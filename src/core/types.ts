@@ -51,6 +51,8 @@ export interface RunRecord {
   completedAt?: string;
   stages: StageRecord[];
   usage: Record<AgentId, TokenUsage>;
+  /** Conditions that weakened the run without stopping it, such as an unavailable Git snapshot. */
+  warnings?: string[];
   error?: string;
 }
 
@@ -78,8 +80,10 @@ export interface AgentHealth {
 
 export interface AgentAdapter {
   readonly id: AgentId;
-  doctor(signal?: AbortSignal): Promise<AgentHealth>;
+  doctor(signal?: AbortSignal, workspacePath?: string): Promise<AgentHealth>;
   run(request: AgentRunRequest): Promise<StageResult>;
+  /** Reports repository-controlled configuration that this provider may apply to a run. */
+  preflightWarnings?(workspacePath: string): Promise<string[]>;
 }
 
 export interface RunStore {
@@ -99,10 +103,22 @@ export interface OrchestratorOptions {
   fallbackOnQuota: boolean;
 }
 
+export interface UntrackedFile {
+  path: string;
+  /** Text content, present only for small, regular, non-sensitive files inside the workspace. */
+  content?: string;
+  /** Why the content was not included. */
+  omitted?: string;
+}
+
 export interface GitSnapshot {
+  /** False when Git could not describe the workspace; the other fields are then empty. */
+  available: boolean;
   status: string;
   diff: string;
   diffStat: string;
+  untracked: UntrackedFile[];
+  warnings: string[];
 }
 
 export const emptyUsage = (): TokenUsage => ({

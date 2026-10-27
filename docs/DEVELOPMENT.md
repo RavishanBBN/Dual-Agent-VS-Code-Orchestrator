@@ -23,6 +23,19 @@ npm.cmd run package
 
 No test command invokes a live provider. Fake adapters verify stage order, permission flow, usage aggregation, durable updates, and fallback behavior without spending subscription quota.
 
+Process-level behavior is tested with fake CLIs: `test/helpers.ts` writes a small Node.js script plus a launcher, a `.cmd` shim on Windows (the same shape npm installs for the real CLIs) or an executable shell script elsewhere. The adapter tests run these through the real process runner, which covers argument escaping, stdin prompts, the environment allowlist, and provider failure reports. Git snapshot tests create temporary repositories, so Git must be on `PATH`.
+
+Several tests reproduce specific vulnerabilities and must keep passing:
+
+- a same-named launcher planted in the workspace, first on `PATH`, never runs (`cliAdapters.test.ts`, `executables.test.ts`);
+- on Windows, a `git.exe` planted in the workspace never runs, with `NoDefaultCurrentDirectoryInExePath` removed to match a normal desktop session (`gitSnapshot.test.ts`);
+- cancelling an agent started through a `.cmd` shim stops the agent itself, not only `cmd.exe` (`processRunner.test.ts`, Windows); the process-group equivalent runs everywhere;
+- an abort signal raised before a process starts prevents it from starting;
+- failures are classified from provider errors, not from repository text in tool output;
+- untrusted text cannot close its prompt block or forge the boundary (`context.test.ts`).
+
+Some tests run only on Windows or only on POSIX; CI covers both. Coverage is measured for every module that does not import `vscode` (`src/core`, `src/adapters`, and `src/ui/messages.ts`).
+
 ## Local extension debugging
 
 1. Open the project in VS Code.
@@ -49,7 +62,8 @@ Implement `AgentAdapter`, normalize output into `StageResult`, classify operatio
 - Unknown provider stream events are tolerated.
 - Missing final text is a stage failure.
 - Parser fixtures should be added for every provider schema regression.
-- Settings that choose executables or billing remain machine-scoped.
+- Every setting remains machine-scoped and is read through `inspect().globalValue`, never from workspace settings.
+- Executables are started only by absolute path from `resolveExecutable`, never by bare name.
 - State schema changes require a migration or backward-compatible reader.
 
 ## Release procedure

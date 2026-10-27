@@ -4,6 +4,12 @@ The 1.0 release contains the complete local reciprocal workflow. Future work sho
 
 ## Planned candidates
 
+### Deterministic verification and gates
+
+- parse a structured verdict from Codex's final verification instead of free-text PASS, with a bounded fix loop and a "completed with findings" status;
+- optional extension-run verification commands whose output is passed to reviewers as trusted evidence. This needs a design that does not run agent-edited scripts outside every sandbox: in an implementation run, `npm test` executes whatever the agents last wrote;
+- use Claude Code's `--restricted` mode for review stages once the minimum supported CLI version includes it.
+
 ### Codex app-server adapter
 
 - interactive approval requests;

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -82,5 +82,36 @@ describe('run report', () => {
     expect(report).toContain('Fallback reason: quota reached');
     expect(report).toContain('Finding recorded.');
     expect(report).toContain('verification failed');
+  });
+});
+
+describe('FileRunStore recovery', () => {
+  it('sets an unreadable history aside instead of failing every save', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'dual-agent-store-'));
+    temporaryDirectories.push(directory);
+    await writeFile(path.join(directory, 'runs.json'), '{ not json', 'utf8');
+    const store = new FileRunStore(directory, 5);
+
+    expect(await store.list()).toEqual([]);
+    await store.save(run('after-corruption'));
+
+    expect((await store.list()).map((item) => item.id)).toEqual(['after-corruption']);
+    expect((await readdir(directory)).some((name) => name.startsWith('runs.json.unreadable-'))).toBe(true);
+  });
+
+  it('serializes concurrent saves so no run is lost', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'dual-agent-store-'));
+    temporaryDirectories.push(directory);
+    const store = new FileRunStore(directory, 50);
+    await Promise.all(Array.from({ length: 10 }, (_, index) => store.save(run(`run-${index}`))));
+    expect(await store.list()).toHaveLength(10);
+  });
+});
+
+describe('run report warnings', () => {
+  it('lists run warnings', () => {
+    const value = run('warned');
+    value.warnings = ['Git snapshot unavailable.'];
+    expect(renderRunReport(value)).toContain('## Warnings\n\n- Git snapshot unavailable.');
   });
 });

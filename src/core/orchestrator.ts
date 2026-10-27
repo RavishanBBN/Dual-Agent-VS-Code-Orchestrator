@@ -1,30 +1,44 @@
 import { randomUUID } from 'node:crypto';
 
 import { buildStagePrompt } from './context.js';
-import { canFallback } from './errors.js';
+import { AgentExecutionError, canFallback } from './errors.js';
 import { captureGitSnapshot } from './gitSnapshot.js';
 import type {
   AgentAdapter,
   AgentId,
+  GitSnapshot,
   OrchestratorEvent,
   OrchestratorOptions,
   RunRecord,
   RunStore,
   StageRecord,
+  StageResult,
   WorkflowKind,
 } from './types.js';
 import { addUsage, totalUsageByAgent } from './usage.js';
 import { getWorkflow } from './workflows.js';
 
+export interface OrchestratorDependencies {
+  captureSnapshot?: (cwd: string) => Promise<GitSnapshot>;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export class WorkflowOrchestrator {
   private active: { controller: AbortController; run: RunRecord } | undefined;
   private readonly listeners = new Set<(event: OrchestratorEvent) => void>();
+  private readonly captureSnapshot: (cwd: string) => Promise<GitSnapshot>;
 
   public constructor(
     private readonly adapters: Record<AgentId, AgentAdapter>,
     private readonly store: RunStore,
     private readonly options: OrchestratorOptions,
-  ) {}
+    dependencies: OrchestratorDependencies = {},
+  ) {
+    this.captureSnapshot = dependencies.captureSnapshot ?? captureGitSnapshot;
+  }
 
   public onEvent(listener: (event: OrchestratorEvent) => void): () => void {
     this.listeners.add(listener);
@@ -66,26 +80,42 @@ export class WorkflowOrchestrator {
       updatedAt: now,
       stages: getWorkflow(kind).map<StageRecord>((stage) => ({
         ...stage,
+        // Write permission is granted only with this run's consent, whatever the template says.
+        permission: allowWrites ? stage.permission : 'read-only',
         assignedAgent: stage.agent,
         status: 'pending',
       })),
       usage: totalUsageByAgent(),
+      warnings: [],
     };
     const controller = new AbortController();
     this.active = { controller, run };
-    await this.update(run);
 
     try {
+      await this.update(run);
+      for (const adapter of Object.values(this.adapters)) {
+        for (const warning of (await adapter.preflightWarnings?.(workspacePath)) ?? []) this.warn(run, warning);
+      }
+      let snapshot: GitSnapshot | undefined;
+      if (kind === 'implementation') {
+        snapshot = await this.snapshot(run);
+        if (!snapshot.available) {
+          throw new Error(
+            `Implementation workflows need a working Git repository so reviewers see every change and it can be reverted. ${snapshot.warnings.join(' ')}`,
+          );
+        }
+      }
       for (const stage of run.stages) {
         if (controller.signal.aborted) throw new Error('Workflow cancelled.');
-        await this.executeStage(run, stage, controller.signal);
+        await this.executeStage(run, stage, controller.signal, snapshot);
+        snapshot = undefined;
       }
       run.status = 'completed';
       run.completedAt = new Date().toISOString();
     } catch (error) {
       const cancelled = controller.signal.aborted;
       run.status = cancelled ? 'cancelled' : 'failed';
-      run.error = error instanceof Error ? error.message : String(error);
+      run.error = messageOf(error);
       run.completedAt = new Date().toISOString();
       const running = run.stages.find((stage) => stage.status === 'running');
       if (running) {
@@ -95,33 +125,46 @@ export class WorkflowOrchestrator {
       }
       for (const stage of run.stages.filter((item) => item.status === 'pending')) stage.status = 'skipped';
     } finally {
-      await this.update(run);
-      this.active = undefined;
+      try {
+        await this.update(run);
+      } catch (error) {
+        // A storage failure must never leave the orchestrator believing a run is still active.
+        this.warn(run, `Run history could not be saved: ${messageOf(error)}`);
+        this.emit({ type: 'run-updated', run });
+      } finally {
+        this.active = undefined;
+      }
     }
     return run;
   }
 
-  private async executeStage(run: RunRecord, stage: StageRecord, signal: AbortSignal): Promise<void> {
+  private async executeStage(
+    run: RunRecord,
+    stage: StageRecord,
+    signal: AbortSignal,
+    initialSnapshot?: GitSnapshot,
+  ): Promise<void> {
     stage.status = 'running';
     stage.startedAt = new Date().toISOString();
     await this.update(run);
 
-    const snapshot = await captureGitSnapshot(run.workspacePath);
-    const prompt = buildStagePrompt(run, stage, snapshot, this.options.maxContextCharacters);
+    const snapshot = initialSnapshot ?? (await this.snapshot(run));
+    if (signal.aborted) throw new Error('Workflow cancelled.');
+    const max = this.options.maxContextCharacters;
 
     try {
-      stage.result = await this.runAdapter(run, stage, stage.agent, prompt, signal);
+      stage.result = await this.attempt(run, stage, stage.agent, buildStagePrompt(run, stage, snapshot, max), signal);
     } catch (error) {
       if (!this.options.fallbackOnQuota || !canFallback(error) || signal.aborted) throw error;
       const fallback: AgentId = stage.agent === 'claude' ? 'codex' : 'claude';
       stage.assignedAgent = fallback;
-      stage.fallbackReason = error instanceof Error ? error.message : String(error);
+      stage.fallbackReason = messageOf(error);
       await this.update(run);
-      const fallbackPrompt = `${buildStagePrompt(run, stage, snapshot, this.options.maxContextCharacters)}
-
-## Bounded provider fallback
-The intended provider could not complete this stage. You are the recorded fallback provider. Complete the same stage contract without expanding its authority or scope.`;
-      stage.result = await this.runAdapter(run, stage, fallback, fallbackPrompt, signal);
+      // The failed attempt may have changed files before it stopped, so the fallback needs a fresh view.
+      const fresh = await this.snapshot(run);
+      if (signal.aborted) throw new Error('Workflow cancelled.');
+      const prompt = buildStagePrompt(run, stage, fresh, max, { fallback: true });
+      stage.result = await this.attempt(run, stage, fallback, prompt, signal);
     }
 
     stage.status = 'completed';
@@ -130,29 +173,58 @@ The intended provider could not complete this stage. You are the recorded fallba
     await this.update(run);
   }
 
-  private async runAdapter(
+  private async attempt(
     run: RunRecord,
     stage: StageRecord,
     agent: AgentId,
     prompt: string,
     signal: AbortSignal,
-  ) {
-    return this.adapters[agent].run({
-      prompt,
-      cwd: run.workspacePath,
-      permission: stage.permission,
-      signal,
-      onEvent: (agentEvent) => this.emit({ type: 'agent-event', run, agentEvent }),
-    });
+  ): Promise<StageResult> {
+    try {
+      return await this.adapters[agent].run({
+        prompt,
+        cwd: run.workspacePath,
+        permission: stage.permission,
+        signal,
+        onEvent: (agentEvent) => this.emit({ type: 'agent-event', run, agentEvent }),
+      });
+    } catch (error) {
+      // Quota spent by a failed attempt is still spent.
+      if (error instanceof AgentExecutionError && error.usage) run.usage[agent] = addUsage(run.usage[agent], error.usage);
+      throw error;
+    }
+  }
+
+  private async snapshot(run: RunRecord): Promise<GitSnapshot> {
+    let snapshot: GitSnapshot;
+    try {
+      snapshot = await this.captureSnapshot(run.workspacePath);
+    } catch (error) {
+      snapshot = { available: false, status: '', diff: '', diffStat: '', untracked: [], warnings: [`Git snapshot failed: ${messageOf(error)}`] };
+    }
+    for (const warning of snapshot.warnings) this.warn(run, warning);
+    return snapshot;
+  }
+
+  private warn(run: RunRecord, warning: string): void {
+    run.warnings ??= [];
+    if (!run.warnings.includes(warning)) run.warnings.push(warning);
   }
 
   private async update(run: RunRecord): Promise<void> {
     run.updatedAt = new Date().toISOString();
-    await this.store.save(run);
+    // Listeners see every transition even when persistence fails.
     this.emit({ type: 'run-updated', run });
+    await this.store.save(run);
   }
 
   private emit(event: OrchestratorEvent): void {
-    for (const listener of this.listeners) listener(event);
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // A failing listener (for example a disposed view) must not break the workflow.
+      }
+    }
   }
 }

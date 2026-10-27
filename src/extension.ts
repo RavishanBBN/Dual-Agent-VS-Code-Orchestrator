@@ -1,9 +1,11 @@
 import { writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 
 import * as vscode from 'vscode';
 
 import { ClaudeCliAdapter, CodexCliAdapter } from './adapters/cliAdapters.js';
-import { readConfiguration } from './config.js';
+import { readConfiguration, type ExtensionConfiguration } from './config.js';
 import { WorkflowOrchestrator } from './core/orchestrator.js';
 import { renderRunReport } from './core/report.js';
 import { FileRunStore } from './core/store.js';
@@ -14,23 +16,48 @@ function workspacePath(): string {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) throw new Error('Open a workspace folder before starting a workflow.');
   if (folder.uri.scheme !== 'file') throw new Error('This release supports local desktop workspaces only.');
+  if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before running agents in it.');
   return folder.uri.fsPath;
+}
+
+function optionalWorkspacePath(): string | undefined {
+  try {
+    return workspacePath();
+  } catch {
+    return undefined;
+  }
+}
+
+function reportProblems(configuration: ExtensionConfiguration): void {
+  if (configuration.problems.length) {
+    void vscode.window.showWarningMessage(`Dual Agent settings ignored: ${configuration.problems.join(' ')}`);
+  }
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const storagePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
   const initial = readConfiguration();
-  const store = new FileRunStore(storagePath, initial.maxRuns);
-  let orchestrator = createOrchestrator(store);
+  reportProblems(initial);
+  let store = new FileRunStore(storagePath, initial.maxRuns);
+  let orchestrator = createOrchestrator(initial, store);
   let detach = (): void => undefined;
+  let reconfigurePending = false;
 
   const controller: DashboardController = {
-    start: async (kind, objective, allowWrites) => orchestrator.start(kind, objective, workspacePath(), allowWrites),
+    start: async (kind, objective, allowWrites) => {
+      try {
+        return await orchestrator.start(kind, objective, workspacePath(), allowWrites);
+      } finally {
+        // Settings changed during the run take effect once it ends.
+        if (reconfigurePending && !orchestrator.activeRun) reconfigure();
+      }
+    },
     cancel: () => orchestrator.cancel(),
     doctor: async () => {
       const configuration = readConfiguration();
       const adapters = [new ClaudeCliAdapter(configuration.claude), new CodexCliAdapter(configuration.codex)];
-      return Promise.all(adapters.map((adapter) => adapter.doctor()));
+      const folder = optionalWorkspacePath();
+      return Promise.all(adapters.map((adapter) => adapter.doctor(undefined, folder)));
     },
     latest: () => store.latest(),
     exportLatest: async () => exportLatest(store),
@@ -41,6 +68,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     detach();
     detach = orchestrator.onEvent((event) => dashboard.publish(event));
   };
+  function reconfigure(): void {
+    const configuration = readConfiguration();
+    reportProblems(configuration);
+    store = new FileRunStore(storagePath, configuration.maxRuns);
+    orchestrator = createOrchestrator(configuration, store);
+    reconfigurePending = false;
+    attach();
+  }
   attach();
 
   context.subscriptions.push(
@@ -53,27 +88,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('dualAgent.doctor', async () => showHealth(await controller.doctor())),
     vscode.commands.registerCommand('dualAgent.exportLatestRun', () => controller.exportLatest()),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (!event.affectsConfiguration('dualAgent') || orchestrator.activeRun) return;
-      orchestrator = createOrchestrator(store);
-      attach();
+      if (!event.affectsConfiguration('dualAgent')) return;
+      if (orchestrator.activeRun) reconfigurePending = true;
+      else reconfigure();
     }),
-    { dispose: detach },
+    { dispose: () => detach() },
+    // Stops any agent still running when the extension shuts down.
+    { dispose: () => void orchestrator.cancel() },
   );
+}
 
-  function createOrchestrator(runStore: FileRunStore): WorkflowOrchestrator {
-    const configuration = readConfiguration();
-    return new WorkflowOrchestrator(
-      {
-        claude: new ClaudeCliAdapter(configuration.claude),
-        codex: new CodexCliAdapter(configuration.codex),
-      },
-      runStore,
-      {
-        maxContextCharacters: configuration.maxContextCharacters,
-        fallbackOnQuota: configuration.fallbackOnQuota,
-      },
-    );
-  }
+function createOrchestrator(configuration: ExtensionConfiguration, runStore: FileRunStore): WorkflowOrchestrator {
+  return new WorkflowOrchestrator(
+    {
+      claude: new ClaudeCliAdapter(configuration.claude),
+      codex: new CodexCliAdapter(configuration.codex),
+    },
+    runStore,
+    {
+      maxContextCharacters: configuration.maxContextCharacters,
+      fallbackOnQuota: configuration.fallbackOnQuota,
+    },
+  );
 }
 
 async function promptAndStart(kind: WorkflowKind, controller: DashboardController): Promise<void> {
@@ -96,9 +132,13 @@ async function promptAndStart(kind: WorkflowKind, controller: DashboardControlle
     { location: vscode.ProgressLocation.Notification, title: `Dual Agent ${kind} workflow`, cancellable: true },
     async (_progress, token) => {
       token.onCancellationRequested(() => controller.cancel());
-      const run = await controller.start(kind, objective, allowWrites);
-      if (run.status === 'completed') void vscode.window.showInformationMessage('Dual Agent workflow completed.');
-      else void vscode.window.showErrorMessage(`Dual Agent workflow ${run.status}: ${run.error ?? 'unknown error'}`);
+      try {
+        const run = await controller.start(kind, objective, allowWrites);
+        if (run.status === 'completed') void vscode.window.showInformationMessage('Dual Agent workflow completed.');
+        else void vscode.window.showErrorMessage(`Dual Agent workflow ${run.status}: ${run.error ?? 'unknown error'}`);
+      } catch (error) {
+        void vscode.window.showErrorMessage(`Dual Agent: ${error instanceof Error ? error.message : String(error)}`);
+      }
     },
   );
 }
@@ -114,7 +154,8 @@ async function exportLatest(store: FileRunStore): Promise<void> {
   const latest = await store.latest();
   if (!latest) throw new Error('There is no run to export.');
   const target = await vscode.window.showSaveDialog({
-    defaultUri: vscode.Uri.file(`${latest.workspacePath}/dual-agent-run-${latest.id.slice(0, 8)}.md`),
+    // Reports contain prompts and agent output; defaulting outside the repository avoids committing them.
+    defaultUri: vscode.Uri.file(path.join(os.homedir(), `dual-agent-run-${latest.id.slice(0, 8)}.md`)),
     filters: { Markdown: ['md'] },
   });
   if (!target) return;

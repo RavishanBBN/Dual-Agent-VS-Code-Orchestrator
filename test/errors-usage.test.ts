@@ -39,3 +39,23 @@ describe('usage aggregation', () => {
     });
   });
 });
+
+describe('failure classification boundaries', () => {
+  it.each([
+    ['new AbortController()', 'unknown'],
+    ['timeoutMs exceeded the budget', 'unknown'],
+    ['file not found: src/a.ts', 'unknown'],
+    ['Request timed out', 'timeout'],
+    ['Operation aborted by user', 'cancelled'],
+    ['rate_limit_error', 'quota'],
+    ['codex was not found on PATH. Install it or configure an absolute path.', 'unavailable'],
+  ] as const)('classifies %s as %s', (message, expected) => {
+    expect(classifyFailure(message)).toBe(expected);
+  });
+
+  it('caps long error details and keeps the end', () => {
+    const error = new AgentExecutionError(`${'x'.repeat(5_000)} final cause`, 'unknown');
+    expect(error.message.length).toBeLessThan(2_100);
+    expect(error.message).toContain('final cause');
+  });
+});

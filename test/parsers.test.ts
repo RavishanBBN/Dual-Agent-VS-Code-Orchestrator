@@ -49,3 +49,30 @@ describe('provider stream parsers', () => {
     expect(lifecycle).toMatchObject({ sessionId: 's2', event: { category: 'lifecycle', message: 'system' } });
   });
 });
+
+describe('provider failure reporting', () => {
+  it('never treats a Claude error result as stage output', () => {
+    const parsed = parseClaudeLine(
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"API Error: 500","usage":{"input_tokens":3}}',
+    );
+    expect(parsed?.text).toBeUndefined();
+    expect(parsed?.failure).toBe('API Error: 500');
+    expect(parsed?.usage?.inputTokens).toBe(3);
+    const accumulator = new StreamAccumulator();
+    accumulator.add(parseClaudeLine('{"type":"assistant","message":{"content":"partial"}}'));
+    accumulator.add(parsed);
+    expect(accumulator.failureMessage()).toBe('API Error: 500');
+  });
+
+  it('separates Codex turn failures from recoverable error events', () => {
+    const error = parseCodexLine('{"type":"error","message":"stream disconnected; retrying"}');
+    expect(error).toMatchObject({ error: 'stream disconnected; retrying' });
+    expect(error?.failure).toBeUndefined();
+    const failed = parseCodexLine('{"type":"turn.failed","error":{"message":"usage limit"}}');
+    expect(failed?.failure).toBe('usage limit');
+    const accumulator = new StreamAccumulator();
+    accumulator.add(error);
+    expect(accumulator.failureMessage()).toBeUndefined();
+    expect(accumulator.errorMessage()).toBe('stream disconnected; retrying');
+  });
+});

@@ -35,6 +35,10 @@ export interface ParsedLine {
   sessionId?: string;
   usage?: TokenUsage;
   terminal?: boolean;
+  /** A provider-reported failure of the turn. The stage fails even if the process exits cleanly. */
+  failure?: string;
+  /** A provider-reported error that may have been recovered from, kept to explain a later failure. */
+  error?: string;
 }
 
 export function parseCodexLine(line: string): ParsedLine | undefined {
@@ -84,8 +88,16 @@ export function parseCodexLine(line: string): ParsedLine | undefined {
 
   if (type === 'turn.failed' || type === 'error') {
     const error = asObject(value.error);
-    const message = typeof error?.message === 'string' ? error.message : 'Codex reported a failure.';
-    return { event: { agent: 'codex', category: 'diagnostic', message, raw: value } };
+    const message =
+      typeof value.message === 'string'
+        ? value.message
+        : typeof error?.message === 'string'
+          ? error.message
+          : 'Codex reported a failure.';
+    return {
+      ...(type === 'turn.failed' ? { failure: message } : { error: message }),
+      event: { agent: 'codex', category: 'diagnostic', message, raw: value },
+    };
   }
 
   return { event: { agent: 'codex', category: 'lifecycle', message: type, raw: value } };
@@ -116,10 +128,13 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
     const usage = asObject(value.usage);
     const result = typeof value.result === 'string' ? value.result : textContent(value.result);
     const cost = typeof value.total_cost_usd === 'number' ? value.total_cost_usd : undefined;
+    const subtype = typeof value.subtype === 'string' ? value.subtype : 'success';
+    // An error result's text describes the failure; it must never become the stage output.
+    const failed = value.is_error === true || subtype.startsWith('error');
     return {
       terminal: true,
       ...(sessionId ? { sessionId } : {}),
-      ...(result ? { text: result } : {}),
+      ...(failed ? { failure: result || `Claude stopped with ${subtype}.` } : result ? { text: result } : {}),
       usage: {
         inputTokens: numberAt(usage, 'input_tokens', 'inputTokens'),
         cachedInputTokens: numberAt(usage, 'cache_read_input_tokens', 'cached_input_tokens', 'cachedInputTokens'),
@@ -127,7 +142,12 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
         reasoningOutputTokens: 0,
         ...(cost !== undefined ? { estimatedCostUsd: cost } : {}),
       },
-      event: { agent: 'claude', category: 'usage', message: 'Claude turn completed.', raw: value },
+      event: {
+        agent: 'claude',
+        category: failed ? 'diagnostic' : 'usage',
+        message: failed ? `Claude turn failed (${subtype}).` : 'Claude turn completed.',
+        raw: value,
+      },
     };
   }
 
@@ -138,23 +158,36 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
 }
 
 export class StreamAccumulator {
-  private readonly texts: string[] = [];
+  private lastText = '';
   private sessionId?: string;
   private usage: TokenUsage = emptyUsage();
   private eventCount = 0;
+  private failure?: string;
+  private lastError?: string;
 
   public add(parsed: ParsedLine | undefined): void {
     if (!parsed) return;
     this.eventCount += 1;
-    if (parsed.text && this.texts.at(-1) !== parsed.text) this.texts.push(parsed.text);
+    if (parsed.text) this.lastText = parsed.text;
     if (parsed.sessionId) this.sessionId = parsed.sessionId;
     if (parsed.usage) this.usage = parsed.usage;
+    if (parsed.failure) this.failure = parsed.failure;
+    if (parsed.error) this.lastError = parsed.error;
+  }
+
+  /** The definitive turn failure, if the provider reported one. */
+  public failureMessage(): string | undefined {
+    return this.failure;
+  }
+
+  /** The best provider-reported explanation for a failed process. */
+  public errorMessage(): string | undefined {
+    return this.failure ?? this.lastError;
   }
 
   public result(): StageResult {
-    const text = this.texts.at(-1) ?? this.texts.join('\n\n');
     return {
-      text,
+      text: this.lastText,
       usage: this.usage,
       rawEventCount: this.eventCount,
       ...(this.sessionId ? { providerSessionId: this.sessionId } : {}),

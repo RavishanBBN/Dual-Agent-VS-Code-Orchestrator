@@ -25,11 +25,15 @@ export function renderRunReport(run: RunRecord): string {
     `- Claude: ${usageLine(run.usage.claude)}`,
     `- Codex: ${usageLine(run.usage.codex)}`,
     '',
-    'These figures are event-level observations, not authoritative subscription balances.',
-    '',
-    '## Stages',
+    'These figures are event-level observations, not authoritative subscription balances. They include attempts that failed and were handed to the fallback provider.',
     '',
   ];
+
+  if (run.warnings?.length) {
+    lines.push('## Warnings', '', ...run.warnings.map((warning) => `- ${warning}`), '');
+  }
+
+  lines.push('## Stages', '');
 
   for (const stage of run.stages) {
     lines.push(

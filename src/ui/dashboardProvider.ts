@@ -1,6 +1,9 @@
+import { randomBytes } from 'node:crypto';
+
 import * as vscode from 'vscode';
 
 import type { AgentHealth, OrchestratorEvent, RunRecord, WorkflowKind } from '../core/types.js';
+import { agentEventView, OBJECTIVE_LIMIT, parseDashboardMessage, runView, type DashboardMessage } from './messages.js';
 
 export interface DashboardController {
   start(kind: WorkflowKind, objective: string, allowWrites: boolean): Promise<RunRecord>;
@@ -10,21 +13,9 @@ export interface DashboardController {
   exportLatest(): Promise<void>;
 }
 
-type DashboardMessage =
-  | { type: 'ready' }
-  | { type: 'start'; kind: WorkflowKind; objective: string; allowWrites: boolean }
-  | { type: 'cancel' }
-  | { type: 'doctor' }
-  | { type: 'export' };
-
-function nonce(): string {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  return Array.from({ length: 32 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
-}
-
 export class DashboardProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'dualAgent.dashboard';
-  private view?: vscode.WebviewView;
+  private view: vscode.WebviewView | undefined;
 
   public constructor(
     private readonly extensionUri: vscode.Uri,
@@ -38,11 +29,22 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
     };
     view.webview.html = this.html(view.webview);
-    view.webview.onDidReceiveMessage((message: DashboardMessage) => void this.handleMessage(message));
+    view.webview.onDidReceiveMessage((value: unknown) => {
+      const message = parseDashboardMessage(value);
+      if (message) void this.handleMessage(message);
+    });
+    view.onDidDispose(() => {
+      if (this.view === view) this.view = undefined;
+    });
   }
 
   public publish(event: OrchestratorEvent): void {
-    void this.view?.webview.postMessage({ type: event.type, run: event.run, agentEvent: event.agentEvent });
+    if (!this.view) return;
+    if (event.type === 'run-updated') {
+      void this.view.webview.postMessage({ type: 'run-updated', run: runView(event.run) });
+    } else if (event.agentEvent) {
+      void this.view.webview.postMessage({ type: 'agent-event', agentEvent: agentEventView(event.agentEvent) });
+    }
   }
 
   private async handleMessage(message: DashboardMessage): Promise<void> {
@@ -50,7 +52,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
       switch (message.type) {
         case 'ready': {
           const latest = await this.controller.latest();
-          await this.view?.webview.postMessage({ type: 'initial-state', latest });
+          await this.view?.webview.postMessage({ type: 'initial-state', latest: latest ? runView(latest) : null });
           break;
         }
         case 'start':
@@ -76,7 +78,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
   }
 
   private html(webview: vscode.Webview): string {
-    const token = nonce();
+    const token = randomBytes(16).toString('hex');
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'dashboard.css')).toString();
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'dashboard.js')).toString();
     return `<!doctype html>
@@ -110,7 +112,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
     </select>
 
     <label for="objective">Objective</label>
-    <textarea id="objective" rows="7" placeholder="Describe the outcome, constraints, and acceptance criteria..."></textarea>
+    <textarea id="objective" rows="7" maxlength="${OBJECTIVE_LIMIT}" placeholder="Describe the outcome, constraints, and acceptance criteria..."></textarea>
 
     <label id="writeConsent" class="consent">
       <input id="allowWrites" type="checkbox">
@@ -127,6 +129,7 @@ export class DashboardProvider implements vscode.WebviewViewProvider {
   <section class="run-summary">
     <div class="summary-heading"><h2>Latest run</h2><span id="runStatus" class="badge">none</span></div>
     <div id="usage" class="usage"></div>
+    <ul id="warnings" class="warnings" aria-label="Run warnings" hidden></ul>
     <ol id="stages" class="stages"><li class="empty">No workflow has run in this workspace.</li></ol>
   </section>
 

@@ -1,24 +1,42 @@
+import type { TokenUsage } from './types.js';
+
 export type FailureKind = 'quota' | 'authentication' | 'unavailable' | 'cancelled' | 'timeout' | 'invalid' | 'unknown';
+
+/** Error details are persisted and shown to the user, so they are capped. */
+export const ERROR_DETAIL_LIMIT = 2_000;
 
 export class AgentExecutionError extends Error {
   public constructor(
     message: string,
     public readonly kind: FailureKind,
     public readonly exitCode?: number,
+    /** Usage the provider reported before the attempt failed. */
+    public readonly usage?: TokenUsage,
   ) {
-    super(message);
+    super(limitDetail(message));
     this.name = 'AgentExecutionError';
   }
 }
 
+export function limitDetail(message: string, limit = ERROR_DETAIL_LIMIT): string {
+  const value = message.trim();
+  return value.length <= limit ? value : `[...] ${value.slice(value.length - limit)}`;
+}
+
+/**
+ * Classifies a provider or process error message. Callers must pass provider-reported error text or
+ * process stderr, never the agent's output stream, because that stream contains repository content.
+ */
 export function classifyFailure(message: string): FailureKind {
   const value = message.toLowerCase();
-  if (/cancelled|canceled|abort/.test(value)) return 'cancelled';
-  if (/timed? out|timeout/.test(value)) return 'timeout';
-  if (/usage limit|rate limit|quota|too many requests|429/.test(value)) return 'quota';
-  if (/not logged in|unauthorized|authentication|invalid.*token|401/.test(value)) return 'authentication';
-  if (/not found|enoent|is not recognized|command not found|unavailable|503/.test(value)) return 'unavailable';
-  if (/invalid argument|bad request|unsupported|400/.test(value)) return 'invalid';
+  if (/\b(?:cancelled|canceled|aborted)\b/.test(value)) return 'cancelled';
+  if (/\btimed? out\b|\btimeout\b/.test(value)) return 'timeout';
+  if (/usage limit|rate[ _-]limit|\bquota\b|too many requests|\b429\b/.test(value)) return 'quota';
+  if (/not logged in|unauthori[sz]ed|authentication|invalid[^\n]{0,40}\btoken\b|\b401\b/.test(value)) return 'authentication';
+  if (/command not found|is not recognized|\benoent\b|not found on path|executable not found|\bunavailable\b|\boverloaded\b|\b503\b/.test(value)) {
+    return 'unavailable';
+  }
+  if (/invalid argument|bad request|\bunsupported\b|\b400\b/.test(value)) return 'invalid';
   return 'unknown';
 }
 

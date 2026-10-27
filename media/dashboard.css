@@ -6,6 +6,11 @@
   box-sizing: border-box;
 }
 
+/* Author display rules such as .consent's flex layout would otherwise override the hidden attribute. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   margin: 0;
   padding: 14px;
@@ -163,6 +168,21 @@ button:disabled { cursor: default; opacity: 0.5; }
   margin: 8px 0;
   color: var(--vscode-descriptionForeground);
   font-size: 11px;
+}
+
+.warnings {
+  margin: 8px 0;
+  padding: 7px 7px 7px 22px;
+  color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+  background: var(--vscode-inputValidation-warningBackground);
+  border: 1px solid var(--vscode-inputValidation-warningBorder);
+  border-radius: 4px;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.warnings li + li {
+  margin-top: 4px;
 }
 
 .stages {

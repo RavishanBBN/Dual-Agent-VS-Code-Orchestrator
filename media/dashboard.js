@@ -10,6 +10,7 @@
   const stages = byId('stages');
   const status = byId('runStatus');
   const usage = byId('usage');
+  const warnings = byId('warnings');
   const activity = byId('activity');
   const errorBox = byId('error');
 
@@ -42,6 +43,19 @@
     activity.scrollTop = activity.scrollHeight;
   }
 
+  function renderWarnings(run) {
+    const items = [...(run.warnings || [])];
+    if (run.error) items.push(`Error: ${run.error}`);
+    warnings.replaceChildren(
+      ...items.map((item) => {
+        const row = document.createElement('li');
+        row.textContent = item;
+        return row;
+      }),
+    );
+    warnings.hidden = items.length === 0;
+  }
+
   function renderRun(run) {
     if (!run) return;
     status.textContent = run.status;
@@ -49,6 +63,7 @@
     start.disabled = run.status === 'running';
     cancel.disabled = run.status !== 'running';
     usage.textContent = `Claude ${formatUsage(run.usage.claude)} · Codex ${formatUsage(run.usage.codex)}`;
+    renderWarnings(run);
     stages.replaceChildren();
     for (const stage of run.stages) {
       const row = document.createElement('li');
@@ -60,7 +75,7 @@
       const title = document.createElement('strong');
       title.textContent = stage.title;
       const meta = document.createElement('small');
-      meta.textContent = `${stage.assignedAgent} · ${stage.permission}${stage.fallbackReason ? ' · fallback' : ''}`;
+      meta.textContent = `${stage.assignedAgent} · ${stage.permission}${stage.fallback ? ' · fallback' : ''}`;
       details.append(title, meta);
       row.append(marker, details);
       stages.append(row);
@@ -80,12 +95,16 @@
       const card = byId(`${item.agent}Health`);
       if (!card) continue;
       card.querySelector('.dot').className = `dot ${item.available ? 'available' : 'unavailable'}`;
-      card.querySelector('small').textContent = item.version || item.detail;
+      const detail = card.querySelector('small');
+      detail.textContent = item.version || item.detail;
+      detail.title = item.detail;
     }
   }
 
   start.addEventListener('click', () => {
     errorBox.hidden = true;
+    // Disabled immediately so a double click cannot send two start requests.
+    start.disabled = true;
     persist();
     vscode.postMessage({
       type: 'start',
@@ -105,9 +124,8 @@
   window.addEventListener('message', ({ data }) => {
     if (data.type === 'initial-state') renderRun(data.latest);
     if (data.type === 'run-updated') renderRun(data.run);
-    if (data.type === 'agent-event') {
-      renderRun(data.run);
-      if (data.agentEvent) addActivity(data.agentEvent.agent, data.agentEvent.message, data.agentEvent.category);
+    if (data.type === 'agent-event' && data.agentEvent) {
+      addActivity(data.agentEvent.agent, data.agentEvent.message, data.agentEvent.category);
     }
     if (data.type === 'health') renderHealth(data.health);
     if (data.type === 'ui-error') {

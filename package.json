@@ -2,7 +2,7 @@
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent Orchestrator",
   "description": "A Claude-led, Codex-reviewed workflow orchestrator for VS Code with reciprocal review, safe handoffs, and subscription-aware execution.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "publisher": "local",
   "license": "MIT",
@@ -28,6 +28,16 @@
     "onCommand:dualAgent.doctor"
   ],
   "main": "./dist/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Dual Agent launches local agent CLIs with workspace access, so it runs only in trusted workspaces."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Agents and Git need a local file system."
+    }
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -90,13 +100,13 @@
           "type": "string",
           "default": "codex",
           "scope": "machine",
-          "description": "Codex CLI executable or absolute path. Machine-scoped to prevent repository settings from replacing the executable."
+          "description": "Codex CLI command name or absolute path. Machine-scoped, and never resolved from the workspace folder."
         },
         "dualAgent.claude.command": {
           "type": "string",
           "default": "claude",
           "scope": "machine",
-          "description": "Claude Code CLI executable or absolute path. Machine-scoped to prevent repository settings from replacing the executable."
+          "description": "Claude Code CLI command name or absolute path. Machine-scoped, and never resolved from the workspace folder."
         },
         "dualAgent.billingMode": {
           "type": "string",
@@ -107,8 +117,8 @@
           "default": "subscription",
           "scope": "machine",
           "enumDescriptions": [
-            "Remove API-key environment variables from child processes and use saved CLI sign-in.",
-            "Pass API-key environment variables through to child processes. This may incur API charges."
+            "Remove API-key, auth-token, alternate-endpoint, and Bedrock/Vertex routing variables from child processes and use saved CLI sign-in.",
+            "Pass those variables through to child processes. This may incur API charges."
           ],
           "description": "Controls which credentials child agent processes can use."
         },
@@ -117,14 +127,16 @@
           "default": 30,
           "minimum": 1,
           "maximum": 180,
-          "description": "Maximum duration for each workflow stage."
+          "description": "Maximum duration for each workflow stage.",
+          "scope": "machine"
         },
         "dualAgent.claude.maxTurns": {
           "type": "number",
           "default": 24,
           "minimum": 1,
           "maximum": 100,
-          "description": "Maximum agentic turns for each Claude stage."
+          "description": "Maximum agentic turns for each Claude stage.",
+          "scope": "machine"
         },
         "dualAgent.claude.model": {
           "type": "string",
@@ -143,19 +155,40 @@
           "default": 90000,
           "minimum": 10000,
           "maximum": 300000,
-          "description": "Maximum normalized shared context included in a stage prompt."
+          "description": "Maximum normalized shared context included in a stage prompt.",
+          "scope": "machine"
         },
         "dualAgent.fallbackOnQuota": {
           "type": "boolean",
           "default": true,
-          "description": "Allow the other provider to complete a stage when the assigned provider reports a quota or availability failure."
+          "description": "Allow the other provider to complete a stage when the assigned provider reports a quota or availability failure.",
+          "scope": "machine"
         },
         "dualAgent.history.maxRuns": {
           "type": "number",
           "default": 50,
           "minimum": 5,
           "maximum": 500,
-          "description": "Maximum number of workflow records retained in private workspace storage."
+          "description": "Maximum number of workflow records retained in private workspace storage.",
+          "scope": "machine"
+        },
+        "dualAgent.claude.allowedTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "machine",
+          "markdownDescription": "Claude Code permission rules granted to workspace-write stages only, for example `Bash(npm test:*)`. Print mode cannot ask for approval, so without rules here Claude cannot run shell commands such as tests. Each rule lets agents run that command against files they wrote."
+        },
+        "dualAgent.environment.passthrough": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "machine",
+          "markdownDescription": "Extra environment variable names passed to agent processes. By default only an allowlist (PATH, home and temp locations, locale, proxy and TLS settings) is passed so tokens and cloud credentials stay out of reach. In `subscription` billing mode, API-key and endpoint variables are removed even if listed here."
         }
       }
     }
