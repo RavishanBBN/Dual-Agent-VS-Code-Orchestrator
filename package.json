@@ -1,0 +1,192 @@
+{
+  "name": "dual-agent-orchestrator",
+  "displayName": "Dual Agent Orchestrator",
+  "description": "A Claude-led, Codex-reviewed workflow orchestrator for VS Code with reciprocal review, safe handoffs, and subscription-aware execution.",
+  "version": "1.0.0",
+  "private": true,
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.105.0",
+    "node": ">=20"
+  },
+  "categories": [
+    "Machine Learning",
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "codex",
+    "agents",
+    "orchestration",
+    "code-review"
+  ],
+  "activationEvents": [
+    "onView:dualAgent.dashboard",
+    "onCommand:dualAgent.runImplementation",
+    "onCommand:dualAgent.runBrainstorming",
+    "onCommand:dualAgent.doctor"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dualAgent",
+          "title": "Dual Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dualAgent": [
+        {
+          "type": "webview",
+          "id": "dualAgent.dashboard",
+          "name": "Orchestrator"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dualAgent.runImplementation",
+        "title": "Dual Agent: Run Implementation Workflow"
+      },
+      {
+        "command": "dualAgent.runBrainstorming",
+        "title": "Dual Agent: Run Brainstorming Workflow"
+      },
+      {
+        "command": "dualAgent.cancel",
+        "title": "Dual Agent: Cancel Active Workflow"
+      },
+      {
+        "command": "dualAgent.doctor",
+        "title": "Dual Agent: Check Agent Setup"
+      },
+      {
+        "command": "dualAgent.exportLatestRun",
+        "title": "Dual Agent: Export Latest Run Report"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "dualAgent.doctor",
+          "when": "view == dualAgent.dashboard",
+          "group": "navigation"
+        },
+        {
+          "command": "dualAgent.exportLatestRun",
+          "when": "view == dualAgent.dashboard",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Dual Agent Orchestrator",
+      "properties": {
+        "dualAgent.codex.command": {
+          "type": "string",
+          "default": "codex",
+          "scope": "machine",
+          "description": "Codex CLI executable or absolute path. Machine-scoped to prevent repository settings from replacing the executable."
+        },
+        "dualAgent.claude.command": {
+          "type": "string",
+          "default": "claude",
+          "scope": "machine",
+          "description": "Claude Code CLI executable or absolute path. Machine-scoped to prevent repository settings from replacing the executable."
+        },
+        "dualAgent.billingMode": {
+          "type": "string",
+          "enum": [
+            "subscription",
+            "environment"
+          ],
+          "default": "subscription",
+          "scope": "machine",
+          "enumDescriptions": [
+            "Remove API-key environment variables from child processes and use saved CLI sign-in.",
+            "Pass API-key environment variables through to child processes. This may incur API charges."
+          ],
+          "description": "Controls which credentials child agent processes can use."
+        },
+        "dualAgent.timeoutMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 180,
+          "description": "Maximum duration for each workflow stage."
+        },
+        "dualAgent.claude.maxTurns": {
+          "type": "number",
+          "default": 24,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum agentic turns for each Claude stage."
+        },
+        "dualAgent.claude.model": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional Claude model alias or ID. Empty uses the CLI/account default."
+        },
+        "dualAgent.codex.model": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional Codex model ID. Empty uses the CLI/account default."
+        },
+        "dualAgent.context.maxCharacters": {
+          "type": "number",
+          "default": 90000,
+          "minimum": 10000,
+          "maximum": 300000,
+          "description": "Maximum normalized shared context included in a stage prompt."
+        },
+        "dualAgent.fallbackOnQuota": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow the other provider to complete a stage when the assigned provider reports a quota or availability failure."
+        },
+        "dualAgent.history.maxRuns": {
+          "type": "number",
+          "default": 50,
+          "minimum": 5,
+          "maximum": 500,
+          "description": "Maximum number of workflow records retained in private workspace storage."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "watch": "node ./scripts/build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build",
+    "package": "npm run check && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links"
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.6"
+  },
+  "overrides": {
+    "@azure/msal-node": "7.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.38.0",
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^22.18.0",
+    "@types/vscode": "^1.105.0",
+    "@vitest/coverage-v8": "^5.0.5",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "^0.28.2",
+    "eslint": "^9.38.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.2",
+    "vitest": "^5.0.5"
+  }
+}
