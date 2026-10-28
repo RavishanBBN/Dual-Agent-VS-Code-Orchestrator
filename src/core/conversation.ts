@@ -33,6 +33,13 @@ export interface ConversationTurn {
   /** Tokens the run used, kept so conversation totals survive the pruning of old runs. */
   usage?: Record<AgentId, TokenUsage>;
   error?: string;
+  /**
+   * The conversation's worktree as this edit turn started, so retrying an earlier message can undo it: a Git
+   * tree of its files, or no tree when this turn's run created the worktree.
+   */
+  checkpoint?: { tree?: string };
+  /** This turn retried an earlier message, so it and later turns do not continue sessions from before it. */
+  freshSessions?: boolean;
 }
 
 export interface Conversation {
@@ -63,9 +70,12 @@ function isConversation(value: unknown): value is Conversation {
   return candidate.schemaVersion === 1 && typeof candidate.id === 'string' && ID_PATTERN.test(candidate.id) && Array.isArray(candidate.turns);
 }
 
-/** The stage whose text the user should read as the run's answer: the last completed Claude stage. */
+/**
+ * The stage whose text the user should read as the run's answer: the last completed stage in Claude's role,
+ * whoever ran it, so an answer Codex gave alone while Claude was at its limit still counts.
+ */
 export function finalStage(run: RunRecord): RunRecord['stages'][number] | undefined {
-  return [...run.stages].reverse().find((stage) => stage.status === 'completed' && stage.assignedAgent === 'claude' && stage.result?.text);
+  return [...run.stages].reverse().find((stage) => stage.status === 'completed' && stage.agent === 'claude' && stage.result?.text);
 }
 
 /** "1 high issue" or "3 issues (1 high, 2 low)", for the outcome line. */
@@ -117,9 +127,37 @@ export function recordRun(turn: ConversationTurn, run: RunRecord): void {
 
 /** The sessions the next turn continues: the most recent session of each agent in earlier turns. */
 export function continuedSessions(conversation: Conversation): Partial<Record<AgentId, string>> {
-  const sessions: Partial<Record<AgentId, string>> = {};
-  for (const turn of conversation.turns) Object.assign(sessions, turn.sessions ?? {});
+  let sessions: Partial<Record<AgentId, string>> = {};
+  for (const turn of conversation.turns) {
+    // A retried message started new sessions, because the earlier ones also saw the messages it replaced.
+    if (turn.freshSessions) sessions = {};
+    Object.assign(sessions, turn.sessions ?? {});
+  }
   return sessions;
+}
+
+/**
+ * For each continued session, the later turns it took no part in, such as turns the other agent answered
+ * alone while this one was at its usage limit, as history text within `budget`.
+ */
+export function missedTurns(
+  conversation: Conversation,
+  sessions: Partial<Record<AgentId, string>>,
+  budget: number,
+): Partial<Record<AgentId, string>> {
+  const missed: Partial<Record<AgentId, string>> = {};
+  for (const agent of ['claude', 'codex'] as const) {
+    const id = sessions[agent];
+    if (!id) continue;
+    let last = -1;
+    conversation.turns.forEach((turn, index) => {
+      if (turn.sessions?.[agent] === id) last = index;
+    });
+    const later = conversation.turns.slice(last + 1);
+    const text = later.length ? conversationHistory({ ...conversation, turns: later }, budget) : '';
+    if (text) missed[agent] = text;
+  }
+  return missed;
 }
 
 /**
@@ -204,6 +242,13 @@ export class FileConversationStore {
     const deleted = this.queue.then(() => rm(this.file(id), { force: true }));
     this.queue = deleted.catch(() => undefined);
     return deleted;
+  }
+
+  /** Deletes every conversation, including files set aside as unreadable. */
+  public clear(): Promise<void> {
+    const cleared = this.queue.then(() => rm(this.directory, { recursive: true, force: true }));
+    this.queue = cleared.catch(() => undefined);
+    return cleared;
   }
 
   /** Deletes the oldest conversations beyond `max`, except those `keep` protects; returns what was deleted. */

@@ -19,6 +19,9 @@ export interface ExtensionConfiguration {
   maxFixRounds: number;
   approvePlan: boolean;
   resumeClaudeSessions: boolean;
+  redactSecrets: boolean;
+  /** Continue a run that stopped at both agents' usage limits once the first limit resets. */
+  autoContinue: boolean;
   /** Settings that were ignored because their values were invalid. */
   problems: string[];
 }
@@ -152,6 +155,8 @@ export function readConfiguration(): ExtensionConfiguration {
     maxFixRounds: Math.round(bounded('workflow.maxFixRounds', 1, 0, 3)),
     approvePlan: user<unknown>('workflow.approvePlan', true) !== false,
     resumeClaudeSessions: user<unknown>('claude.resumeSessions', true) !== false,
+    redactSecrets: user<unknown>('privacy.redactSecrets', true) !== false,
+    autoContinue: user<unknown>('limits.autoContinue', true) !== false,
     problems,
   };
 }

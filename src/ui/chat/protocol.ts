@@ -114,6 +114,10 @@ export interface TurnView {
   /** Tokens the message used, including failed attempts. */
   usage?: UsageByAgent;
   canResume: boolean;
+  /** Retry or edit is possible: nothing is running and the message has finished or stopped. */
+  canRetry: boolean;
+  /** The run stopped at the agents' usage limits: when they reset, and when it continues on its own if it will. */
+  paused?: { runId: string; reset: string; continuesAt?: string };
 }
 
 export interface ModelChoice {
@@ -136,6 +140,26 @@ export interface ComposerView {
   options: Record<AgentId, AgentOptions>;
   pending: AttachmentView[];
   choices: Record<AgentId, AgentChoices>;
+  /** The earlier message being edited; sending replaces it and the messages after it. */
+  editing?: { turnId: string; preview: string };
+}
+
+/** A message waiting for the current one to finish, or for the agents' limits to reset. */
+export interface QueuedView {
+  id: string;
+  text: string;
+  mode: WorkflowKind;
+  /** The conversation's title, when it is not the one shown. */
+  conversation?: string;
+}
+
+/** An agent at its usage limit. */
+export interface LimitView {
+  agent: AgentId;
+  /** When the limit resets, such as "3:05 PM". */
+  until: string;
+  /** No reset time was given, so `until` is when the agent is tried again. */
+  estimated: boolean;
 }
 
 export interface ConsentView {
@@ -167,13 +191,18 @@ export interface ChatState {
   notice?: { text: string; tone: Tone };
   /** Token totals for this conversation, today, the last 7 days, and all runs in this workspace. */
   usage: UsagePeriod[];
+  queue: QueuedView[];
+  /** Agents at their usage limits; while one is, the other works alone. */
+  limits: LimitView[];
 }
 
 export type HostMessage =
   | { type: 'state'; state: ChatState }
   | { type: 'mentions'; query: string; items: { path: string; description: string }[] }
   | { type: 'focus' }
-  | { type: 'showUsage' };
+  | { type: 'showUsage' }
+  /** Puts an earlier message's text in the composer for editing. */
+  | { type: 'fillComposer'; text: string };
 
 // ---- Webview → extension ----
 
@@ -208,7 +237,15 @@ export type WebviewMessage =
   | { type: 'openLink'; href: string }
   | { type: 'openFile'; path: string }
   | { type: 'copy'; text: string }
-  | { type: 'dismissNotice' };
+  | { type: 'dismissNotice' }
+  | { type: 'retry'; turnId: string }
+  | { type: 'editMessage'; turnId: string }
+  | { type: 'cancelEdit' }
+  | { type: 'unqueue'; id: string }
+  | { type: 'continueAfterLimit'; runId: string }
+  | { type: 'cancelContinuation'; runId: string }
+  /** A script error or blocked content in the webview, reported so it reaches the output log. */
+  | { type: 'pageError'; message: string };
 
 type Fields = Record<string, unknown>;
 
@@ -239,7 +276,16 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | undefined 
     case 'pickFiles':
     case 'reject':
     case 'dismissNotice':
+    case 'cancelEdit':
       return { type: message.type };
+    case 'retry':
+    case 'editMessage':
+      return id(message.turnId) ? { type: message.type, turnId: message.turnId } : undefined;
+    case 'unqueue':
+      return id(message.id) ? { type: 'unqueue', id: message.id } : undefined;
+    case 'continueAfterLimit':
+    case 'cancelContinuation':
+      return id(message.runId) ? { type: message.type, runId: message.runId } : undefined;
     case 'send':
       return text(message.text, MESSAGE_LIMIT) && message.text.trim() && mode(message.mode)
         ? { type: 'send', text: message.text, mode: message.mode }
@@ -295,6 +341,8 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | undefined 
       return text(message.path, 1_000) && message.path.trim() ? { type: 'openFile', path: message.path } : undefined;
     case 'copy':
       return text(message.text, 1_000_000) ? { type: 'copy', text: message.text } : undefined;
+    case 'pageError':
+      return typeof message.message === 'string' ? { type: 'pageError', message: message.message.slice(0, 2_000) } : undefined;
     default:
       return undefined;
   }
