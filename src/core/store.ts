@@ -90,7 +90,9 @@ export class FileRunStore implements RunStore {
   private async write(run: RunRecord): Promise<void> {
     await mkdir(path.dirname(this.filePath), { recursive: true });
     const existing = (await this.read()).filter((item) => item.id !== run.id);
-    const document: StoreDocument = { schemaVersion: 1, runs: [run, ...existing].slice(0, this.maxRuns) };
+    // A run whose worktree changes are still waiting to be applied or discarded is never pruned.
+    const runs = [run, ...existing].filter((item, index) => index < this.maxRuns || item.worktree?.state === 'active');
+    const document: StoreDocument = { schemaVersion: 1, runs };
     const temporary = `${this.filePath}.${process.pid}.tmp`;
     await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     await replaceFile(temporary, this.filePath);

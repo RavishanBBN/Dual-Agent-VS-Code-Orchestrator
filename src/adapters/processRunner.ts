@@ -22,6 +22,8 @@ export interface ProcessRunOptions {
   onLine?: (line: ProcessLine) => void;
   /** Characters of each stream retained for the result. Older output is discarded. */
   captureLimit?: number;
+  /** Resolve with the exit code instead of rejecting when the process exits unsuccessfully. */
+  allowNonZeroExit?: boolean;
 }
 
 export interface ProcessRunResult {
@@ -37,7 +39,8 @@ const KILL_GRACE_MS = 2_000;
 /** How long to wait for pipes held open by an escaped descendant after the process exits. */
 const DRAIN_GRACE_MS = 5_000;
 
-class TailBuffer {
+/** Keeps the most recent `limit` characters of a line stream. */
+export class TailBuffer {
   private value = '';
 
   public constructor(private readonly limit: number) {}
@@ -101,7 +104,7 @@ export function runProcess(options: ProcessRunOptions): Promise<ProcessRunResult
         reject(new AgentExecutionError('Agent execution cancelled.', 'cancelled', exitCode));
       } else if (timedOut) {
         reject(new AgentExecutionError(`Agent stage timed out after ${options.timeoutMs} ms.`, 'timeout', exitCode));
-      } else if (exitCode !== 0) {
+      } else if (exitCode !== 0 && !options.allowNonZeroExit) {
         // Only stderr is classified: stdout carries agent output, including repository content.
         const detail = limitDetail(stderr.toString()) || `Process exited with code ${exitCode}.`;
         reject(new AgentExecutionError(detail, classifyFailure(detail), exitCode));

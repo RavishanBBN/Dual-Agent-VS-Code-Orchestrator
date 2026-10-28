@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 
+import type { CheckRunnerConfiguration } from './adapters/checkRunner.js';
 import type { AdapterConfiguration } from './adapters/cliAdapters.js';
 import type { BillingMode } from './adapters/environment.js';
+import type { IsolationMode } from './core/types.js';
 
 export interface ExtensionConfiguration {
   codex: AdapterConfiguration;
@@ -9,11 +11,21 @@ export interface ExtensionConfiguration {
   maxContextCharacters: number;
   fallbackOnQuota: boolean;
   maxRuns: number;
+  isolation: IsolationMode;
+  setupCommands: string[][];
+  verificationCommands: string[][];
+  checks: CheckRunnerConfiguration;
+  maxFixRounds: number;
+  approvePlan: boolean;
+  resumeClaudeSessions: boolean;
   /** Settings that were ignored because their values were invalid. */
   problems: string[];
 }
 
 const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]*$/;
+const MAX_COMMANDS = 10;
+const MAX_ARGUMENTS = 64;
+const MAX_ARGUMENT_LENGTH = 1_000;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_.()]*$/;
 
 export function readConfiguration(): ExtensionConfiguration {
@@ -59,6 +71,28 @@ export function readConfiguration(): ExtensionConfiguration {
     });
   };
 
+  /** Reads a list of argument vectors. Commands run without a shell, so no quoting or expansion applies. */
+  const commands = (key: string): string[][] => {
+    const value = user<unknown>(key, []);
+    if (!Array.isArray(value)) {
+      if (value !== undefined) problems.push(`dualAgent.${key} must be a list of commands; it was ignored.`);
+      return [];
+    }
+    const valid = value.filter((entry): entry is string[] => {
+      const ok =
+        Array.isArray(entry) &&
+        entry.length > 0 &&
+        entry.length <= MAX_ARGUMENTS &&
+        entry.every((part) => typeof part === 'string' && part.length <= MAX_ARGUMENT_LENGTH && !/[\r\n\0]/.test(part)) &&
+        typeof entry[0] === 'string' &&
+        entry[0].trim().length > 0;
+      if (!ok) problems.push(`dualAgent.${key} entry ${JSON.stringify(entry)} must be a non-empty list of arguments and was ignored.`);
+      return ok;
+    });
+    if (valid.length > MAX_COMMANDS) problems.push(`dualAgent.${key} lists more than ${MAX_COMMANDS} commands; only the first ${MAX_COMMANDS} are used.`);
+    return valid.slice(0, MAX_COMMANDS).map((entry) => [entry[0]?.trim() ?? '', ...entry.slice(1)]);
+  };
+
   const command = (key: string, fallback: string): string => {
     const value = user<unknown>(key, fallback);
     return typeof value === 'string' && value.trim() ? value.trim() : fallback;
@@ -95,6 +129,17 @@ export function readConfiguration(): ExtensionConfiguration {
     maxContextCharacters: Math.round(bounded('context.maxCharacters', 90_000, 10_000, 300_000)),
     fallbackOnQuota: user<unknown>('fallbackOnQuota', true) !== false,
     maxRuns: Math.round(bounded('history.maxRuns', 50, 5, 500)),
+    isolation: user<unknown>('isolation.mode', 'worktree') === 'none' ? 'none' : 'worktree',
+    setupCommands: commands('isolation.setupCommands'),
+    verificationCommands: commands('verification.commands'),
+    checks: {
+      timeoutMs: bounded('verification.timeoutMinutes', 10, 1, 120) * 60_000,
+      billingMode,
+      environmentPassthrough,
+    },
+    maxFixRounds: Math.round(bounded('workflow.maxFixRounds', 1, 0, 3)),
+    approvePlan: user<unknown>('workflow.approvePlan', true) !== false,
+    resumeClaudeSessions: user<unknown>('claude.resumeSessions', true) !== false,
     problems,
   };
 }

@@ -131,10 +131,13 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
     const subtype = typeof value.subtype === 'string' ? value.subtype : 'success';
     // An error result's text describes the failure; it must never become the stage output.
     const failed = value.is_error === true || subtype.startsWith('error');
+    // Errors such as an unknown --resume session are reported only in `errors`.
+    const errors = Array.isArray(value.errors) ? value.errors.filter((entry): entry is string => typeof entry === 'string') : [];
+    const failure = result || errors.join('; ') || `Claude stopped with ${subtype}.`;
     return {
       terminal: true,
       ...(sessionId ? { sessionId } : {}),
-      ...(failed ? { failure: result || `Claude stopped with ${subtype}.` } : result ? { text: result } : {}),
+      ...(failed ? { failure } : result ? { text: result } : {}),
       usage: {
         inputTokens: numberAt(usage, 'input_tokens', 'inputTokens'),
         cachedInputTokens: numberAt(usage, 'cache_read_input_tokens', 'cached_input_tokens', 'cachedInputTokens'),
