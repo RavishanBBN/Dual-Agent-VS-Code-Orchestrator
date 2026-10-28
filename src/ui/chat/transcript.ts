@@ -6,7 +6,7 @@ import { canResume } from '../../core/orchestrator.js';
 import type { AgentActivity, AgentId, AgentStreamEvent, AttachmentRef, RunRecord, StageRecord, TokenUsage } from '../../core/types.js';
 import { checksPassed } from '../../core/types.js';
 import { sumByAgent, totalTokens } from '../../core/usage.js';
-import { summarizeVerdict } from '../../core/verdict.js';
+import { onlyMinorFindings, summarizeVerdict } from '../../core/verdict.js';
 import type { WorktreeChange } from '../../core/worktree.js';
 import { describeCheck, relativeTime } from '../presentation.js';
 import type {
@@ -137,7 +137,8 @@ function toneOf(run: RunRecord): Tone {
   if (run.status === 'completed-with-findings') return 'warn';
   const reviews = run.stages.filter((stage) => stage.review && stage.status === 'completed');
   const last = reviews.at(-1);
-  return !last?.verdict || last.verdict.outcome === 'pass' ? 'good' : 'warn';
+  if (!last?.verdict || last.verdict.outcome === 'pass') return 'good';
+  return run.kind === 'chat' && onlyMinorFindings(last.verdict) ? 'good' : 'warn';
 }
 
 function stageViews(run: RunRecord, live: ReadonlyMap<string, LiveStage> | undefined, active: boolean): StageView[] {

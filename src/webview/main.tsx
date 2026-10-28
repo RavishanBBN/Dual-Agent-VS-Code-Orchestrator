@@ -33,6 +33,7 @@ const FILE_LIMIT = 25 * 1024 * 1024;
 
 const MODES: { id: WorkflowKind; label: string; hint: string }[] = [
   { id: 'chat', label: 'Chat', hint: 'Claude answers and Codex checks the answer. Nothing is edited.' },
+  { id: 'research', label: 'Research', hint: 'Claude researches on the web with cited sources; Codex opens every source and looks for missing or contrary work.' },
   { id: 'edit', label: 'Edit', hint: 'Claude edits an isolated copy, Codex reviews the change, and you apply it.' },
   { id: 'brainstorming', label: 'Brainstorm', hint: 'Five rounds of proposal and challenge, read-only.' },
   { id: 'implementation', label: 'Implement', hint: 'Plan, review, your approval, edit, review, fix, and a final check.' },
@@ -713,6 +714,22 @@ function Composer({ state, mentions }: { state: ChatState; mentions: { query: st
       <div class="toolbar">
         <button type="button" class="icon-button" title="Attach files (or paste, or drop them here)" disabled={disabled} onClick={() => send({ type: 'pickFiles' })}>
           <Icon path={ICONS.plus} />
+        </button>
+        <button
+          type="button"
+          class={`web-toggle${composer.web ? ' on' : ''}`}
+          disabled={disabled || composer.mode === 'research'}
+          title={
+            composer.mode === 'research'
+              ? 'Research mode always searches and reads the web.'
+              : composer.web
+                ? 'Web on: agents may search and read web pages. Search terms and page requests leave your machine.'
+                : 'Web off: agents use only the workspace and your attachments. Click to let them search the web.'
+          }
+          onClick={() => send({ type: 'setWeb', enabled: !composer.web })}
+        >
+          <Icon path={ACTIVITY_ICONS.web} />
+          <span>Web</span>
         </button>
         <label class="pill-select" title={mode?.hint}>
           <select value={composer.mode} onChange={(event) => send({ type: 'setMode', mode: event.currentTarget.value as WorkflowKind })}>

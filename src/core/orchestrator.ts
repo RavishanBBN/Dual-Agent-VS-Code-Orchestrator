@@ -29,8 +29,8 @@ import type {
 } from './types.js';
 import { checksPassed, isFinished } from './types.js';
 import { addUsage, totalUsageByAgent } from './usage.js';
-import { parseVerdict, summarizeVerdict } from './verdict.js';
-import { fixRoundStages, getWorkflow, reviseStage } from './workflows.js';
+import { onlyMinorFindings, parseVerdict, summarizeVerdict } from './verdict.js';
+import { fixRoundStages, getWorkflow, repairStage, reviseStage } from './workflows.js';
 
 export interface PreparedWorktree {
   info: WorktreeInfo;
@@ -201,6 +201,7 @@ export class WorkflowOrchestrator {
       ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}),
       ...(options.history ? { history: options.history } : {}),
       ...(options.continueSessions ? { continueSessions: options.continueSessions } : {}),
+      ...(options.web ? { web: true } : {}),
     };
     // A conversation keeps editing the same worktree until its changes are applied or discarded.
     const reused = options.worktree;
@@ -300,7 +301,10 @@ export class WorkflowOrchestrator {
         }
         await this.executeStage(run, stage, signal, snapshot);
         snapshot = undefined;
-        if (stage.permission === 'workspace-write') await this.verify(run, stage, signal);
+        if (stage.permission === 'workspace-write') {
+          await this.verify(run, stage, signal);
+          this.repair(run, index, stage);
+        }
         if (stage.gate) this.gate(run, index, stage);
         if (stage.onFail === 'revise') this.revise(run, index, stage);
       }
@@ -461,6 +465,9 @@ export class WorkflowOrchestrator {
       ...(Object.keys(options).length ? { options } : {}),
       ...(images.length ? { images } : {}),
       ...(folders.length ? { readableDirectories: folders } : {}),
+      ...(stage.web || run.web ? { web: true } : {}),
+      // An editing stage may run the commands the user consented to, so it can test its own change.
+      ...(stage.permission === 'workspace-write' && this.options.verificationCommands?.length ? { allowedCommands: this.options.verificationCommands } : {}),
     };
     try {
       return await this.adapters[agent].run(request);
@@ -473,7 +480,21 @@ export class WorkflowOrchestrator {
 
   /** The run's chosen model and effort for the agent actually running, revalidated because runs are stored. */
   private agentOptions(run: RunRecord, agent: AgentId): AgentOptions {
-    return sanitizeAgentOptions(agent, run.agentOptions?.[agent]);
+    const options = sanitizeAgentOptions(agent, run.agentOptions?.[agent]);
+    // Research depends on careful reasoning, so it thinks hard unless the user chose an effort.
+    if (run.kind === 'research' && !options.effort) options.effort = 'high';
+    return options;
+  }
+
+  /**
+   * When the checks fail right after an editing stage, adds one Claude repair before the next stage, so the
+   * reviewer sees working code. It is added at most once per run; later failures go to the gate.
+   */
+  private repair(run: RunRecord, index: number, stage: StageRecord): void {
+    if (!stage.checks?.length || checksPassed(stage.checks) || !run.allowWrites) return;
+    if (stage.id === 'claude-repair' || stage.round !== undefined || run.stages.some((item) => item.id === 'claude-repair')) return;
+    run.stages.splice(index + 1, 0, stageRecord(repairStage(stage.title), run.allowWrites));
+    this.log(run, `Checks failed after "${stage.title}"; Claude repairs them before the review.`);
   }
 
   /** Runs the configured verification commands after a stage that could edit files. */
@@ -532,12 +553,17 @@ export class WorkflowOrchestrator {
    */
   private revise(run: RunRecord, index: number, stage: StageRecord): void {
     if (stage.verdict?.outcome === 'pass') return;
+    // Low-severity notes are shown with the check; rewriting the whole answer for them costs a full call.
+    if (stage.verdict && onlyMinorFindings(stage.verdict)) {
+      this.log(run, `Codex's check found only minor notes (${summarizeVerdict(stage.verdict)}); the answer stands.`);
+      return;
+    }
     if (run.stages.slice(index + 1).some((item) => item.id === 'claude-revise')) return;
     const reason =
       !stage.verdict || stage.verdict.outcome === 'missing'
         ? 'the check gave no machine-readable verdict'
         : `the check reported ${summarizeVerdict(stage.verdict)}`;
-    run.stages.splice(index + 1, 0, stageRecord(reviseStage(reason), run.allowWrites));
+    run.stages.splice(index + 1, 0, stageRecord(reviseStage(reason, run.kind), run.allowWrites));
     this.log(run, `Codex's check did not pass (${reason}); Claude revises the answer.`);
   }
 

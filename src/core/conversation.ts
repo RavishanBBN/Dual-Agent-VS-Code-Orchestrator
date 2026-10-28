@@ -3,6 +3,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import path from 'node:path';
 
 import { trimMiddle } from './context.js';
+import { onlyMinorFindings } from './verdict.js';
 import type { AgentId, AgentOptions, AttachmentRef, ReviewVerdict, RunRecord, RunStatus, TokenUsage, WorkflowKind } from './types.js';
 
 /** Characters of a final answer kept on the turn, so a conversation outlives the pruning of its runs. */
@@ -19,6 +20,8 @@ export interface ConversationTurn {
   message: string;
   attachments: AttachmentRef[];
   agentOptions?: Partial<Record<AgentId, AgentOptions>>;
+  /** The agents could search and read the web for this message. */
+  web?: boolean;
   runId?: string;
   status?: RunStatus;
   /** The final answer, or the edit summary, kept after the run itself may be pruned. */
@@ -88,6 +91,10 @@ export function describeOutcome(run: RunRecord): string {
   if (revised) return `Claude revised the answer after Codex found ${issueSummary(first)}`;
   if (run.status === 'completed-with-findings') return `Codex still reports ${issueSummary(last.verdict)}`;
   if (last.verdict.outcome === 'pass') return reviews.length > 1 && first.outcome !== 'pass' ? `Codex agreed after Claude fixed ${issueSummary(first)}` : 'Codex agreed';
+  if (run.kind === 'chat' && onlyMinorFindings(last.verdict)) {
+    const count = last.verdict.findings.length;
+    return `Codex agreed, with ${count} minor note${count === 1 ? '' : 's'}`;
+  }
   return `Codex found ${issueSummary(last.verdict)}`;
 }
 

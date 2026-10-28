@@ -274,8 +274,9 @@ describe('final gate and fix rounds', () => {
 
   it('runs verification after every editing stage, shows the result to reviewers, and gates on it', async () => {
     const checkRequests: CheckRequest[] = [];
-    const results = [[check(0)], [check(1)], [check(0)]];
-    const { codex, orchestrator } = setup({
+    // Implement passes; adjudication fails; the repair fails too; the fix round passes.
+    const results = [[check(0)], [check(1)], [check(1)], [check(0)]];
+    const { claude, codex, orchestrator } = setup({
       options: { maxFixRounds: 1, verificationCommands: [['npm', 'test']] },
       dependencies: {
         runChecks: async (request) => {
@@ -288,15 +289,35 @@ describe('final gate and fix rounds', () => {
 
     const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
 
-    // Implement, adjudicate, and one fix round: the adjudication checks failed even though Codex passed it.
-    expect(checkRequests).toHaveLength(3);
+    expect(checkRequests).toHaveLength(4);
     expect(run.stages.find((stage) => stage.id === 'claude-adjudicate-fix')?.checks?.[0]?.exitCode).toBe(1);
-    expect(run.stages.some((stage) => stage.id === 'claude-fix-round-1')).toBe(true);
+    // One repair right after the failing checks, before Codex's review; it is never added twice.
+    const ids = run.stages.map((stage) => stage.id);
+    expect(ids.indexOf('claude-repair')).toBe(ids.indexOf('claude-adjudicate-fix') + 1);
+    expect(ids.filter((id) => id === 'claude-repair')).toHaveLength(1);
+    // The repair's checks still failed, so the gate fails even though Codex passed it, and a fix round follows.
+    expect(ids).toContain('claude-fix-round-1');
     expect(run.status).toBe('completed');
     const reviewPrompt = codex.calls.find((request) => stageOf(request) === 'codex-final-verification')?.prompt ?? '';
     expect(reviewPrompt).toContain('Orchestrator-run checks');
     expect(reviewPrompt).toContain('`npm test`: failed with exit code 1');
     expect(reviewPrompt).toContain('1 failing');
+    // Editing stages may run the consented commands themselves; read-only stages may not.
+    expect(claude.calls.find((request) => stageOf(request) === 'claude-implement')?.allowedCommands).toEqual([['npm', 'test']]);
+    expect(claude.calls.find((request) => stageOf(request) === 'claude-plan')?.allowedCommands).toBeUndefined();
+  });
+
+  it('lets Claude repair failing checks once, before the review, so Codex reviews working code', async () => {
+    const results = [[check(1)], [check(0)]];
+    const { codex, orchestrator } = setup({
+      options: { isolation: 'none', maxFixRounds: 1, verificationCommands: [['npm', 'test']] },
+      dependencies: { runChecks: async () => results.shift() ?? [check(0)] },
+    });
+    codex.respond = () => verdict('pass');
+    const run = await orchestrator.start('edit', 'Return 0 for an empty list.', process.cwd(), true);
+    expect(run.stages.map((stage) => stage.id)).toEqual(['claude-edit', 'claude-repair', 'codex-change-review']);
+    expect(run.status).toBe('completed');
+    expect(codex.calls[0]?.prompt).toContain('`npm test`: passed');
   });
 });
 
@@ -640,6 +661,47 @@ describe('conversation turns', () => {
     };
     const linked = await second.start('chat', 'Do the tests pass?', '/repo/app', false);
     expect(linked.stages[0]?.activities).toEqual([{ kind: 'command', tool: 'Bash', title: 'Run tests', input: 'npm test', id: 'call-1', output: '1 failing', failed: true }]);
+  });
+
+  it('keeps the answer when the check finds only minor notes, saving a revision', async () => {
+    const { claude, codex, orchestrator } = setup();
+    codex.respond = () => 'Small nit.\n```verdict\n{"verdict":"fail","findings":[{"severity":"low","title":"Name the helper more clearly"}]}\n```';
+    const logs: string[] = [];
+    orchestrator.onEvent((event) => {
+      if (event.type === 'log' && event.message) logs.push(event.message);
+    });
+    const run = await orchestrator.start('chat', 'Explain the pager.', '/repo/app', false);
+    expect(run.stages.map((stage) => stage.id)).toEqual(['claude-answer', 'codex-check']);
+    expect(claude.calls).toHaveLength(1);
+    expect(logs.some((line) => line.includes('only minor notes'))).toBe(true);
+    // A material finding still gets the revision.
+    codex.respond = () => 'Wrong.\n```verdict\n{"verdict":"fail","findings":[{"severity":"low","title":"Nit"},{"severity":"medium","title":"Misses the empty case"}]}\n```';
+    const revised = await orchestrator.start('chat', 'Explain the pager.', '/repo/app', false);
+    expect(revised.stages.at(-1)?.id).toBe('claude-revise');
+  });
+
+  it('researches with the web, has Codex verify the sources, and thinks hard unless told otherwise', async () => {
+    const { claude, codex, orchestrator } = setup();
+    codex.respond = () => verdict('fail');
+    const run = await orchestrator.start('research', 'What are the open problems in sparse attention?', '/repo/app', false, {
+      agentOptions: { codex: { effort: 'low' } },
+    });
+    expect(run.stages.map((stage) => stage.id)).toEqual(['claude-research', 'codex-source-check', 'claude-revise']);
+    expect(run.stages[2]?.title).toBe('Claude revises the research');
+    expect([...claude.calls, ...codex.calls].every((request) => request.web === true)).toBe(true);
+    expect(claude.calls[0]?.options).toEqual({ effort: 'high' });
+    // An effort the user chose is kept.
+    expect(codex.calls[0]?.options).toEqual({ effort: 'low' });
+    expect(claude.calls[0]?.prompt).toContain('never cite from a search snippet or from memory');
+    expect(codex.calls[0]?.prompt).toContain('Open each cited source');
+  });
+
+  it('gives chat stages the web only when the user turns it on', async () => {
+    const { claude, orchestrator } = setup();
+    await orchestrator.start('chat', 'What changed in Node 24?', '/repo/app', false);
+    expect(claude.calls[0]?.web).toBeUndefined();
+    await orchestrator.start('chat', 'What changed in Node 24?', '/repo/app', false, { web: true });
+    expect(claude.calls.at(-1)?.web).toBe(true);
   });
 
   it('tags agent events with their stage', async () => {

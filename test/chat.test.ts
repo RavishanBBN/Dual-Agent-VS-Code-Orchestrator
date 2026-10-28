@@ -13,6 +13,9 @@ describe('chat protocol', () => {
     expect(parseWebviewMessage({ type: 'attachData', name: 'a.png', data: 'iVBORw0KGgo=' })).toMatchObject({ name: 'a.png' });
     expect(parseWebviewMessage({ type: 'openStage', runId: 'e3b0c442-98fc-1c14-9afb-f4c8996fb924', index: 2 })).toMatchObject({ index: 2 });
     expect(parseWebviewMessage({ type: 'consent', turnId: 'abc-123', decision: 'conversation' })).toMatchObject({ decision: 'conversation' });
+    expect(parseWebviewMessage({ type: 'send', text: 'Find research gaps in sparse attention.', mode: 'research' })).toMatchObject({ mode: 'research' });
+    expect(parseWebviewMessage({ type: 'setWeb', enabled: true })).toEqual({ type: 'setWeb', enabled: true });
+    expect(parseWebviewMessage({ type: 'setWeb', enabled: 'yes' })).toBeUndefined();
   });
 
   it('drops anything malformed, so the webview cannot steer the extension with odd input', () => {

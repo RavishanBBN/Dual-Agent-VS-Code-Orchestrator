@@ -76,3 +76,8 @@ export function summarizeVerdict(verdict: ReviewVerdict): string {
     .map(([severity, count]) => `${count} ${severity}`);
   return `${verdict.outcome}: ${counts.join(', ')}`;
 }
+
+/** A failing verdict whose findings are all low severity: notes worth showing, not worth another agent call. */
+export function onlyMinorFindings(verdict: ReviewVerdict): boolean {
+  return verdict.outcome === 'fail' && verdict.findings.length > 0 && verdict.findings.every((finding) => finding.severity === 'low');
+}

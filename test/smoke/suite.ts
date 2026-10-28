@@ -163,6 +163,16 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   const followUp = recordedCalls('claude').at(-1)?.args ?? [];
   assert.equal(followUp[followUp.indexOf('--resume') + 1], 'smoke-claude-session', "the follow-up continues Claude's session");
 
+  // Research gives both agents the web, verifies the sources, and thinks hard by default.
+  await api.chatMessage({ type: 'setOptions', agent: 'claude', model: 'opus', effort: '' });
+  await api.chatMessage({ type: 'send', text: 'Find research gaps in caching for search pages.', mode: 'research' });
+  const [research] = api.chatState().turns.slice(-1);
+  assert.deepEqual(research?.stages.map((stage) => stage.id), ['claude-research', 'codex-source-check']);
+  const researchCall = recordedCalls('claude').at(-1)?.args ?? [];
+  assert.equal(researchCall[researchCall.indexOf('--tools') + 1], 'Read,Grep,Glob,WebSearch,WebFetch');
+  assert.equal(researchCall[researchCall.indexOf('--effort') + 1], 'high');
+  assert.equal(recordedCalls('codex').at(-1)?.args[0], '--search');
+
   // An edit asks for consent in the chat, then edits an isolated copy, never the workspace.
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
   const sending = api.chatMessage({ type: 'send', text: 'Add a note file.', mode: 'edit' });

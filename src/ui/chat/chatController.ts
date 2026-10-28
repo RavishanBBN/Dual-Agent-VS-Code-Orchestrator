@@ -49,7 +49,7 @@ const MAX_CONVERSATIONS = 50;
 const PUSH_DELAY_MS = 100;
 /** Share of the context budget given to the conversation's earlier turns. */
 const HISTORY_SHARE = 0.3;
-const MODES: readonly WorkflowKind[] = ['chat', 'edit', 'brainstorming', 'implementation'];
+const MODES: readonly WorkflowKind[] = ['chat', 'research', 'edit', 'brainstorming', 'implementation'];
 const STATUS_LETTERS: Record<string, WorktreeChange['status']> = { A: 'added', M: 'modified', D: 'deleted', T: 'type-changed' };
 
 /** What the chat needs from the extension: its single-run lock, the orchestrator, settings, and commands. */
@@ -85,6 +85,7 @@ export interface ChatHost {
 interface Composer {
   mode: WorkflowKind;
   options: Record<AgentId, AgentOptions>;
+  web: boolean;
 }
 
 interface PendingConsent {
@@ -159,6 +160,7 @@ export class ChatController implements vscode.Disposable {
     return {
       mode,
       options: { claude: sanitizeAgentOptions('claude', stored.options?.claude), codex: sanitizeAgentOptions('codex', stored.options?.codex) },
+      web: stored.web === true,
     };
   }
 
@@ -286,6 +288,7 @@ export class ChatController implements vscode.Disposable {
       running: this.host.isBusy(),
       composer: {
         mode: this.composer.mode,
+        web: this.composer.web || this.composer.mode === 'research',
         options: this.composer.options,
         pending: pending.map((attachment) => attachmentView(attachment, thumbnail(attachment))),
         choices: this.choices(),
@@ -559,6 +562,7 @@ export class ChatController implements vscode.Disposable {
       message: text.trim(),
       attachments,
       agentOptions: { claude: { ...this.composer.options.claude }, codex: { ...this.composer.options.codex } },
+      ...(this.composer.web || mode === 'research' ? { web: true } : {}),
     };
     if (!conversation.turns.length) conversation.title = titleFor(turn.message);
     conversation.turns.push(turn);
@@ -588,6 +592,7 @@ export class ChatController implements vscode.Disposable {
           ...(history ? { history } : {}),
           ...(Object.keys(sessions).length ? { continueSessions: sessions } : {}),
           ...(worktree ? { worktree } : {}),
+          ...(turn.web ? { web: true } : {}),
         };
         const finished = await this.host.start(mode, turn.message, conversation.workspacePath, allowWrites, options);
         // The turn shows its answer and changes only once the finished run has been recorded on it.
@@ -699,6 +704,10 @@ export class ChatController implements vscode.Disposable {
         return;
       case 'setMode':
         this.composer.mode = incoming.mode;
+        this.saveComposer();
+        break;
+      case 'setWeb':
+        this.composer.web = incoming.enabled;
         this.saveComposer();
         break;
       case 'setOptions':

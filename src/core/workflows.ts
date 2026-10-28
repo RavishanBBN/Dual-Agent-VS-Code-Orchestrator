@@ -75,6 +75,7 @@ const IMPLEMENTATION: readonly WorkflowStageDefinition[] = [
 const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
   {
     id: 'claude-proposal',
+    context: 'lean',
     title: 'Claude develops the proposal',
     agent: 'claude',
     permission: 'read-only',
@@ -84,6 +85,7 @@ const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
   },
   {
     id: 'codex-challenge',
+    context: 'lean',
     title: 'Codex challenges the proposal',
     agent: 'codex',
     permission: 'read-only',
@@ -94,6 +96,7 @@ const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
   },
   {
     id: 'claude-synthesis',
+    context: 'lean',
     title: 'Claude synthesizes the strongest design',
     agent: 'claude',
     permission: 'read-only',
@@ -103,6 +106,7 @@ const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
   },
   {
     id: 'codex-final-challenge',
+    context: 'lean',
     title: 'Codex performs the final challenge',
     agent: 'codex',
     permission: 'read-only',
@@ -113,6 +117,7 @@ const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
   },
   {
     id: 'claude-final-recommendation',
+    context: 'lean',
     title: 'Claude issues the final recommendation',
     agent: 'claude',
     permission: 'read-only',
@@ -126,6 +131,7 @@ const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
 const CHAT: readonly WorkflowStageDefinition[] = [
   {
     id: 'claude-answer',
+    context: 'lean',
     title: 'Claude answers',
     agent: 'claude',
     permission: 'read-only',
@@ -135,6 +141,7 @@ const CHAT: readonly WorkflowStageDefinition[] = [
   },
   {
     id: 'codex-check',
+    context: 'lean',
     title: 'Codex checks the answer',
     agent: 'codex',
     permission: 'read-only',
@@ -155,7 +162,7 @@ const EDIT: readonly WorkflowStageDefinition[] = [
     permission: 'workspace-write',
     purpose: 'Primary implementation',
     instructions:
-      'Make the change the user asked for in their latest message. Inspect the relevant code first, keep the change scoped to the request, and preserve unrelated work. End with a short summary of what you changed and why, and of any check you could not run.',
+      'Make the change the user asked for in their latest message, correctly the first time. Before editing, read the code you will change, its callers, and its existing tests, and follow the project\'s conventions. Handle edge cases and errors the way the surrounding code does, add or update tests for the new behavior, keep the change scoped to the request, and preserve unrelated work. If you can run the project\'s checks, run them and fix any failure before you finish. End with a short summary of what you changed and why, and of any check you could not run.',
   },
   {
     id: 'codex-change-review',
@@ -170,26 +177,86 @@ const EDIT: readonly WorkflowStageDefinition[] = [
   },
 ];
 
+/**
+ * One research question: Claude researches with the web and the workspace, and Codex independently opens
+ * every cited source and looks for what was missed before the user relies on the findings.
+ */
+const RESEARCH: readonly WorkflowStageDefinition[] = [
+  {
+    id: 'claude-research',
+    context: 'lean',
+    web: true,
+    title: 'Claude researches',
+    agent: 'claude',
+    permission: 'read-only',
+    purpose: 'Primary research',
+    instructions: [
+      'Research the user\'s latest message using the web, the attachments, and the workspace.',
+      'Prefer primary and authoritative sources: peer-reviewed papers, official documentation, standards, and original data, with preprints marked as such. Read a source before you cite it; never cite from a search snippet or from memory.',
+      'Cite every factual claim inline as [n], and end with a numbered source list giving each source\'s title, authors or publisher, year, and URL.',
+      'Separate what is established, what is contested, and what is unknown, and give your confidence in each conclusion. When the question is about research gaps, map what has been done, with sources; what has not been done or not been replicated; why each gap matters; and how it could be studied.',
+      'Reason step by step before concluding, check your arithmetic and logic, and say plainly where the evidence is thin. Do not modify files.',
+    ].join(' '),
+  },
+  {
+    id: 'codex-source-check',
+    context: 'lean',
+    web: true,
+    title: 'Codex verifies the sources',
+    agent: 'codex',
+    permission: 'read-only',
+    purpose: 'Independent source and reasoning check',
+    instructions: [
+      'Verify Claude\'s research independently. Open each cited source and confirm that it exists, is attributed correctly, and actually supports the claim it is cited for; flag invented, misattributed, outdated, or retracted sources.',
+      'Search for important work Claude missed and for evidence against its conclusions, and check the reasoning, numbers, and stated confidence.',
+      'Pass only if every material claim is supported by a real source and no important counter-evidence or work is missing. Otherwise list each problem with its evidence and a correction. Do not modify files.',
+    ].join(' '),
+    review: true,
+    onFail: 'revise',
+  },
+];
+
 const WORKFLOWS: Record<WorkflowKind, readonly WorkflowStageDefinition[]> = {
   implementation: IMPLEMENTATION,
   brainstorming: BRAINSTORMING,
   chat: CHAT,
   edit: EDIT,
+  research: RESEARCH,
 };
 
 export function getWorkflow(kind: WorkflowKind): WorkflowStageDefinition[] {
   return WORKFLOWS[kind].map((stage) => ({ ...stage }));
 }
 
-/** The single stage a failed chat check adds: Claude weighs Codex's findings and gives the final answer. */
-export function reviseStage(reason: string): WorkflowStageDefinition {
+/** The single stage a failed check adds: Claude weighs Codex's findings and gives the final answer. */
+export function reviseStage(reason: string, kind: WorkflowKind = 'chat'): WorkflowStageDefinition {
+  const research = kind === 'research';
   return {
     id: 'claude-revise',
-    title: 'Claude revises the answer',
+    context: 'lean',
+    ...(research ? { web: true } : {}),
+    title: research ? 'Claude revises the research' : 'Claude revises the answer',
     agent: 'claude',
     permission: 'read-only',
     purpose: 'Answer revision',
-    instructions: `Codex's check did not pass (${reason}). Weigh each of its findings against the evidence, reading files again where needed. Then give the user your complete, corrected answer to their latest message: rely on findings that hold, and say briefly why you set aside any that do not. Mention the check in at most one short line. Do not modify files.`,
+    instructions: research
+      ? `Codex's check did not pass (${reason}). Check each of its findings against the sources themselves, opening them again where needed. Then give the user the complete, corrected research: keep only sources you have confirmed support their claims, replace or remove the rest, add the important work that was missing, and adjust your conclusions and confidence. Mention the check in at most one short line. Do not modify files.`
+      : `Codex's check did not pass (${reason}). Weigh each of its findings against the evidence, reading files again where needed. Then give the user your complete, corrected answer to their latest message: rely on findings that hold, and say briefly why you set aside any that do not. Mention the check in at most one short line. Do not modify files.`,
+  };
+}
+
+/**
+ * A repair stage added once when the checks fail right after an editing stage, so Codex reviews working code
+ * rather than spending its review on failures the checks already found.
+ */
+export function repairStage(stage: string): WorkflowStageDefinition {
+  return {
+    id: 'claude-repair',
+    title: 'Claude fixes the failing checks',
+    agent: 'claude',
+    permission: 'workspace-write',
+    purpose: 'Repair before review',
+    instructions: `The orchestrator-run checks failed after "${stage}". Read the failing output, find the cause in the code you changed, and fix it without weakening or deleting the tests. Keep the change scoped to the request, and say what the failure was and how you fixed it.`,
   };
 }
 

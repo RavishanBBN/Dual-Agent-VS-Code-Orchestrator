@@ -102,6 +102,11 @@ describe('conversation records', () => {
       'completed-with-findings',
     );
     expect(describeOutcome(findings)).toBe('Codex still reports 1 low issue');
+    const minor = chatRun([
+      stage('claude-answer', 'claude', 'x'),
+      stage('codex-check', 'codex', 'y', { review: true, verdict: { outcome: 'fail', findings: [{ severity: 'low', title: 'a' }, { severity: 'low', title: 'b' }] } }),
+    ]);
+    expect(describeOutcome(minor)).toBe('Codex agreed, with 2 minor notes');
   });
 
   it('gives agents the most recent turns that fit, oldest first', () => {

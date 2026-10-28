@@ -8,7 +8,7 @@ export const MESSAGE_LIMIT = 20_000;
 export const GUIDANCE_LIMIT = 4_000;
 /** Base64 for a 25 MB file, plus padding. */
 const DATA_LIMIT = Math.ceil((25 * 1024 * 1024 * 4) / 3) + 4;
-const MODES: readonly WorkflowKind[] = ['chat', 'edit', 'brainstorming', 'implementation'];
+const MODES: readonly WorkflowKind[] = ['chat', 'research', 'edit', 'brainstorming', 'implementation'];
 const ID = /^[A-Za-z0-9-]{1,64}$/;
 
 // ---- Extension → webview ----
@@ -131,6 +131,8 @@ export interface AgentChoices {
 
 export interface ComposerView {
   mode: WorkflowKind;
+  /** Agents may search and read the web; Research mode always may. */
+  web: boolean;
   options: Record<AgentId, AgentOptions>;
   pending: AttachmentView[];
   choices: Record<AgentId, AgentChoices>;
@@ -189,6 +191,7 @@ export type WebviewMessage =
   | { type: 'searchMentions'; query: string }
   | { type: 'addMention'; path: string }
   | { type: 'setMode'; mode: WorkflowKind }
+  | { type: 'setWeb'; enabled: boolean }
   | { type: 'setOptions'; agent: AgentId; model: string; effort: string }
   | { type: 'customModel'; agent: AgentId }
   | { type: 'consent'; turnId: string; decision: 'once' | 'conversation' | 'deny' }
@@ -257,6 +260,8 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | undefined 
       return text(message.path, 1_000) && message.path.trim() ? { type: 'addMention', path: message.path } : undefined;
     case 'setMode':
       return mode(message.mode) ? { type: 'setMode', mode: message.mode } : undefined;
+    case 'setWeb':
+      return typeof message.enabled === 'boolean' ? { type: 'setWeb', enabled: message.enabled } : undefined;
     case 'setOptions':
       return agent(message.agent) && text(message.model, 128) && text(message.effort, 16)
         ? { type: 'setOptions', agent: message.agent, model: message.model, effort: message.effort }

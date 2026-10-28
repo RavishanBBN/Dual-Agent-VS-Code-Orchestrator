@@ -89,8 +89,17 @@ function codexActivity(item: JsonObject | undefined): AgentActivity | undefined 
     return text ? { kind: 'reasoning', tool: 'Thinking', title: clip(text.split('\n')[0] ?? '', TITLE_LIMIT), output: clip(text, OUTPUT_LIMIT) } : undefined;
   }
   if (type === 'web_search') {
-    const query = stringAt(item, 'query');
-    return { kind: 'web', tool: 'Web search', title: clip(query, TITLE_LIMIT), ...(query ? { input: query } : {}) };
+    // A search carries its query; opening or reading a result page carries a URL, or nothing at all.
+    const action = asObject(item?.action);
+    const query = stringAt(item, 'query') || stringAt(action, 'query');
+    const url = stringAt(action, 'url');
+    const subject = query || url;
+    return {
+      kind: 'web',
+      tool: query ? 'Web search' : 'Web page',
+      title: clip(subject || 'Read a search result', TITLE_LIMIT),
+      ...(subject ? { input: subject } : {}),
+    };
   }
   if (type === 'mcp_tool_call') {
     const name = [stringAt(item, 'server'), stringAt(item, 'tool')].filter(Boolean).join('.');

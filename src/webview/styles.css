@@ -1112,3 +1112,35 @@ pre {
 .usage-table .agent-codex .pill-dot {
   background: var(--codex);
 }
+
+/* ---- Web access toggle ---- */
+
+.web-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+  color: var(--muted);
+}
+
+.web-toggle .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.web-toggle.on {
+  color: var(--vscode-foreground);
+  border-color: var(--good);
+}
+
+.web-toggle.on .icon {
+  color: var(--good);
+}
+
+.web-toggle:disabled {
+  opacity: 1;
+}

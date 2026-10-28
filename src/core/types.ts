@@ -1,6 +1,6 @@
 export type AgentId = 'claude' | 'codex';
-/** `chat` and `edit` handle one message of a conversation; the others are standalone runs. */
-export type WorkflowKind = 'implementation' | 'brainstorming' | 'chat' | 'edit';
+/** `chat`, `edit`, and `research` handle one message of a conversation; the others can also run standalone. */
+export type WorkflowKind = 'implementation' | 'brainstorming' | 'chat' | 'edit' | 'research';
 export type PermissionMode = 'read-only' | 'workspace-write';
 export type RunStatus =
   | 'queued'
@@ -39,6 +39,14 @@ export interface WorkflowStageDefinition {
   gate?: boolean;
   /** A failing verdict at this review adds one read-only Claude stage that revises the answer. */
   onFail?: 'revise';
+  /**
+   * `lean` gives the stage the workspace as a summary (status, changed files, a short diff, untracked file
+   * names) instead of full contents; the agent reads what it needs. Every turn of an agent re-reads its
+   * prompt, so a smaller one saves tokens many times over.
+   */
+  context?: 'lean';
+  /** The stage may search and read the web; other stages may only when the user turns web access on. */
+  web?: boolean;
   /** When plan approval is enabled, the user must approve the work so far before this stage starts. */
   requiresApproval?: boolean;
   /** Fix round that added this stage; absent for template stages. */
@@ -182,6 +190,8 @@ export interface RunRecord {
   history?: string;
   /** Sessions from the conversation's previous turn that this run's first stage of each agent continues. */
   continueSessions?: Partial<Record<AgentId, string>>;
+  /** The user allowed every stage of this run to search and read the web. */
+  web?: boolean;
 }
 
 /** Everything about a new run beyond its kind, objective, folder, and consent. */
@@ -193,6 +203,7 @@ export interface StartOptions {
   continueSessions?: Partial<Record<AgentId, string>>;
   /** An active worktree from the same conversation that this run keeps editing. */
   worktree?: WorktreeInfo;
+  web?: boolean;
 }
 
 export interface AgentRunRequest {
@@ -215,6 +226,13 @@ export interface AgentRunRequest {
   images?: readonly string[];
   /** Folders outside the working directory the agent may read, such as the conversation's attachments. */
   readableDirectories?: readonly string[];
+  /** The agent may search and read the web. */
+  web?: boolean;
+  /**
+   * Commands the user consented to as verification commands, which an editing stage may run itself so it
+   * can test its change before finishing.
+   */
+  allowedCommands?: readonly (readonly string[])[];
 }
 
 export type ActivityKind = 'read' | 'search' | 'edit' | 'command' | 'web' | 'reasoning' | 'tool';

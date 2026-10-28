@@ -117,6 +117,10 @@ describe('streamed text and agent activity', () => {
     expect(reasoning?.event?.activity).toMatchObject({ kind: 'reasoning', tool: 'Thinking', title: 'Comparing the two' });
     const search = parseCodexLine('{"type":"item.completed","item":{"type":"web_search","query":"pdf.js worker"}}');
     expect(search?.event?.activity).toMatchObject({ kind: 'web', tool: 'Web search', title: 'pdf.js worker' });
+    const page = parseCodexLine('{"type":"item.completed","item":{"type":"web_search","query":"","action":{"type":"other"}}}');
+    expect(page?.event?.activity).toEqual({ kind: 'web', tool: 'Web page', title: 'Read a search result' });
+    const opened = parseCodexLine('{"type":"item.completed","item":{"type":"web_search","query":"","action":{"type":"open_page","url":"https://arxiv.org/abs/1"}}}');
+    expect(opened?.event?.activity).toMatchObject({ tool: 'Web page', title: 'https://arxiv.org/abs/1', input: 'https://arxiv.org/abs/1' });
   });
 });
 
