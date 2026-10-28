@@ -2,9 +2,10 @@
 import { formatSize } from '../../core/context.js';
 import type { Conversation, ConversationTurn } from '../../core/conversation.js';
 import { describeOutcome, finalStage } from '../../core/conversation.js';
+import { formatReset } from '../../core/limits.js';
 import { canResume } from '../../core/orchestrator.js';
 import type { AgentActivity, AgentId, AgentStreamEvent, AttachmentRef, RunRecord, StageRecord, TokenUsage } from '../../core/types.js';
-import { checksPassed } from '../../core/types.js';
+import { checksPassed, isFinished } from '../../core/types.js';
 import { sumByAgent, totalTokens } from '../../core/usage.js';
 import { onlyMinorFindings, summarizeVerdict } from '../../core/verdict.js';
 import type { WorktreeChange } from '../../core/worktree.js';
@@ -60,6 +61,10 @@ export interface TranscriptInput {
   awaitingApprovalRunId?: string;
   /** Webview URI for an image attachment's thumbnail. */
   thumbnail: (attachment: AttachmentRef) => string | undefined;
+  /** Nothing is running or starting, so a message can be retried. */
+  idle?: boolean;
+  /** When a run that stopped at the usage limits continues on its own, if it is scheduled to. */
+  continuation?: (runId: string) => string | undefined;
 }
 
 const AGENT_NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
@@ -150,7 +155,8 @@ function stageViews(run: RunRecord, live: ReadonlyMap<string, LiveStage> | undef
     const view: StageView = {
       index,
       id: stage.id,
-      title: stage.title,
+      // Titles name the planned agent ("Claude answers"); a stand-in's stage is titled for the agent that ran it.
+      title: stage.assignedAgent === stage.agent ? stage.title : stage.title.replace(/^(?:Claude|Codex)\b/, AGENT_NAMES[stage.assignedAgent]),
       agent: stage.assignedAgent,
       label: stageLabel(run, stage),
       status: stage.status,
@@ -194,7 +200,12 @@ function turnView(turn: ConversationTurn, input: TranscriptInput, latestEditRun:
     checks: [],
     awaitingApproval: run !== undefined && run.id === input.awaitingApprovalRunId,
     canResume: run !== undefined && !active && canResume(run),
+    canRetry: Boolean(input.idle) && !active && (run !== undefined ? isFinished(run.status) : turn.status !== undefined),
   };
+  if (run && !active && run.status === 'failed' && run.limitReset) {
+    const continuesAt = input.continuation?.(run.id);
+    view.paused = { runId: run.id, reset: formatReset(run.limitReset), ...(continuesAt ? { continuesAt: formatReset(continuesAt) } : {}) };
+  }
   if (turn.runId) view.runId = turn.runId;
   if (run && !active) view.outcome = { text: describeOutcome(run), tone: toneOf(run) };
   else if (!run && turn.outcome) view.outcome = { text: turn.outcome, tone: turn.status === 'failed' ? 'bad' : 'neutral' };
