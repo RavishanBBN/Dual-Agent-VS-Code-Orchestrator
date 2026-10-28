@@ -4,7 +4,7 @@
 
 ## Project status
 
-- **Release:** 2.1.0 (chat with attachments, model and effort pickers, and quick edits; see [CHANGELOG.md](CHANGELOG.md))
+- **Release:** 2.2.0 (Research mode with web access and source checking, leaner context, and first-shot edits; see [CHANGELOG.md](CHANGELOG.md))
 - **Lifecycle:** production-oriented local release
 - **Last updated:** 2026-10-28
 - **Implementation:** complete
@@ -23,6 +23,7 @@ Every chat message runs in one of four modes, chosen in the composer:
 | Mode | What happens | Agent calls | Files |
 |---|---|---|---|
 | **Chat** (default) | Claude answers → Codex checks the answer → Claude revises only if the check fails | 2–3 | read-only |
+| **Research** | Claude researches on the web with cited sources → Codex opens every source and looks for missing or contrary work → Claude revises if needed | 2–3 | read-only, web on |
 | **Edit** | Claude edits an isolated copy → your checks run → Codex reviews the diff → bounded fix rounds | 2–4 | isolated copy, applied by you |
 | **Brainstorm** | Claude proposal → Codex challenge → Claude synthesis → Codex final challenge → Claude recommendation | 5 | read-only |
 | **Implement** | the full implementation workflow below, with your approval of the plan | 7+ | isolated copy, applied by you |
@@ -41,6 +42,18 @@ Claude plan
     -> Claude completion report (read-only)
     -> you review the diff, then apply or discard it
 ```
+
+## Quality and token use
+
+The workflows are built for answers you can rely on, without paying for the same work twice:
+
+- **Independent checking.** Codex checks every Chat and Research answer and reviews every edit. A finding of medium severity or higher makes Claude revise; low-severity notes are shown without another call.
+- **Sources that hold up.** In Research, Claude reads every source before citing it, and Codex opens each one to confirm it exists and supports its claim, and searches for what was missed. Both reason at high effort unless you choose otherwise.
+- **Targeted reviews.** Each reviewer sees the previous agent's steps (files read, searches, commands), so it checks specific claims and looks at what was not examined instead of re-exploring.
+- **Lean context.** Chat, Research, and Brainstorm get a summary of the workspace and read the files they need. Every agent step re-reads its prompt, so this saves tokens on every step. Reviews of edits still get the full diff.
+- **Right the first time.** In Edit and Implement, Claude may run your configured test commands while it works, and if the checks still fail, it repairs once before Codex reviews.
+
+**Web access.** Research mode always uses the web. In other modes, the **Web** toggle in the composer lets the agents search and read pages for that message. Search terms and page requests leave your machine, and page content is treated as untrusted.
 
 Follow-up messages continue the conversation. Claude continues its own session, so it is sent only what is new; Codex starts fresh on every message, with a summary of the conversation, so its checks stay independent. Edit messages in one conversation keep working on the same isolated copy until you apply or discard it.
 

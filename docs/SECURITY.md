@@ -72,6 +72,20 @@ The chat is the only webview. Its page is built into the extension package and r
 
 Residual risk: a webview shares VS Code's renderer. A flaw in VS Code's webview isolation is outside this extension's control.
 
+### Web access
+
+Research stages, and any stage of a message for which the user turned on the **Web** toggle, may search and read the web. Claude gets its WebSearch and WebFetch tools; Codex runs with `--search`. This changes the boundary:
+
+- **Data leaves the machine.** Search terms, page requests, and anything an agent puts into a URL reach search engines and web sites. A page or a repository file could try to steer an agent into putting workspace content into a URL. Web access is therefore off by default outside Research, shown on the composer, and chosen per message.
+- **Untrusted pages.** Page content reaches the agents' context as evidence, like repository text. Agent output that quotes it is fenced in later prompts.
+- **No other permission.** A stage with web access can still only read and search the workspace when it is read-only.
+
+Residual risk: a model can be misled by a page, or include sensitive context in a search. Do not turn on the web for workspaces whose content must not leave the machine.
+
+### Editing stages that run your checks
+
+Editing stages may run the user's verification commands themselves, through Claude Code prefix rules built only from arguments that need no quoting. These are the commands the user already configured and consented to for the extension to run after each edit, so no new command source is introduced. Once Bash is available, Claude Code also runs commands it judges read-only, as for configured tool rules.
+
 ### Attachments
 
 Attachments are files the user chooses to send to both providers. The extension limits what it does with them:

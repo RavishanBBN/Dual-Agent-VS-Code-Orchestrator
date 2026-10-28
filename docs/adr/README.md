@@ -7,3 +7,4 @@
 - [ADR-0005: Native VS Code interface](0005-native-vscode-interface.md)
 - [ADR-0006: Isolated worktrees and a verification gate](0006-isolation-and-verification-gate.md)
 - [ADR-0007: Conversational chat panel](0007-chat-panel.md)
+- [ADR-0008: Research mode, web access, and lean context](0008-research-web-and-lean-context.md)

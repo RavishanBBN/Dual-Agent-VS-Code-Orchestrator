@@ -2,6 +2,38 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
+## [2.2.0] - 2026-10-28
+
+Research support and better answers for fewer tokens.
+
+### Added
+
+- **Research mode.**
+  - **Claude researches** with the web, the attachments, and the workspace. It reads every source before citing it, cites each claim inline with a numbered source list, separates established, contested, and unknown points with its confidence, and maps research gaps.
+  - **Codex verifies the sources:** it opens every cited source, confirms it exists and supports its claim, and searches for missing or contrary work.
+  - **Claude revises** when needed, keeping only confirmed sources.
+  - **Both agents reason at high effort** unless you choose otherwise.
+- **Web access.** A **Web** toggle in the composer lets the agents search and read the web for a message in any mode; Research always has it. Claude gets WebSearch and WebFetch, and Codex runs with `--search`. Codex's web steps appear on the timeline.
+- **First-shot edits.** Editing stages may run your configured verification commands themselves (for example `node --test math.test.js` under `Bash(node --test:*)`), and when the checks still fail after an edit, Claude repairs once before Codex reviews.
+- ADR 0008.
+
+### Changed
+
+- **Lean context.** Chat, Research, and Brainstorm stages get the workspace as a summary (status, diff summary, at most 8,000 characters of diff, untracked file names) and read what they need. Editing reviews keep the full diff.
+- **Evidence trail.** Each stage after another sees the previous stage's steps, so reviewers verify specific claims and look at what was not examined.
+- **Prompt guidance.**
+  - Every stage is told to work economically: search before reading, read only what is needed, and don't re-read.
+  - Conversation answers lead with the result and drop stage-report sections, and a passing check is at most two sentences.
+  - The Edit stage reads callers and tests first, follows the project's conventions, adds tests, and runs the checks.
+- **Minor notes.** A Chat or Research check that fails with only low-severity findings keeps the answer and shows the notes ("Codex agreed, with 2 minor notes") instead of spending a revision.
+
+### Verified live
+
+Using Claude haiku and Codex gpt-5.6-luna:
+- **Tokens:** with the same chat question and attachments as before, the follow-up's Codex check used half the input tokens (15.7k instead of 31.3k), and answers were shorter.
+- **Research:** a research run found three real problems in Claude's first draft through Codex's source check, and Claude corrected them after reopening the papers.
+- **Edit:** an Edit run had Claude run `node --test math.test.js` itself before finishing.
+
 ## [2.1.0] - 2026-10-28
 
 A Claude Code–style chat becomes the main interface. Claude answers and Codex checks the answer, conversations take attachments, and each agent's model and effort can be chosen per message. The Runs and Agents views, Command Palette workflows, and every safety boundary from 2.0 remain.

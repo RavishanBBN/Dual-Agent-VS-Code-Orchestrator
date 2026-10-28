@@ -16,6 +16,26 @@ Every workflow obeys these rules:
 10. Workflows that edit files (Edit and Implement) start only when Git can describe the workspace.
 11. Files change after the final gate only through a fix round that is verified again; the completion stage is read-only.
 
+## Research workflow
+
+One message in **Research** mode. Every stage is read-only and has the web, and both agents use high reasoning effort unless the user chose another.
+
+1. **Claude researches.** Claude uses the web, the attachments, and the workspace. It prefers primary and authoritative sources and reads each one before citing it, never citing from a snippet or from memory. It cites every factual claim inline and ends with a numbered source list. It separates established, contested, and unknown points and gives its confidence. For research-gap questions, it maps what has been done, what has not, why each gap matters, and how it could be studied.
+2. **Codex verifies the sources** (with a verdict). Codex opens each cited source and confirms that it exists, is attributed correctly, and supports its claim. It searches for missing work and counter-evidence, and checks the reasoning and numbers.
+3. **Claude revises the research**, when the check fails with a finding of medium severity or higher. It rechecks the findings against the sources themselves, keeps only confirmed sources, adds what was missing, and adjusts its conclusions.
+
+## Web access
+
+Research stages always have the web. In every other mode the user can turn on the composer's **Web** toggle for a message, which gives every stage of that message the web. Claude gets its WebSearch and WebFetch tools, and Codex runs with `--search`. Web access adds no other permission: read-only stages still cannot run commands or edit files.
+
+## Quality and context rules
+
+- **Lean context.** Chat, Research, and Brainstorm stages see the workspace as a summary: status, the diff summary, at most 8,000 characters of diff, and untracked files by name. They read the files they need. Edit and Implement stages keep the full diff.
+- **Evidence trail.** Each stage after another sees the steps the previous stage took, fenced as untrusted. Reviewers check specific claims and look at what was not examined instead of re-exploring.
+- **Economical work.** Every stage is told to find code with search tools before reading, to read only the files and ranges it needs, and not to re-read what it already has.
+- **Answers for the reader.** In conversations, answers lead with the result and contain no stage-report sections; a passing check is at most two sentences.
+- **Minor notes.** A Chat or Research check that fails with only low-severity findings keeps the answer; the notes stay visible on the check.
+
 ## Chat workflow
 
 One message in **Chat** mode, the default. Every stage is read-only and runs in the conversation's folder.
@@ -33,7 +53,7 @@ One message in **Edit** mode: a quick change without a planning stage. It needs 
 1. **Claude makes the change** (workspace-write). Claude inspects the relevant code, makes the change asked for, and ends with a summary. Configured verification commands then run.
 2. **Codex reviews the change** (read-only, with a verdict, a gate). Codex reviews the diff against the message and the checks.
 
-A failed review starts fix rounds exactly as in the implementation workflow. The changes stay in the worktree until you apply or discard them. Later Edit messages in the same conversation keep working in the same worktree, so a change can be built up over several messages and reviewed once.
+Claude may run the configured verification commands itself while it edits (see [Orchestrator-run checks](#orchestrator-run-checks)). If the checks still fail after the edit, one **Claude fixes the failing checks** stage runs before the review, so Codex reviews working code; this repair happens at most once per run, in Implement as well. A failed review starts fix rounds exactly as in the implementation workflow. The changes stay in the worktree until you apply or discard them. Later Edit messages in the same conversation keep working in the same worktree, so a change can be built up over several messages and reviewed once.
 
 ## Conversations
 
@@ -137,6 +157,8 @@ A `fail` verdict, a missing verdict, or a failing, timed-out, or unstartable com
 ## Orchestrator-run checks
 
 `dualAgent.verification.commands` run after every workspace-write stage, including fallback-completed and fix-round stages. Commands run in order in the stage's working directory and stop at the first failure. Each records its command, exit code, duration, and the last 16 KB of combined output. The next prompt lists each command with its exit code, which is reported by the extension and reliable, and fences the output as untrusted evidence. Up to a fifth of the evidence budget is reserved for check output.
+
+Editing stages may also run these commands themselves while they work. Claude gets a Claude Code prefix rule for each command, for example `Bash(node --test:*)`, which also allows extra arguments such as a single test file. A command with an argument that would need quoting gets no rule. Read-only stages never get these rules.
 
 `dualAgent.isolation.setupCommands` run once in a new worktree before the first stage. A failing setup command fails the run before any agent runs; resuming the run retries setup.
 

@@ -6,12 +6,12 @@ This document is the maintained implementation ledger for Dual Agent Orchestrato
 
 | Field | Value |
 |---|---|
-| Release | 2.1.0 (chat with attachments, model and effort pickers, and quick edits) |
+| Release | 2.2.0 (Research mode with web access, lean context, evidence trails, and first-shot edits) |
 | Last updated | 2026-10-28 |
 | Product scope | Desktop VS Code extension, trusted local workspaces only |
 | Interface | Chat webview (side bar or editor tab); native Runs and Agents views, commands, status bar, output channel, read-only documents, diff editors |
 | Primary workflow | Chat: Claude answers, Codex checks the answer, Claude revises when the check fails |
-| Other workflows | Edit (worktree edit, Codex review gate, fix rounds); Claude-led implementation with plan approval and a verified final gate; reciprocal brainstorming |
+| Other workflows | Research (web research, Codex source verification, revision); Edit (worktree edit, Codex review gate, fix rounds); Claude-led implementation with plan approval and a verified final gate; reciprocal brainstorming |
 | Runtime integration | Local Claude Code and Codex CLIs, resolved to absolute paths outside the workspace and worktree |
 | Authentication | Existing CLI sign-ins; credentials are not read by the extension |
 | Agent environment | Allowlisted; billing variables removed in subscription mode |
@@ -24,6 +24,8 @@ This document is the maintained implementation ledger for Dual Agent Orchestrato
 |---|---|---|
 | Project structure and build | Complete | TypeScript, esbuild (extension, PDF worker, and webview bundles), strict configuration |
 | Chat panel | Complete | Webview view and editor tab (title-bar button, named after the conversation), nonce CSP, validated protocol, streamed text, a timeline of agent steps with IN/OUT kept after the run, verdict badges, consent, approval, changes and check cards, history; smoke test in VS Code 1.143.1 |
+| Research workflow and web access | Complete | Claude WebSearch and WebFetch, Codex `--search`, source verification, high effort by default, Web toggle per message |
+| Quality and token controls | Complete | Lean context, evidence trail, economical-work guidance, answers for the reader, minor-notes rule, verification commands available to editing stages, one repair before review |
 | Chat and Edit workflows | Complete | Chat check with a single revision; Edit with a gate and fix rounds in a conversation-scoped worktree |
 | Conversations | Complete | One file per conversation, budgeted history, Claude sessions across messages, answers kept after run pruning |
 | Attachments | Complete | Images, PDFs, ZIP, Word, Excel, PowerPoint, notebooks, text; private storage, content detection, safe unpacking, PDF worker with timeout |
@@ -58,11 +60,14 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 | Dependency audit | Passed | `npm audit`: 0 known vulnerabilities, with preact 10.29.8, markdown-it 15.0.3, fflate 0.8.3, and unpdf 1.8.1 pinned |
 | TypeScript | Passed | Strict `tsc --noEmit`, including the webview's TSX |
 | ESLint | Passed | Type-aware rules; zero findings |
-| Unit and integration tests | Passed | 206 passed, 1 skipped (POSIX-only symlink test), 18 files |
+| Unit and integration tests | Passed | 215 passed, 1 skipped (POSIX-only symlink test), 18 files |
 | Coverage | Passed | 93.8% lines, 78.5% branches, 90.2% statements, 91.4% functions across every module that does not import `vscode` or Preact |
 | Smoke test in VS Code | Passed | `npm run smoke`, VS Code 1.143.1. Brainstorming and worktree review as in 2.0.0. The chat page loaded its script under its CSP, and the Codex model list arrived from the fake CLI. A Chat message with an attachment completed with "Codex agreed", both agents' steps stayed in the transcript with their IN and OUT, and each fake CLI received the chosen model, effort, attachment folder, streaming, and read-only tools. A follow-up continued Claude's session. An Edit message passed the consent card and changed only the worktree, and its changes card listed the file. The chat opened in an editor tab |
 | Live chat with attachments | Passed | Real CLIs, Claude haiku at low effort and Codex gpt-5.6-luna at low effort, in a disposable repository. Claude read a PNG, a PDF, a Word file, and a ZIP and answered all four facts correctly, with text streamed in 28 chunks. Codex opened the unpacked ZIP file in its sandbox and saw the image through `--image`, and passed the answer |
 | Live follow-up | Passed | Claude continued its session and answered from it |
+| Live research | Passed | Claude haiku and Codex gpt-5.6-luna: Claude cited three arXiv papers; Codex opened their full text and found three real problems (an understated mitigation section, real workloads described as missing, a paper published at EuroSys 2025 described as a preprint); Claude reopened the papers, corrected all three, and rebutted the part Codex overstated |
+| Live token comparison | Passed | Same chat question, attachments, and models as the 2.1 check: Codex input on the follow-up check fell from 31.3k to 15.7k tokens, Claude's follow-up answer from 49 to 21 output tokens, first message unchanged within noise on this small repository |
+| Live first-shot edit | Passed | With `node --test` configured, Claude ran `node --test math.test.js` itself under the prefix rule and reported both tests passing; an exact rule had blocked the same command, which led to prefix rules |
 | Live edit | Passed | Claude continued the session from the worktree folder and edited only the worktree. Codex reviewed with `git diff` and passed it. The repository was unchanged until apply. API-equivalent Claude cost for all three messages: $0.13 |
 | PDF worker | Passed | The bundled `dist/pdfWorker.js` extracted text in a worker thread; a hanging worker is stopped by the timeout in tests |
 | Chat layout | Checked | The built page rendered in headless Chrome with VS Code's dark theme colors at 300, 400, and 440 pixels wide: the timeline of stages and tool calls with IN/OUT boxes, cards, and the composer's mode and model pills |

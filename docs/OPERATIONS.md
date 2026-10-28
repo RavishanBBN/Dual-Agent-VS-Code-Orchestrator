@@ -39,7 +39,7 @@ Agents receive an allowlisted environment (see the README's billing section). If
 
 ### Claude reports that it could not run tests
 
-Claude stages have no shell unless a rule in `dualAgent.claude.allowedTools` names one, for example `Bash(npm test:*)` or `Bash(npm run lint)`. A rule makes its tool available to write stages and pre-approves the matching commands. Print mode cannot ask for approval, so Claude Code denies other commands unless it judges them read-only. Read-only stages never get a shell. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in your own `~/.claude/settings.json` still apply, but only to tools a stage already has, so they cannot add a shell; rules in the repository's `.claude/settings.json` deliberately do not apply.
+Editing stages may run your `dualAgent.verification.commands` themselves, with extra arguments, so setting those is usually enough; a command with an argument that needs quoting gets no rule. Otherwise, Claude stages have no shell unless a rule in `dualAgent.claude.allowedTools` names one, for example `Bash(npm test:*)` or `Bash(npm run lint)`. A rule makes its tool available to write stages and pre-approves the matching commands. Print mode cannot ask for approval, so Claude Code denies other commands unless it judges them read-only. Read-only stages never get a shell. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in your own `~/.claude/settings.json` still apply, but only to tools a stage already has, so they cannot add a shell; rules in the repository's `.claude/settings.json` deliberately do not apply.
 
 Codex review stages run in a read-only sandbox, so test runners and builds that write files (caches, coverage, build output) usually fail there. Reviewers are instructed to report such checks as not run rather than passed. For results reviewers can rely on, configure `dualAgent.verification.commands`: the extension runs them itself after every editing stage and reports their exit codes to the next reviewer.
 
@@ -65,6 +65,10 @@ git config --global --add safe.directory "F:/path/to/repository"
 ### The chat says it cannot run here
 
 The chat needs a trusted workspace with a local folder. In a multi-root workspace, a new conversation uses the folder of the active editor, or the first folder; the conversation keeps that folder.
+
+### Research or the Web toggle finds nothing
+
+Research mode always gives both agents the web; in other modes, turn on **Web** in the composer. If searches fail, check that each CLI can reach the internet (proxy variables may need `dualAgent.environment.passthrough`) and that your Codex plan includes web search. The agents' web steps appear on the timeline as WebSearch, WebFetch, Web search, or Web page.
 
 ### An attachment is refused
 
