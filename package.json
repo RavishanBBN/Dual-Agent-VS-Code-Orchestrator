@@ -1,8 +1,8 @@
 {
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent Orchestrator",
-  "description": "A Claude-led, Codex-reviewed workflow orchestrator for VS Code with reciprocal review, safe handoffs, and subscription-aware execution.",
-  "version": "1.1.0",
+  "description": "Claude plans and implements, Codex independently reviews, and you approve: a reciprocal two-agent workflow in the VS Code sidebar, with isolated worktrees, verification gates, and subscription-safe execution.",
+  "version": "2.0.0",
   "private": true,
   "publisher": "local",
   "license": "MIT",
@@ -20,12 +20,6 @@
     "agents",
     "orchestration",
     "code-review"
-  ],
-  "activationEvents": [
-    "onView:dualAgent.dashboard",
-    "onCommand:dualAgent.runImplementation",
-    "onCommand:dualAgent.runBrainstorming",
-    "onCommand:dualAgent.doctor"
   ],
   "main": "./dist/extension.js",
   "capabilities": {
@@ -51,45 +45,273 @@
     "views": {
       "dualAgent": [
         {
-          "type": "webview",
-          "id": "dualAgent.dashboard",
-          "name": "Orchestrator"
+          "id": "dualAgent.runs",
+          "name": "Runs",
+          "contextualTitle": "Dual Agent"
+        },
+        {
+          "id": "dualAgent.agents",
+          "name": "Agents",
+          "contextualTitle": "Dual Agent"
         }
       ]
     },
     "commands": [
       {
         "command": "dualAgent.runImplementation",
-        "title": "Dual Agent: Run Implementation Workflow"
+        "title": "Start Implementation Run",
+        "category": "Dual Agent",
+        "icon": "$(play)",
+        "enablement": "!dualAgent.running"
       },
       {
         "command": "dualAgent.runBrainstorming",
-        "title": "Dual Agent: Run Brainstorming Workflow"
+        "title": "Start Brainstorming Run",
+        "category": "Dual Agent",
+        "icon": "$(lightbulb)",
+        "enablement": "!dualAgent.running"
       },
       {
         "command": "dualAgent.cancel",
-        "title": "Dual Agent: Cancel Active Workflow"
+        "title": "Cancel Run",
+        "category": "Dual Agent",
+        "icon": "$(debug-stop)"
       },
       {
-        "command": "dualAgent.doctor",
-        "title": "Dual Agent: Check Agent Setup"
+        "command": "dualAgent.resumeRun",
+        "title": "Resume Run",
+        "category": "Dual Agent",
+        "icon": "$(debug-continue)",
+        "enablement": "!dualAgent.running"
+      },
+      {
+        "command": "dualAgent.approvePlan",
+        "title": "Approve Plan…",
+        "category": "Dual Agent",
+        "icon": "$(check)"
+      },
+      {
+        "command": "dualAgent.rejectPlan",
+        "title": "Reject Plan",
+        "category": "Dual Agent",
+        "icon": "$(close)"
+      },
+      {
+        "command": "dualAgent.reviewChanges",
+        "title": "Review Changes",
+        "category": "Dual Agent",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "dualAgent.applyChanges",
+        "title": "Apply Changes to Workspace",
+        "category": "Dual Agent",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "dualAgent.discardChanges",
+        "title": "Discard Changes",
+        "category": "Dual Agent",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "dualAgent.openWorktree",
+        "title": "Open Worktree in New Window",
+        "category": "Dual Agent",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "dualAgent.openReport",
+        "title": "Open Run Report",
+        "category": "Dual Agent",
+        "icon": "$(book)"
+      },
+      {
+        "command": "dualAgent.exportRun",
+        "title": "Export Run Report…",
+        "category": "Dual Agent",
+        "icon": "$(save)"
       },
       {
         "command": "dualAgent.exportLatestRun",
-        "title": "Dual Agent: Export Latest Run Report"
+        "title": "Export Latest Run Report…",
+        "category": "Dual Agent",
+        "icon": "$(save)"
+      },
+      {
+        "command": "dualAgent.doctor",
+        "title": "Check Agent Setup",
+        "category": "Dual Agent",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "dualAgent.showOutput",
+        "title": "Show Output",
+        "category": "Dual Agent",
+        "icon": "$(output)"
+      },
+      {
+        "command": "dualAgent.refreshRuns",
+        "title": "Refresh Runs",
+        "category": "Dual Agent",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "dualAgent.openDocument",
+        "title": "Open Run Document",
+        "category": "Dual Agent"
+      },
+      {
+        "command": "dualAgent.openChange",
+        "title": "Open Change",
+        "category": "Dual Agent"
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "dualAgent.doctor",
-          "when": "view == dualAgent.dashboard",
-          "group": "navigation"
+          "command": "dualAgent.cancel",
+          "when": "view == dualAgent.runs && dualAgent.running",
+          "group": "navigation@0"
+        },
+        {
+          "command": "dualAgent.runImplementation",
+          "when": "view == dualAgent.runs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dualAgent.runBrainstorming",
+          "when": "view == dualAgent.runs",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dualAgent.refreshRuns",
+          "when": "view == dualAgent.runs",
+          "group": "navigation@9"
+        },
+        {
+          "command": "dualAgent.resumeRun",
+          "when": "view == dualAgent.runs",
+          "group": "1_run@1"
+        },
+        {
+          "command": "dualAgent.showOutput",
+          "when": "view == dualAgent.runs",
+          "group": "2_output@1"
         },
         {
           "command": "dualAgent.exportLatestRun",
-          "when": "view == dualAgent.dashboard",
+          "when": "view == dualAgent.runs",
+          "group": "2_output@2"
+        },
+        {
+          "command": "dualAgent.doctor",
+          "when": "view == dualAgent.agents",
           "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "dualAgent.approvePlan",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bawaitingApproval\\b/",
+          "group": "inline@1"
+        },
+        {
+          "command": "dualAgent.rejectPlan",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bawaitingApproval\\b/",
+          "group": "inline@2"
+        },
+        {
+          "command": "dualAgent.cancel",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bactive\\b/",
+          "group": "inline@3"
+        },
+        {
+          "command": "dualAgent.resumeRun",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bresumable\\b/",
+          "group": "inline@4"
+        },
+        {
+          "command": "dualAgent.reviewChanges",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bworktree\\b/",
+          "group": "inline@5"
+        },
+        {
+          "command": "dualAgent.reviewChanges",
+          "when": "view == dualAgent.runs && viewItem == changes",
+          "group": "inline@1"
+        },
+        {
+          "command": "dualAgent.applyChanges",
+          "when": "view == dualAgent.runs && viewItem == changes",
+          "group": "inline@2"
+        },
+        {
+          "command": "dualAgent.openReport",
+          "when": "view == dualAgent.runs && viewItem =~ /\\brun\\b/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "dualAgent.exportRun",
+          "when": "view == dualAgent.runs && viewItem =~ /\\brun\\b/",
+          "group": "1_open@2"
+        },
+        {
+          "command": "dualAgent.reviewChanges",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bworktree\\b/",
+          "group": "2_changes@1"
+        },
+        {
+          "command": "dualAgent.applyChanges",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bworktree\\b/",
+          "group": "2_changes@2"
+        },
+        {
+          "command": "dualAgent.discardChanges",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bworktree\\b/",
+          "group": "2_changes@3"
+        },
+        {
+          "command": "dualAgent.openWorktree",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bworktree\\b/",
+          "group": "2_changes@4"
+        },
+        {
+          "command": "dualAgent.resumeRun",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bresumable\\b/",
+          "group": "3_run@1"
+        },
+        {
+          "command": "dualAgent.approvePlan",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bawaitingApproval\\b/",
+          "group": "3_run@2"
+        },
+        {
+          "command": "dualAgent.cancel",
+          "when": "view == dualAgent.runs && viewItem =~ /\\bactive\\b/",
+          "group": "3_run@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "dualAgent.cancel",
+          "when": "dualAgent.running"
+        },
+        {
+          "command": "dualAgent.approvePlan",
+          "when": "dualAgent.awaitingApproval"
+        },
+        {
+          "command": "dualAgent.rejectPlan",
+          "when": "dualAgent.awaitingApproval"
+        },
+        {
+          "command": "dualAgent.openDocument",
+          "when": "false"
+        },
+        {
+          "command": "dualAgent.openChange",
+          "when": "false"
         }
       ]
     },
@@ -100,13 +322,13 @@
           "type": "string",
           "default": "codex",
           "scope": "machine",
-          "description": "Codex CLI command name or absolute path. Machine-scoped, and never resolved from the workspace folder."
+          "description": "Codex CLI command name or absolute path. Machine-scoped, and never resolved from the workspace folder or its worktree."
         },
         "dualAgent.claude.command": {
           "type": "string",
           "default": "claude",
           "scope": "machine",
-          "description": "Claude Code CLI command name or absolute path. Machine-scoped, and never resolved from the workspace folder."
+          "description": "Claude Code CLI command name or absolute path. Machine-scoped, and never resolved from the workspace folder or its worktree."
         },
         "dualAgent.billingMode": {
           "type": "string",
@@ -189,9 +411,89 @@
           "default": [],
           "scope": "machine",
           "markdownDescription": "Extra environment variable names passed to agent processes. By default only an allowlist (PATH, home and temp locations, locale, proxy and TLS settings) is passed so tokens and cloud credentials stay out of reach. In `subscription` billing mode, API-key and endpoint variables are removed even if listed here."
+        },
+        "dualAgent.isolation.mode": {
+          "type": "string",
+          "enum": [
+            "worktree",
+            "none"
+          ],
+          "default": "worktree",
+          "scope": "machine",
+          "enumDescriptions": [
+            "Implementation runs edit an isolated Git worktree in private storage. You review the diff and apply or discard it when the run ends.",
+            "Implementation runs edit the workspace directly, as in 1.x."
+          ],
+          "markdownDescription": "Where implementation runs edit files. The worktree contains tracked files plus your uncommitted and untracked changes, but not ignored files such as `node_modules` or `.env`; use `#dualAgent.isolation.setupCommands#` to install dependencies there."
+        },
+        "dualAgent.isolation.setupCommands": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "default": [],
+          "scope": "machine",
+          "markdownDescription": "Commands run once in a new worktree before the first stage, each as an argument list without a shell, for example `[[\"npm\", \"ci\"]]`. They run repository code with your permissions, outside any agent sandbox, and are listed in the consent prompt."
+        },
+        "dualAgent.verification.commands": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "default": [],
+          "scope": "machine",
+          "markdownDescription": "Commands the extension runs after every editing stage, each as an argument list without a shell, for example `[[\"npm\", \"test\"]]`. Their exit codes and output are given to the next reviewer as evidence, and a failure keeps the final gate from passing. They execute code the agents may have changed, with your permissions and outside any agent sandbox, and are listed in the consent prompt. Executables are never taken from the workspace, so use a command on `PATH` such as `npm` or `npx`."
+        },
+        "dualAgent.verification.timeoutMinutes": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 120,
+          "scope": "machine",
+          "description": "Maximum duration of each setup or verification command."
+        },
+        "dualAgent.workflow.maxFixRounds": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 3,
+          "scope": "machine",
+          "markdownDescription": "How many times Claude may fix the result after the final verification fails (a \"fail\" verdict, no readable verdict, or a failing verification command). Each round adds a Claude fix stage and a fresh Codex verification. When rounds run out the run ends as \"completed with unresolved findings\"."
+        },
+        "dualAgent.workflow.approvePlan": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Pause implementation runs after Codex reviews Claude's plan, so you can approve, add guidance, or reject it before any file is edited."
+        },
+        "dualAgent.claude.resumeSessions": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Continue Claude's previous session in later Claude stages of the same run, so its earlier exploration and output are not sent again. A session that cannot be resumed is replaced by a new one automatically."
         }
       }
-    }
+    },
+    "viewsWelcome": [
+      {
+        "view": "dualAgent.runs",
+        "contents": "Claude plans and implements, Codex reviews independently, and you approve the plan and the final diff.\n[Start Implementation Run](command:dualAgent.runImplementation)\n[Start Brainstorming Run](command:dualAgent.runBrainstorming)\nBoth CLIs must be installed and signed in. [Check Agent Setup](command:dualAgent.doctor)",
+        "when": "workspaceFolderCount > 0"
+      },
+      {
+        "view": "dualAgent.runs",
+        "contents": "Open a folder to run agents in it.\n[Open Folder](command:workbench.action.files.openFolder)",
+        "when": "workspaceFolderCount == 0"
+      }
+    ]
   },
   "scripts": {
     "build": "node ./scripts/build.mjs",
@@ -200,6 +502,7 @@
     "lint": "eslint src test",
     "test": "vitest run --coverage",
     "test:watch": "vitest",
+    "smoke": "npm run build && node ./scripts/smoke.mjs",
     "check": "npm run lint && npm run typecheck && npm test && npm run build",
     "package": "npm run check && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links"
   },
