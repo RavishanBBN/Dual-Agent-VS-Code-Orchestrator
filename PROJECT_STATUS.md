@@ -55,8 +55,8 @@ Results of the 2.0.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 | Dependency audit | Passed | `npm audit`: 0 known vulnerabilities |
 | TypeScript | Passed | Strict `tsc --noEmit` |
 | ESLint | Passed | Type-aware rules; zero findings |
-| Unit and integration tests | Passed | 145 passed, 1 skipped (POSIX-only symlink test), 15 files |
-| Coverage | Passed | 93.5% lines, 79.7% branches, 88.7% statements, 91.2% functions across every module that does not import `vscode` |
+| Unit and integration tests | Passed | 146 passed, 1 skipped (POSIX-only symlink test), 15 files; also passed with `TEMP` set to an 8.3 short path |
+| Coverage | Passed | 93.6% lines, 79.8% branches, 88.8% statements, 91.2% functions across every module that does not import `vscode` |
 | Smoke test in VS Code | Passed | `npm run smoke`, VS Code 1.143.1: activation, all contributed commands registered, both views, agent check, a brainstorming run started from a selection through the real QuickPick, verdict parsed, Claude session continued, report and stage documents, and a worktree's changes in the multi-file and single-file diff editors |
 | Smoke test detects failures | Passed | With one assertion deliberately broken, `npm run smoke` exited with code 1 |
 | Git hooks disabled | Passed | Planted `post-checkout` and `reference-transaction` hooks never ran during the worktree lifecycle; a control `git worktree add` ran them |
@@ -65,7 +65,8 @@ Results of the 2.0.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 | VSIX package | Passed | `dual-agent-orchestrator-2.0.0.vsix`, 23 files, 93 KB, no packaging warnings |
 | Claude CLI flags | Passed | `--resume` present in Claude Code 2.1.304; an unknown session fails before any model call with "No conversation found", which the adapter retries as a new session |
 | Codex CLI discovery | Not run | Codex was not on `PATH` for the verifying account; Codex arguments are unchanged from 1.1.0 and Codex sessions are not resumed |
-| Linux test run | Pending | POSIX-only paths (process-group termination, symlink handling) run in CI |
+| Linux test run | Passed | GitHub Actions `verify (ubuntu-latest)` on commit `e62cf0b`, including the POSIX-only paths (process-group termination, symlink handling) |
+| Windows CI run | Fixed | `verify (windows-latest)` on `e62cf0b` failed because untracked files were not copied into a worktree under the runner's short-name temp folder (`C:\Users\RUNNER~1`). Reproduced locally, fixed in path containment, and covered by a regression test |
 | Live model workflow | Not run | Intentionally avoids spending user quota during build verification |
 
 ## Release acceptance criteria
@@ -87,7 +88,7 @@ Results of the 2.0.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 - [x] Final `npm run check` passes.
 - [x] `npm run smoke` passes in a real VS Code.
 - [x] VSIX packaging passes.
-- [ ] CI passes on Linux for 2.0.0.
+- [x] CI passes on Linux for 2.0.0.
 - [ ] Signed-in test with live CLIs: brainstorming, cancellation, resume, and an implementation run with plan approval, verification commands, review, and apply.
 
 ## Known risks
@@ -106,7 +107,7 @@ Results of the 2.0.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 
 ## Next verification action
 
-Push to CI to confirm the Linux run. Then, with signed-in CLIs, install the VSIX and test in a disposable Git repository:
+Confirm that the Windows CI job passes with the path fix. Then, with signed-in CLIs, install the VSIX and test in a disposable Git repository:
 
 1. Run a read-only brainstorming run.
 2. Cancel a run during a stage, then resume it.

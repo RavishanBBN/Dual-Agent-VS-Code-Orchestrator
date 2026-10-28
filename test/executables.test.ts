@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -78,5 +78,22 @@ describe('isInsideDirectory', () => {
     expect(isInsideDirectory(root, root)).toBe(true);
     expect(isInsideDirectory(path.resolve('/workspace/a'), root)).toBe(false);
     expect(isInsideDirectory(path.resolve('/other'), root)).toBe(false);
+  });
+
+  // Regression: a Windows short name such as C:\Users\RUNNER~1 was expanded only for paths that existed.
+  it('resolves paths that do not exist yet through their existing ancestor', async () => {
+    const root = await temporaryDirectory('inside');
+    const real = path.join(root, 'real');
+    const outside = path.join(root, 'outside');
+    await mkdir(real);
+    await mkdir(outside);
+    // Junctions need no special rights on Windows; elsewhere the type is ignored and a symbolic link is made.
+    const linked = path.join(root, 'linked');
+    await symlink(real, linked, 'junction');
+    await symlink(outside, path.join(real, 'escape'), 'junction');
+
+    expect(isInsideDirectory(path.join(linked, 'new', 'file.txt'), linked)).toBe(true);
+    expect(isInsideDirectory(path.join(linked, 'new', 'file.txt'), real)).toBe(true);
+    expect(isInsideDirectory(path.join(real, 'escape', 'new-file.txt'), real)).toBe(false);
   });
 });

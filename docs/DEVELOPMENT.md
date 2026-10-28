@@ -43,6 +43,7 @@ A VS Code window appears for a few seconds. The script exits with VS Code's exit
 Several tests reproduce specific vulnerabilities and must keep passing:
 
 - a same-named launcher planted in the workspace, first on `PATH`, never runs (`cliAdapters.test.ts`, `executables.test.ts`);
+- a path that does not exist yet is compared through its resolved parent, so Windows short names match and a linked directory cannot lead outside (`executables.test.ts`);
 - on Windows, a `git.exe` planted in the workspace never runs, with `NoDefaultCurrentDirectoryInExePath` removed to match a normal desktop session (`gitSnapshot.test.ts`);
 - cancelling an agent started through a `.cmd` shim stops the agent itself, not only `cmd.exe` (`processRunner.test.ts`, Windows); the process-group equivalent runs everywhere;
 - an abort signal raised before a process starts prevents it from starting;

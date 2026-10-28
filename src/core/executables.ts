@@ -26,14 +26,29 @@ export function isFullyQualified(value: string): boolean {
   return isWindows ? /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(value) : path.isAbsolute(value);
 }
 
+/**
+ * Resolves symbolic links and Windows short names. A path that does not exist yet is resolved through its
+ * deepest existing ancestor, so it compares like its parent and cannot escape through a linked directory.
+ */
 function canonical(target: string): string {
-  let resolved = path.resolve(target);
-  try {
-    resolved = realpathSync.native(resolved);
-  } catch {
-    // Keep the lexical path for locations that do not exist.
+  let existing = path.resolve(target);
+  const missing: string[] = [];
+  let resolved: string | undefined;
+  while (resolved === undefined) {
+    try {
+      resolved = realpathSync.native(existing);
+    } catch {
+      const parent = path.dirname(existing);
+      if (parent === existing) {
+        resolved = existing;
+      } else {
+        missing.unshift(path.basename(existing));
+        existing = parent;
+      }
+    }
   }
-  return isWindows ? resolved.toLowerCase() : resolved;
+  const full = path.join(resolved, ...missing);
+  return isWindows ? full.toLowerCase() : full;
 }
 
 export function isInsideDirectory(target: string, directory: string): boolean {

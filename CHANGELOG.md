@@ -36,6 +36,7 @@ A native VS Code interface replaces the webview dashboard, and the improvement p
 ### Fixed
 
 - A Claude error result reported only in `errors` (for example an unknown session) now surfaces that message instead of a generic subtype.
+- Path containment checks resolved Windows short names (such as `C:\Users\RUNNER~1`) and linked directories only for paths that already existed. A path that does not exist yet is now resolved through its deepest existing parent. Previously untracked files were not copied into a worktree under such a folder, and a new file under a linked directory that points elsewhere counted as inside.
 
 ## [1.1.0] - 2026-10-28
 
