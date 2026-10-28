@@ -12,7 +12,7 @@ Native components cannot provide a conversation view with streamed Markdown, inl
 
 ## Decision
 
-- **Chat panel.** Add a webview view, **Chat**, as the first view of the Dual Agent container, available as an editor tab too. Keep the Runs and Agents views, documents, diff editors, status bar, and output channel native, and route every action in the chat to the same commands, consent, and single-run lock.
+- **Chat panel.** Add a webview view, **Chat**, in its own container in the secondary side bar, where Claude Code places its panel, and available as an editor tab too. Keep the Runs and Agents views, documents, diff editors, status bar, and output channel native, and route every action in the chat to the same commands, consent, and single-run lock.
 - **Four modes per message:**
   - **Chat:** Claude answers, then Codex checks the answer with a verdict, and Claude revises only when the check fails. It is read-only, with at most three calls.
   - **Edit:** Claude edits, verification commands run, Codex reviews the diff as a gate, and fix rounds follow, in a worktree the conversation keeps until the changes are applied or discarded.
