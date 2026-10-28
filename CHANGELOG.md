@@ -2,6 +2,41 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
+## [2.0.0] - 2026-10-28
+
+A native VS Code interface replaces the webview dashboard, and the improvement proposals from the 1.0 review are implemented. Implementation runs now edit an isolated Git worktree by default, and plan approval is on by default; set `dualAgent.isolation.mode` to `none` and `dualAgent.workflow.approvePlan` to `false` for 1.x behavior.
+
+### Changed
+
+- **Native interface.** The Dual Agent activity-bar container now holds a **Runs** tree view (runs, stages, check results, warnings, changed files) and an **Agents** view (Claude Code, Codex, and Git health), with a welcome view, title and context-menu actions, Command Palette commands, a status bar item, and a **Dual Agent** output channel. Stage outputs, check logs, and reports open as read-only documents, and changes open in the built-in diff editors. The webview, its HTML/CSS/JS assets, and its message protocol are removed.
+- Objectives are typed in an input box or taken from the active editor's selection; in a multi-root workspace you choose the folder (previously the first folder was always used).
+- The final Claude stage writes the completion report read-only. Fixes after the final verification happen only in fix rounds that are verified again.
+- A run's status now reflects the final gate: `completed` only when the last verification passed, otherwise `completed-with-findings`.
+- The manifest no longer lists `activationEvents`; VS Code derives them from the contributed views and commands.
+
+### Added
+
+- **Verification gate.** Review stages end with a machine-readable `verdict` block that is parsed into an outcome and findings by severity. A failing, missing, or unparseable verdict, or a failing verification command, fails the final gate. Claude then gets up to `dualAgent.workflow.maxFixRounds` fix rounds (default 1), each followed by a fresh Codex re-verification.
+- **Extension-run checks.** `dualAgent.verification.commands` run after every editing stage, and `dualAgent.isolation.setupCommands` once in a new worktree. Each is an argument list run without a shell, resolved outside the workspace, with the allowlisted environment and a timeout (`dualAgent.verification.timeoutMinutes`). Exit codes are reported to reviewers as reliable evidence, and the output is fenced as untrusted.
+- **Isolated worktrees.** `dualAgent.isolation.mode` (default `worktree`) runs implementation in a detached worktree. Its base includes your uncommitted and untracked work, and your branch, index, stash, and files are not touched. **Review Changes** opens every change in the multi-file diff editor. **Apply Changes** checks the whole patch for conflicts and writes the working tree only, and **Discard Changes** deletes the worktree.
+- **Plan approval.** `dualAgent.workflow.approvePlan` (default on) pauses before the first editing stage. You can open the plan beside its review, approve, approve with guidance that later prompts include, or reject.
+- **Session continuity.** `dualAgent.claude.resumeSessions` (default on) continues the previous Claude session in later Claude stages and leaves Claude's own earlier output out of the prompt. If the session is gone, the stage reruns in a new session automatically.
+- **Resume Run.** Failed and cancelled runs continue from their first unfinished stage, keeping completed stages and an earlier approval. Runs interrupted by closing VS Code are marked cancelled on the next start.
+- `npm run smoke`: an automated test inside a real VS Code. It completes a run against fake CLIs and reviews a worktree's changes in the diff editors.
+
+### Security
+
+- Every Git command the extension runs disables hooks (`core.hooksPath` set to the null device). Worktree checkout, staging, and ref updates would otherwise run repository hooks, which an agent with write access could plant.
+- Executables for agents, Git, and configured commands exclude the workspace, the worktree, and the repository root.
+- Untracked files whose names suggest secrets are never copied into a worktree, so they are not written into the repository's object database.
+- Worktree deletion refuses any path outside the extension's storage, and runs whose changes have not been applied or discarded are never pruned from history.
+- Agent text reaches tooltips only Markdown-escaped in untrusted `MarkdownString`s, so injected `command:` links cannot activate.
+- Claude session IDs that could be read as command-line flags are rejected.
+
+### Fixed
+
+- A Claude error result reported only in `errors` (for example an unknown session) now surfaces that message instead of a generic subtype.
+
 ## [1.1.0] - 2026-10-28
 
 Security hardening release. Upgrade from 1.0.0 and rebuild any distributed VSIX: the first and fourth items under Security can be exploited by a malicious repository.
