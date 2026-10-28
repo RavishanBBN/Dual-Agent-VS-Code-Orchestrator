@@ -2,6 +2,20 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
+## [Unreleased]
+
+### Changed
+
+- **Dependencies:**
+  - The chat page now runs on Preact 11. The smoke test passes in VS Code, and three of the four screenshots render byte-for-byte identically. The fourth differs only in the frame of its animated spinner.
+  - unpdf 1.9.1 for PDF text.
+  - eslint 10.
+  - CodeQL action 4.39.1.
+- **Error causes.** eslint 10's `preserve-caught-error` rule found a cancellation that dropped the failure it interrupted; the failure is now kept as the error's cause.
+- **Dependabot ignores two kinds of update.**
+  - **@types/node major versions:** these types must describe the Node 22 that VS Code 1.105 runs. Version 26 also fails the typecheck.
+  - **@types/vscode minor and major versions:** these must not exceed `engines.vscode`.
+
 ## [2.3.0] - 2026-10-28
 
 Ready for the Visual Studio Marketplace and Open VSX. Work continues through usage limits, messages can be queued, and any earlier message can be retried or edited.
