@@ -1,7 +1,7 @@
 {
   "name": "dual-agent-orchestrator",
-  "displayName": "Dual Agent Orchestrator",
-  "description": "Claude answers and Codex checks the answer: a chat where two coding agents review each other, with attachments, cited web research, isolated edits you review and apply, and token usage.",
+  "displayName": "Dual Agent: Claude + Codex",
+  "description": "Claude Code and Codex check each other’s work: Claude answers, Codex verifies. Chat, research with verified sources, isolated edits you review and apply, and one agent carries on when the other hits its limit.",
   "version": "2.3.1",
   "private": true,
   "publisher": "NileshRavishan",
@@ -33,12 +33,15 @@
     "claude",
     "claude code",
     "codex",
+    "codex cli",
     "ai",
     "agents",
     "multi-agent",
+    "pair programming",
     "code review",
-    "chat",
+    "second opinion",
     "research",
+    "chat",
     "llm"
   ],
   "extensionKind": [
@@ -236,6 +239,59 @@
         "command": "dualAgent.openChange",
         "title": "Open Change",
         "category": "Dual Agent"
+      },
+      {
+        "command": "dualAgent.fixProblem",
+        "title": "Fix with Dual Agent",
+        "category": "Dual Agent",
+        "icon": "$(wand)"
+      },
+      {
+        "command": "dualAgent.explainProblem",
+        "title": "Explain with Dual Agent",
+        "category": "Dual Agent"
+      },
+      {
+        "command": "dualAgent.askAboutSelection",
+        "title": "Ask Dual Agent About This",
+        "category": "Dual Agent",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "dualAgent.editBrief",
+        "title": "Edit Project Brief",
+        "category": "Dual Agent",
+        "icon": "$(note)"
+      },
+      {
+        "command": "dualAgent.exportConversation",
+        "title": "Export Conversation as Markdown",
+        "category": "Dual Agent",
+        "icon": "$(export)"
+      },
+      {
+        "command": "dualAgent.clearFindings",
+        "title": "Clear Findings in the Editor",
+        "category": "Dual Agent",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "dualAgent.signIn",
+        "title": "Sign In",
+        "category": "Dual Agent",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "dualAgent.signOut",
+        "title": "Sign Out",
+        "category": "Dual Agent",
+        "icon": "$(sign-out)"
+      },
+      {
+        "command": "dualAgent.refreshLimits",
+        "title": "Refresh Subscription Limits",
+        "category": "Dual Agent",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -304,6 +360,26 @@
           "command": "dualAgent.doctor",
           "when": "view == dualAgent.agents",
           "group": "navigation"
+        },
+        {
+          "command": "dualAgent.editBrief",
+          "when": "view == dualAgent.chat",
+          "group": "brief@1"
+        },
+        {
+          "command": "dualAgent.exportConversation",
+          "when": "view == dualAgent.chat",
+          "group": "brief@2"
+        },
+        {
+          "command": "dualAgent.clearFindings",
+          "when": "view == dualAgent.chat",
+          "group": "brief@3"
+        },
+        {
+          "command": "dualAgent.signIn",
+          "when": "view == dualAgent.agents",
+          "group": "navigation@0"
         }
       ],
       "view/item/context": [
@@ -386,6 +462,21 @@
           "command": "dualAgent.cancel",
           "when": "view == dualAgent.runs && viewItem =~ /\\bactive\\b/",
           "group": "3_run@3"
+        },
+        {
+          "command": "dualAgent.signIn",
+          "when": "view == dualAgent.agents && viewItem =~ /^account-/",
+          "group": "inline@1"
+        },
+        {
+          "command": "dualAgent.signOut",
+          "when": "view == dualAgent.agents && viewItem == account-signed-in",
+          "group": "account@2"
+        },
+        {
+          "command": "dualAgent.signIn",
+          "when": "view == dualAgent.agents && viewItem =~ /^account-/",
+          "group": "account@1"
         }
       ],
       "commandPalette": [
@@ -408,6 +499,18 @@
         {
           "command": "dualAgent.openChange",
           "when": "false"
+        },
+        {
+          "command": "dualAgent.fixProblem",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "dualAgent.explainProblem",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "dualAgent.askAboutSelection",
+          "when": "editorIsOpen"
         }
       ],
       "editor/title": [
@@ -415,6 +518,18 @@
           "command": "dualAgent.openChatInEditor",
           "group": "navigation@100",
           "when": "activeWebviewPanelId != 'dualAgent.chatPanel'"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "dualAgent.askAboutSelection",
+          "when": "resourceScheme == file",
+          "group": "dualAgent@1"
+        },
+        {
+          "command": "dualAgent.fixProblem",
+          "when": "resourceScheme == file",
+          "group": "dualAgent@2"
         }
       ]
     },
@@ -624,13 +739,67 @@
           "default": true,
           "scope": "machine",
           "markdownDescription": "Mask API keys, tokens, and private keys (AWS, GitHub, OpenAI, Anthropic, Google, Slack, Stripe, npm, Azure, JWTs, PEM keys) in the diffs, files, attachments, history, and check output the extension puts into prompts, and in the output log. Agents can still open files themselves."
+        },
+        "dualAgent.gemini.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "When Codex's check finds problems with an answer, let Gemini CLI rule on each finding before Claude revises, as an independent referee. Needs Gemini CLI installed and signed in (`npm install -g @google/gemini-cli`, then run `gemini` once). Gemini runs read-only, in its plan mode."
+        },
+        "dualAgent.gemini.command": {
+          "type": "string",
+          "default": "gemini",
+          "scope": "machine",
+          "description": "Gemini CLI command name or absolute path, never resolved from the workspace."
+        },
+        "dualAgent.gemini.model": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Optional Gemini model, such as pro or flash. Empty uses the CLI default."
+        },
+        "dualAgent.codex.agentNetwork": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "In Agent mode Codex cannot ask before a command, so it works inside its own sandbox. Allow that sandbox to reach the network, so Codex can install packages for the folder. Claude in Agent mode asks you before every command it does not judge read-only."
+        },
+        "dualAgent.chat.includeEditorContext": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Include the active editor's file, selected lines, and problems in new messages, shown as a chip you can turn off per message."
+        },
+        "dualAgent.chat.sound": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Play a short sound in the chat when a message that took longer than 15 seconds finishes."
+        },
+        "dualAgent.findings.showInEditor": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Show reviewers' findings that name a file and line as problems in the editor and the Problems panel."
+        },
+        "dualAgent.claude.userMcpServers": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Let Claude use MCP servers, as Claude Code does in your terminal. Off by default: Claude then loads no MCP server at all, because a server can read and send data. When on, Claude loads the servers from your own Claude configuration, and a server a repository declares in `.mcp.json` may also load if you approved it in Claude Code. Claude still needs a rule in `#dualAgent.claude.allowedTools#` to call a server's tools without asking."
+        },
+        "dualAgent.usage.readLocalLogs": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "Count all use of Claude Code and Codex on this machine, including terminals and other editors, by reading the logs both CLIs keep (`~/.claude/projects` and `~/.codex/sessions`). Only token counts, times, usage-limit messages, and Codex's rate-limit percentages are read; conversations are not kept, and nothing leaves your machine. Limits found there also hand work to the other agent before a call fails."
         }
       }
     },
     "viewsWelcome": [
       {
         "view": "dualAgent.runs",
-        "contents": "Talk to Claude and Codex in the chat on the right-hand side bar.\n[Open Chat](command:dualAgent.openChat)\nClaude plans and implements, Codex reviews independently, and you approve the plan and the final diff.\n[Start Implementation Run](command:dualAgent.runImplementation)\n[Start Brainstorming Run](command:dualAgent.runBrainstorming)\nBoth CLIs must be installed and signed in. [Check Agent Setup](command:dualAgent.doctor)",
+        "contents": "Talk to Claude and Codex in the chat on the right-hand side bar.\n[Open Chat](command:dualAgent.openChat)\nClaude plans and implements, Codex reviews independently, and you approve the plan and the final diff.\n[Start Implementation Run](command:dualAgent.runImplementation)\n[Start Brainstorming Run](command:dualAgent.runBrainstorming)\nBoth CLIs must be installed and signed in.\n[Sign In](command:dualAgent.signIn)\n[Check Agent Setup](command:dualAgent.doctor)",
         "when": "workspaceFolderCount > 0"
       },
       {
@@ -644,6 +813,12 @@
         "command": "dualAgent.openChat",
         "key": "ctrl+alt+d",
         "mac": "cmd+alt+d"
+      },
+      {
+        "command": "dualAgent.askAboutSelection",
+        "key": "ctrl+alt+shift+d",
+        "mac": "cmd+alt+shift+d",
+        "when": "editorTextFocus"
       }
     ],
     "walkthroughs": [
@@ -655,7 +830,7 @@
           {
             "id": "setup",
             "title": "Install and sign in to both CLIs",
-            "description": "Dual Agent drives the Claude Code and Codex CLIs you already use, with their saved sign-in.\n[Check Agent Setup](command:dualAgent.doctor)",
+            "description": "Dual Agent drives the Claude Code and Codex CLIs you already use, with their saved sign-in. Sign in to either from here, in the CLI's own browser or device-code flow.\n[Sign In](command:dualAgent.signIn)\n[Check Agent Setup](command:dualAgent.doctor)",
             "media": {
               "markdown": "media/walkthrough/setup.md"
             },
@@ -677,8 +852,8 @@
           },
           {
             "id": "modes",
-            "title": "Pick a mode",
-            "description": "Chat, Research, Edit, Brainstorm, or Implement. Choose models and effort per agent from the pills under the message box.\n[Open Chat](command:dualAgent.openChat)",
+            "title": "Pick a mode and who works",
+            "description": "Chat, Research, Agent, Edit, Test first, Compare, Brainstorm, or Implement, or type / for commands. Choose Claude + Codex, Codex + Claude, or either one alone, and the model and effort for each.\n[Open Chat](command:dualAgent.openChat)",
             "media": {
               "markdown": "media/walkthrough/modes.md"
             }
@@ -694,7 +869,7 @@
           {
             "id": "review",
             "title": "Review and apply",
-            "description": "Edits happen in an isolated copy. Nothing reaches your files until you review the diff and apply it.\n[Show Token Usage](command:dualAgent.showUsage)",
+            "description": "Edit mode works in an isolated copy, and nothing reaches your files until you apply it, all at once or file by file. Agent mode, and folders without Git, are edited directly after a snapshot, so you keep or undo the changes.\n[Show Token Usage](command:dualAgent.showUsage)",
             "media": {
               "markdown": "media/walkthrough/review.md"
             }

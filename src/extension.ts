@@ -1,4 +1,5 @@
-import { writeFile } from 'node:fs/promises';
+import { watch, type FSWatcher } from 'node:fs';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -6,23 +7,45 @@ import * as vscode from 'vscode';
 
 import { runChecks } from './adapters/checkRunner.js';
 import { ClaudeCliAdapter, CodexCliAdapter } from './adapters/cliAdapters.js';
+import {
+  accountEnvironment,
+  accountExecutable,
+  accountStatus,
+  PROVIDER_NAMES,
+  SIGN_IN_METHODS,
+  signInWithKey,
+  signOut,
+  terminalLaunch,
+  type AccountOptions,
+  type AccountProvider,
+  type AccountStatus,
+} from './adapters/accounts.js';
+import { isOnline } from './adapters/connectivity.js';
+import { GeminiReferee } from './adapters/gemini.js';
+import { localUsageHomes, LocalUsageScanner, type LocalUsageReport } from './adapters/localUsage.js';
+import { PermissionBroker } from './adapters/permissionBroker.js';
 import { listCodexModels, type CodexModel } from './adapters/models.js';
 import { readConfiguration, type ExtensionConfiguration } from './config.js';
 import { extractPdfTextInWorker } from './core/attachments.js';
+import { describeOutcome, titleFor } from './core/conversation.js';
 import { checkGit } from './core/git.js';
 import { AgentLimits, formatReset, type AgentLimit } from './core/limits.js';
 import { redactSecrets } from './core/redact.js';
 import { canResume, editsFiles, WorkflowOrchestrator, type OrchestratorDependencies } from './core/orchestrator.js';
 import { renderRunReport } from './core/report.js';
 import { FileRunStore } from './core/store.js';
-import type { AgentStreamEvent, OrchestratorEvent, RunRecord, WorkflowKind, WorktreeInfo } from './core/types.js';
+import type { AgentId, AgentStreamEvent, OrchestratorEvent, QuotaReading, RunRecord, WorkflowKind, WorktreeInfo } from './core/types.js';
+import { isFinished } from './core/types.js';
 import {
   applyWorktree,
+  applyWorktreeFiles,
   checkpointWorktree,
+  createFolderSnapshot,
   createWorktree,
   listWorktreeChanges,
   removeWorktree,
   restoreWorktree,
+  revertWorktreeFiles,
   worktreeExists,
   WorktreeError,
   type WorktreeChange,
@@ -30,8 +53,8 @@ import {
 import { ApprovalCoordinator, RunStatusBar } from './ui/approvals.js';
 import { ChatController, type ChatHost } from './ui/chat/chatController.js';
 import { CHAT_VIEW, ChatViewProvider } from './ui/chat/chatProvider.js';
-import type { ChatState } from './ui/chat/protocol.js';
-import { continueAt, ContinuationScheduler, type Continuation, type ContinuationOutcome } from './ui/continuations.js';
+import { fileReference, type ChatState } from './ui/chat/protocol.js';
+import { continueAt, ContinuationScheduler, NETWORK_RETRY_MS, type Continuation, type ContinuationOutcome } from './ui/continuations.js';
 import { BASE_SCHEME, baseUri, BaseFileProvider, reportUri, RUN_SCHEME, RunDocumentProvider, stageUri } from './ui/documents.js';
 import {
   applyDetail,
@@ -47,6 +70,25 @@ const ALLOW = 'Allow and Start';
 /** Usage limits are per account, so they are kept in global state; paused runs belong to the workspace. */
 const LIMITS_KEY = 'dualAgent.agentLimits';
 const CONTINUATIONS_KEY = 'dualAgent.continuations';
+const QUOTAS_KEY = 'dualAgent.quotas';
+/** How often a terminal sign-in is checked, and for how long. */
+const SIGN_IN_POLL_MS = 3_000;
+const SIGN_IN_WAIT_MS = 10 * 60_000;
+/** The prompt of the small call that asks an agent for its current limits. */
+const LIMITS_PROMPT = 'Reply with the single word OK. Do not use any tools.';
+/** How often the CLIs' logs are read again when no change was noticed, and how long changes settle first. */
+const LOCAL_USAGE_POLL_MS = 120_000;
+const LOCAL_USAGE_SETTLE_MS = 3_000;
+const BRIEF_TEMPLATE = `# Project brief
+
+Write here what both agents should always know about this project: its purpose, conventions, commands, and
+anything they must not touch. Every message includes this brief. It is stored privately, not in the repository.
+`;
+
+/** A folder that Git does not track, or one without a commit, is edited directly after a snapshot instead. */
+function needsFolderSnapshot(error: unknown): boolean {
+  return error instanceof WorktreeError && /not a git repository|at least one commit/i.test(error.message);
+}
 /** Agent messages are shown whole in stage documents; the output channel gets a readable excerpt. */
 const LOG_EXCERPT = 400;
 
@@ -129,6 +171,224 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
   let detach = (): void => undefined;
   // Shared by every run, so an agent at its usage limit is skipped until the limit resets.
   const limits = new AgentLimits(context.globalState.get<AgentLimit[]>(LIMITS_KEY) ?? []);
+  // The accounts' usage windows as the CLIs last reported them, for the quota meter.
+  const quotas = new Map<AgentId, QuotaReading>((context.globalState.get<QuotaReading[]>(QUOTAS_KEY) ?? []).map((reading) => [reading.agent, reading]));
+  const briefPath = path.join(storagePath, 'brief.md');
+
+  /** Keeps the newest reading of each account's limits, whether from a run or from the CLIs' own logs. */
+  function noteQuota(reading: QuotaReading): void {
+    const known = quotas.get(reading.agent);
+    // A Claude reading from its logs only says a limit was reached; it does not replace measured windows.
+    if (known && Date.parse(known.observedAt) > Date.parse(reading.observedAt)) return;
+    if (known?.windows.length && !reading.windows.length) quotas.set(reading.agent, { ...known, limited: reading.limited, ...(reading.resetsAt ? { resetsAt: reading.resetsAt } : {}) });
+    else quotas.set(reading.agent, reading);
+    void context.globalState.update(QUOTAS_KEY, [...quotas.values()]);
+    chat.refresh();
+  }
+
+  // Each CLI's sign-in, as its own status command last reported it.
+  const accounts = new Map<AccountProvider, AccountStatus>();
+
+  function accountOptions(provider: AccountProvider): AccountOptions {
+    const current = readConfiguration();
+    const agent = provider === 'gemini' ? current.claude : current[provider];
+    return {
+      command: provider === 'gemini' ? current.gemini.command : agent.command,
+      billingMode: agent.billingMode,
+      ...(agent.environmentPassthrough ? { environmentPassthrough: agent.environmentPassthrough } : {}),
+      untrustedDirectories: localFolders().map((folder) => folder.uri.fsPath),
+    };
+  }
+
+  async function refreshAccount(provider: AccountProvider): Promise<AccountStatus> {
+    const status = await accountStatus(provider, accountOptions(provider));
+    accounts.set(provider, status);
+    chat.refresh();
+    return status;
+  }
+
+  /** Signs in with the CLI's own flow: in a terminal for a browser or device code, or with a typed API key. */
+  async function signIn(provider?: AccountProvider): Promise<void> {
+    const chosen =
+      provider ??
+      (
+        await vscode.window.showQuickPick(
+          (['claude', 'codex', 'gemini'] as const).map((id) => ({ label: `Sign in to ${PROVIDER_NAMES[id]}`, description: accounts.get(id)?.detail ?? '', id })),
+          { title: 'Dual Agent: Sign In' },
+        )
+      )?.id;
+    if (!chosen) return;
+    const name = PROVIDER_NAMES[chosen];
+    const methods = SIGN_IN_METHODS[chosen];
+    const method =
+      methods.length === 1
+        ? methods[0]
+        : (await vscode.window.showQuickPick(methods.map((item) => ({ label: item.label, description: item.description, method: item })), { title: `Sign in to ${name}`, placeHolder: 'How do you want to sign in?' }))?.method;
+    if (!method) return;
+    const options = accountOptions(chosen);
+    if (method.readsKey) {
+      const key = await vscode.window.showInputBox({
+        title: `Sign in to ${name} with an API key`,
+        prompt: `Paste the key. It goes straight to ${name}, which stores it; Dual Agent does not keep it.`,
+        password: true,
+        ignoreFocusOut: true,
+        validateInput: (value) => (value.trim().length >= 20 && !/\s/.test(value.trim()) ? undefined : 'That does not look like an API key.'),
+      });
+      if (!key) return;
+      await signInWithKey(chosen, method, key, options);
+      const status = await refreshAccount(chosen);
+      void agentsView.refresh();
+      void vscode.window.showInformationMessage(status.signedIn ? `Dual Agent: ${name} is signed in. ${status.detail}` : `Dual Agent: ${name} did not accept the key. ${status.detail}`);
+      return;
+    }
+    const before = accounts.get(chosen)?.signedIn ?? (await refreshAccount(chosen)).signedIn;
+    const environment = accountEnvironment(options);
+    const terminal = vscode.window.createTerminal({
+      name: `Sign in to ${name}`,
+      ...terminalLaunch(accountExecutable(options), method.args, environment),
+      cwd: os.homedir(),
+      // The agents' own environment, so the sign-in lands where they look for it.
+      env: environment,
+      strictEnv: true,
+      iconPath: new vscode.ThemeIcon('account'),
+    });
+    terminal.show();
+    output.info(`Signing in to ${name} in a terminal (${method.label}).`);
+    watchSignIn(chosen, terminal, before === true);
+  }
+
+  /** Follows a terminal sign-in until the CLI reports it, the terminal closes, or ten minutes pass. */
+  function watchSignIn(provider: AccountProvider, terminal: vscode.Terminal, wasSignedIn: boolean): void {
+    const started = Date.now();
+    let done = false;
+    const finish = async (): Promise<void> => {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      closed.dispose();
+      const status = await refreshAccount(provider);
+      void agentsView.refresh();
+      if (status.signedIn) void vscode.window.showInformationMessage(`Dual Agent: ${PROVIDER_NAMES[provider]} is signed in. ${status.detail}`);
+    };
+    const timer = setInterval(() => {
+      if (Date.now() - started > SIGN_IN_WAIT_MS) void finish();
+      // Re-signing in changes nothing visible until the terminal closes; a first sign-in shows as soon as it lands.
+      else if (!wasSignedIn) void accountStatus(provider, accountOptions(provider)).then((status) => (status.signedIn ? finish() : undefined));
+    }, SIGN_IN_POLL_MS);
+    const closed = vscode.window.onDidCloseTerminal((item) => {
+      if (item === terminal) void finish();
+    });
+    context.subscriptions.push(closed, { dispose: () => clearInterval(timer) });
+  }
+
+  async function signOutOf(provider?: AccountProvider): Promise<void> {
+    const signedIn = (['claude', 'codex'] as const).filter((id) => accounts.get(id)?.signedIn);
+    const chosen =
+      provider ??
+      (await vscode.window.showQuickPick(signedIn.map((id) => ({ label: `Sign out of ${PROVIDER_NAMES[id]}`, description: accounts.get(id)?.detail ?? '', id })), { title: 'Dual Agent: Sign Out' }))?.id;
+    if (!chosen) return;
+    const name = PROVIDER_NAMES[chosen];
+    const choice = await vscode.window.showWarningMessage(
+      `Sign out of ${name}?`,
+      { modal: true, detail: `${name} signs out everywhere on this machine that uses the same configuration, including your terminal.` },
+      'Sign Out',
+    );
+    if (choice !== 'Sign Out') return;
+    await signOut(chosen, accountOptions(chosen));
+    await refreshAccount(chosen);
+    void agentsView.refresh();
+  }
+
+  /** Asks each agent for its current limits with one small call; the providers report them with every call. */
+  async function refreshLimits(): Promise<void> {
+    const current = readConfiguration();
+    const folder = path.join(context.globalStorageUri.fsPath, 'limits-check');
+    await mkdir(folder, { recursive: true });
+    const signal = new AbortController().signal;
+    const ask = async (adapter: ClaudeCliAdapter | CodexCliAdapter, options: { model?: string; effort?: string }): Promise<void> => {
+      const result = await adapter.run({
+        prompt: LIMITS_PROMPT,
+        cwd: folder,
+        untrustedDirectories: [folder],
+        permission: 'read-only',
+        signal,
+        options,
+        onEvent: (event) => {
+          if (event.quota) noteQuota(event.quota);
+        },
+      });
+      if (result.quota) {
+        noteQuota(result.quota);
+        limits.observe(result.quota);
+      }
+    };
+    const results = await Promise.allSettled([
+      ask(new ClaudeCliAdapter(current.claude), { model: 'haiku' }),
+      ask(new CodexCliAdapter(current.codex), { effort: 'low' }),
+    ]);
+    for (const [index, result] of results.entries()) {
+      if (result.status === 'rejected') output.warn(`${index === 0 ? 'Claude' : 'Codex'} did not report its limits: ${message(result.reason)}`);
+    }
+  }
+
+  // Usage of Claude Code and Codex anywhere on this machine, read from their own logs, so the totals and limits
+  // also reflect work done in a terminal or another editor.
+  const localUsage = new LocalUsageScanner(localUsageHomes());
+  let machine: LocalUsageReport | undefined;
+  let localTimer: ReturnType<typeof setTimeout> | undefined;
+  const localWatchers: FSWatcher[] = [];
+  async function scanLocalUsage(): Promise<void> {
+    if (!readConfiguration().readLocalLogs) {
+      machine = undefined;
+      return;
+    }
+    try {
+      machine = await localUsage.scan();
+      for (const reading of machine.quotas) {
+        noteQuota(reading);
+        limits.observe(reading);
+      }
+      chat.refresh();
+    } catch (error) {
+      output.debug(`The CLIs' usage logs could not be read: ${message(error)}`);
+    }
+  }
+  function scheduleLocalScan(delay = LOCAL_USAGE_SETTLE_MS): void {
+    if (localTimer) clearTimeout(localTimer);
+    localTimer = setTimeout(() => {
+      localTimer = undefined;
+      void scanLocalUsage().finally(() => scheduleLocalScan(LOCAL_USAGE_POLL_MS));
+    }, delay);
+  }
+  function watchLocalUsage(): void {
+    for (const watcher of localWatchers.splice(0)) watcher.close();
+    if (!readConfiguration().readLocalLogs) return;
+    const homes = localUsageHomes();
+    for (const folder of [path.join(homes.claude, 'projects'), path.join(homes.codex, 'sessions')]) {
+      try {
+        // Only that something changed is used; the scan then reads what was appended.
+        const watcher = watch(folder, { recursive: true }, () => scheduleLocalScan());
+        watcher.on('error', () => watcher.close());
+        localWatchers.push(watcher);
+      } catch {
+        // A CLI that was never used has no folder yet; the periodic scan still finds it later.
+      }
+    }
+  }
+  // Agent mode asks the user before commands and edits through this bridge.
+  const broker = new PermissionBroker({
+    storagePath: context.globalStorageUri.fsPath,
+    serverScript: path.join(context.extensionPath, 'dist', 'permissionServer.js'),
+    // The extension host runs on VS Code's own runtime, which acts as Node with this variable.
+    runtime: { command: process.execPath, env: { ELECTRON_RUN_AS_NODE: '1' } },
+    decide: (request) => chat.askPermission(request),
+  });
+  let permissionBridge: { configFile: string; tool: string } | undefined;
+  try {
+    permissionBridge = await broker.start();
+  } catch (error) {
+    output.warn(`Agent mode cannot ask before commands, so it is unavailable: ${message(error)}`);
+  }
 
   const runsView = new RunsView({
     activeRunId: () => orchestrator.activeRun?.id,
@@ -152,11 +412,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
 
   function dependencies(): OrchestratorDependencies {
     return {
-      prepareWorktree: (workspacePath, runId, signal) => createWorktree(workspacePath, path.join(worktreeRoot, runId.slice(0, 12)), signal),
+      prepareWorktree: async (workspacePath, runId, signal, direct) => {
+        const snapshot = (purpose: 'agent' | 'folder'): ReturnType<typeof createFolderSnapshot> =>
+          createFolderSnapshot(workspacePath, path.join(worktreeRoot, `direct-${runId.slice(0, 12)}.git`), signal, purpose);
+        // In a folder without Git, Agent mode's snapshot is the same as any mode's, so later edits can share it.
+        if (direct) return snapshot((await checkGit(workspacePath).catch(() => undefined))?.repository ? 'agent' : 'folder');
+        try {
+          return await createWorktree(workspacePath, path.join(worktreeRoot, runId.slice(0, 12)), signal);
+        } catch (error) {
+          // A folder without Git cannot have an isolated copy; it is edited directly after a snapshot.
+          if (needsFolderSnapshot(error)) return snapshot('folder');
+          throw error;
+        }
+      },
       worktreeExists,
       runChecks: (request) => runChecks(configuration.checks, request),
       requestApproval: (run, stage, signal) => approvals.request(run, stage, signal),
       limits,
+      online: () => isOnline(),
+      onQuota: (reading) => noteQuota(reading),
+      ...(configuration.gemini.enabled
+        ? {
+            referee: new GeminiReferee({
+              command: configuration.gemini.command,
+              timeoutMs: configuration.claude.timeoutMs,
+              billingMode: configuration.claude.billingMode,
+              ...(configuration.claude.environmentPassthrough ? { environmentPassthrough: configuration.claude.environmentPassthrough } : {}),
+              ...(configuration.gemini.model ? { model: configuration.gemini.model } : {}),
+            }),
+          }
+        : {}),
     };
   }
 
@@ -165,7 +450,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
     const current = readConfiguration();
     return JSON.stringify([current.isolation, current.setupCommands, current.verificationCommands]);
   }
-  let orchestrator = createOrchestrator(configuration, store, dependencies());
+  let orchestrator = createOrchestrator(configuration, store, dependencies(), permissionBridge);
 
   async function findRun(runId: string): Promise<RunRecord | undefined> {
     return lookup(runId) ?? (await store.list()).find((run) => run.id === runId);
@@ -225,11 +510,113 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
         await chat.runsChanged();
         return;
       }
+      // A folder edited directly is put back to its snapshot before the snapshot is removed.
+      if (worktree.gitDir) await restoreWorktree(worktree, worktree.baseCommit);
       await removeWorktree(worktree, worktreeRoot);
       await markWorktree(worktree, 'discarded');
     },
+    editorContext: (folder) => editorContext(folder),
+    readBrief: () => readFile(briefPath, 'utf8').catch(() => ''),
+    editBrief: async () => {
+      await mkdir(path.dirname(briefPath), { recursive: true });
+      await readFile(briefPath).catch(() => writeFile(briefPath, BRIEF_TEMPLATE, { encoding: 'utf8', mode: 0o600 }));
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(briefPath));
+    },
+    quotas: () => [...quotas.values()],
+    runCommand: async (folder, argv) => {
+      const choice = await vscode.window.showWarningMessage(
+        `Run \`${argv.join(' ')}\`?`,
+        {
+          modal: true,
+          detail: `It runs in ${folder} with your permissions, outside any agent sandbox, without a shell. Its output is attached to your next message. The command came from agent output, so read it first.`,
+        },
+        'Run',
+      );
+      if (choice !== 'Run') return undefined;
+      const [result] = await runChecks(configuration.checks, {
+        commands: [argv],
+        cwd: folder,
+        signal: new AbortController().signal,
+        untrustedDirectories: [folder],
+        onLine: (line) => output.info(`  ${line}`),
+      });
+      return result ? { exitCode: result.exitCode, output: result.error ?? result.output, durationMs: result.durationMs } : undefined;
+    },
+    pasteToTerminal: (folder, command) => {
+      // A line break would make the shell run the text at once, so only a single line is pasted.
+      if (/[\r\n]/.test(command.trim())) {
+        void vscode.window.showWarningMessage('Dual Agent: only a one-line command can be pasted into the terminal. Copy the block instead.');
+        return;
+      }
+      const terminal = vscode.window.terminals.find((item) => item.name === 'Dual Agent') ?? vscode.window.createTerminal({ name: 'Dual Agent', cwd: folder });
+      terminal.show();
+      // Not executed: the user reads it and presses Enter.
+      terminal.sendText(command.replace(/^(?:\$|>)\s+/, ''), false);
+    },
+    saveFile: async (defaultName, content, filters) => {
+      const target = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(path.join(os.homedir(), defaultName)), filters });
+      if (!target) return;
+      await writeFile(target.fsPath, configuration.redactSecrets ? redactSecrets(content).text : content, 'utf8');
+      const open = await vscode.window.showInformationMessage(`Dual Agent: saved ${path.basename(target.fsPath)}.`, 'Open');
+      if (open) await vscode.window.showTextDocument(target);
+    },
+    applyFile: async (runId, file) => {
+      const run = await findRun(runId);
+      if (!run?.worktree || run.worktree.state !== 'active' || run.worktree.gitDir) return;
+      const choice = await vscode.window.showWarningMessage(`Apply ${file} to your workspace?`, { modal: true, detail: 'Only this file is applied; the other changes stay in the isolated copy.' }, 'Apply');
+      if (choice !== 'Apply') return;
+      try {
+        await applyWorktreeFiles(run.worktree, [file]);
+      } catch (error) {
+        void vscode.window.showErrorMessage(`Dual Agent: ${message(error)}`);
+      }
+      await chat.runsChanged();
+    },
+    discardFile: async (runId, file) => {
+      const run = await findRun(runId);
+      if (!run?.worktree || run.worktree.state !== 'active') return;
+      const direct = Boolean(run.worktree.gitDir);
+      const choice = await vscode.window.showWarningMessage(
+        direct ? `Undo the changes to ${file}?` : `Discard the changes to ${file}?`,
+        { modal: true, detail: direct ? 'The file is put back as it was in the snapshot; a file the agents created is deleted.' : 'Only this file is put back in the isolated copy; your workspace is not touched.' },
+        direct ? 'Undo' : 'Discard',
+      );
+      if (!choice) return;
+      await revertWorktreeFiles(run.worktree, [file]);
+      await chat.runsChanged();
+    },
+    soundEnabled: () => configuration.sound,
+    machineUsage: () => (machine ? { days: { claude: machine.claude, codex: machine.codex }, scannedAt: machine.scannedAt } : undefined),
+    accounts: () => [...accounts.values()].map((status) => ({ provider: status.provider, signedIn: status.signedIn, detail: status.detail })),
+    signIn: (provider) => signIn(provider),
+    refreshLimits: () => refreshLimits(),
+    includeEditorByDefault: () => configuration.includeEditorContext,
   };
+  function editorContext(folder: string): ReturnType<ChatHost['editorContext']> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.scheme !== 'file') return undefined;
+    const relative = path.relative(folder, editor.document.uri.fsPath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return undefined;
+    const file = relative.split(path.sep).join('/');
+    const selection = editor.selection;
+    const selected = selection.isEmpty ? '' : editor.document.getText(selection);
+    const start = selection.start.line + 1;
+    const end = selection.end.line + 1 - (selection.end.character === 0 && selection.end.line > selection.start.line ? 1 : 0);
+    const diagnostics = vscode.languages
+      .getDiagnostics(editor.document.uri)
+      .filter((item) => item.severity <= vscode.DiagnosticSeverity.Warning)
+      .slice(0, 20)
+      .map((item) => `${file}:${item.range.start.line + 1}: ${item.severity === vscode.DiagnosticSeverity.Error ? 'error' : 'warning'}: ${item.message.split('\n')[0] ?? ''}`);
+    return {
+      file,
+      label: selected ? `${file}:${start}-${end}` : file,
+      ...(selected ? { startLine: start, endLine: end, selection: selected } : {}),
+      ...(diagnostics.length ? { diagnostics } : {}),
+    };
+  }
+
   const chat = new ChatController(chatHost, { global: context.globalState, workspace: context.workspaceState });
+  void chat.refreshBrief();
   const chatProvider = new ChatViewProvider(context.extensionUri, chat);
   const continuations = new ContinuationScheduler(
     context.workspaceState.get<unknown[]>(CONTINUATIONS_KEY) ?? [],
@@ -245,17 +632,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
   /** Schedules a run that stopped at the usage limits to continue once the first limit resets. */
   async function scheduleContinuation(runId: string): Promise<void> {
     const run = await findRun(runId);
-    if (!run?.limitReset || !canResume(run)) return;
-    const at = continueAt(run.limitReset);
-    continuations.schedule({ runId, at, commands: commandsSignature() });
-    output.info(`Run ${runId} continues automatically at ${formatReset(at)}.`);
+    if (!run || !canResume(run)) return;
+    if (run.limitReset) {
+      const at = continueAt(run.limitReset);
+      continuations.schedule({ runId, at, commands: commandsSignature() });
+      output.info(`Run ${runId} continues automatically at ${formatReset(at)}.`);
+    } else if (run.offlineSince) {
+      continuations.schedule({ runId, at: new Date(Date.now() + NETWORK_RETRY_MS).toISOString(), commands: commandsSignature(), network: true });
+      output.info(`Run ${runId} continues automatically when the network connection is back.`);
+    }
   }
 
   /** Continues a run whose usage limits have reset, unless what it was allowed to run has changed. */
   async function continueAfterLimit(item: Continuation): Promise<ContinuationOutcome> {
     if (busy || orchestrator.activeRun) return 'retry';
     const run = await findRun(item.runId);
-    if (!run || !canResume(run) || !run.limitReset || !vscode.workspace.isTrusted) return 'done';
+    if (!run || !canResume(run) || !(run.limitReset || run.offlineSince) || !vscode.workspace.isTrusted) return 'done';
+    if (item.network && !(await isOnline())) return 'retry';
     if (run.allowWrites && item.commands !== commandsSignature()) {
       output.warn(`Run ${run.id} was not continued automatically: its setup or verification commands changed while it was paused.`);
       void vscode.window
@@ -266,7 +659,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
         .then((choice) => (choice ? vscode.commands.executeCommand('dualAgent.resumeRun', run.id) : undefined));
       return 'done';
     }
-    output.info(`Usage limits reset; continuing run ${run.id}.`);
+    output.info(item.network ? `The network connection is back; continuing run ${run.id}.` : `Usage limits reset; continuing run ${run.id}.`);
     if (run.conversationId) {
       await chat.continueAfterLimit(run.id);
     } else {
@@ -280,11 +673,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
 
   /** Tells the user a run stopped at the usage limits, and schedules it to continue when that is on. */
   async function paused(run: RunRecord): Promise<void> {
-    if (!run.limitReset) return;
+    if (!run.limitReset && !run.offlineSince) return;
     const auto = readConfiguration().autoContinue;
     if (auto) await scheduleContinuation(run.id);
     // The chat shows a card for its own messages; a hidden chat, or a run from the Runs view, gets a notification.
     if (run.conversationId && chat.hasVisibleView) return;
+    if (!run.limitReset) {
+      const text = auto
+        ? 'Dual Agent: the network connection was lost. The message continues where it stopped when the connection is back.'
+        : 'Dual Agent: the network connection was lost, so the message stopped.';
+      const choice = await vscode.window.showWarningMessage(text, auto ? 'Do Not Continue' : 'Continue When Online', 'Resume Now');
+      if (choice === 'Do Not Continue') continuations.cancel(run.id);
+      else if (choice === 'Continue When Online') await scheduleContinuation(run.id);
+      else if (choice === 'Resume Now') await vscode.commands.executeCommand('dualAgent.resumeRun', run.id);
+      return;
+    }
     const reason = run.error ?? 'Both agents are at their usage limits.';
     if (auto) {
       const choice = await vscode.window.showWarningMessage(
@@ -321,7 +724,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
     configuration = readConfiguration();
     reportProblems(configuration);
     store = new FileRunStore(storagePath, configuration.maxRuns);
-    orchestrator = createOrchestrator(configuration, store, dependencies());
+    orchestrator = createOrchestrator(configuration, store, dependencies(), permissionBridge);
     reconfigurePending = false;
     attach();
   }
@@ -339,6 +742,45 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
     statusBar.show(text, tooltip, attention);
   }
 
+  const findings = vscode.languages.createDiagnosticCollection('Dual Agent');
+  const outcomeItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+  outcomeItem.command = 'dualAgent.openChat';
+
+  /** Puts reviewers' findings that name a file and line on that line, as the editor's problems. */
+  function showFindings(run: RunRecord): void {
+    findings.clear();
+    if (!configuration.findingsInEditor) return;
+    const byFile = new Map<string, vscode.Diagnostic[]>();
+    for (const stage of run.stages) {
+      if (!stage.review || !stage.verdict) continue;
+      for (const finding of stage.verdict.findings) {
+        if (!finding.location) continue;
+        const reference = fileReference(finding.location);
+        const absolute = path.resolve(run.workspacePath, reference.path);
+        if (path.relative(run.workspacePath, absolute).startsWith('..')) continue;
+        const line = Math.max(0, (reference.line ?? 1) - 1);
+        const severity =
+          finding.severity === 'blocker' || finding.severity === 'high'
+            ? vscode.DiagnosticSeverity.Error
+            : finding.severity === 'medium'
+              ? vscode.DiagnosticSeverity.Warning
+              : vscode.DiagnosticSeverity.Information;
+        const diagnostic = new vscode.Diagnostic(new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER), finding.title, severity);
+        diagnostic.source = `Dual Agent (${stage.assignedAgent === 'codex' ? 'Codex' : 'Claude'})`;
+        byFile.set(absolute, [...(byFile.get(absolute) ?? []), diagnostic]);
+      }
+    }
+    for (const [file, list] of byFile) findings.set(vscode.Uri.file(file), list);
+  }
+
+  function showOutcome(run: RunRecord): void {
+    const outcome = describeOutcome(run);
+    const icon = run.status === 'failed' ? '$(error)' : run.status === 'cancelled' ? '$(circle-slash)' : /agreed|Quick reply|merged/.test(outcome) ? '$(pass)' : '$(warning)';
+    outcomeItem.text = `${icon} ${outcome.length > 48 ? `${outcome.slice(0, 47)}…` : outcome}`;
+    outcomeItem.tooltip = `Dual Agent: ${outcome}. Click to open the chat.`;
+    outcomeItem.show();
+  }
+
   function handleEvent(event: OrchestratorEvent): void {
     chat.handleEvent(event);
     switch (event.type) {
@@ -346,6 +788,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
         runsView.upsert(event.run);
         documents.refresh(event.run.id);
         updateContext(event.run);
+        if (isFinished(event.run.status)) {
+          showFindings(event.run);
+          showOutcome(event.run);
+          if (event.run.status === 'failed' && /not logged in|sign in|log in|unauthori[sz]ed|authentication/i.test(event.run.error ?? '')) void agentsView.refresh();
+        }
         break;
       case 'agent-event':
         if (event.agentEvent) logAgentEvent(event.agentEvent);
@@ -375,15 +822,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       new CodexCliAdapter(current.codex).doctor(undefined, workspace),
     ]);
     const git = await checkGit(workspace);
+    const gemini = current.gemini.enabled ? await new GeminiReferee({ command: current.gemini.command, timeoutMs: 30_000, billingMode: current.claude.billingMode }).doctor() : undefined;
+    // Whether each installed CLI is signed in, from its own status command.
+    const signedIn = async (provider: AccountProvider, available: boolean): Promise<AccountStatus | undefined> => (available ? refreshAccount(provider) : undefined);
+    const [claudeAccount, codexAccount, geminiAccount] = await Promise.all([
+      signedIn('claude', health[0]?.available === true),
+      signedIn('codex', health[1]?.available === true),
+      signedIn('gemini', gemini?.available === true),
+    ]);
+    const agentRow = (id: 'claude' | 'codex' | 'gemini', label: string, available: boolean, version: string | undefined, detail: string, account: AccountStatus | undefined): ToolRow => ({
+      id,
+      label,
+      state: !available ? 'unavailable' : account?.signedIn === false ? 'warning' : 'ready',
+      description: !available
+        ? 'not available'
+        : `${version ?? 'installed'} · ${account?.signedIn ? (account.method ?? 'signed in') : account?.signedIn === false ? 'not signed in' : 'sign-in unknown'}`,
+      detail: account ? `${detail} ${account.detail}` : detail,
+      ...(available && account?.signedIn !== undefined ? { signedIn: account.signedIn } : {}),
+    });
     return [
-      ...health.map(
-        (item): ToolRow => ({
-          id: item.agent,
-          label: item.agent === 'claude' ? 'Claude Code' : 'Codex',
-          state: item.available ? 'ready' : 'unavailable',
-          description: item.available ? (item.version ?? 'installed') : 'not available',
-          detail: item.detail,
-        }),
+      ...health.map((item, index) =>
+        agentRow(item.agent, item.agent === 'claude' ? 'Claude Code' : 'Codex', item.available, item.version, item.detail, index === 0 ? claudeAccount : codexAccount),
       ),
       {
         id: 'git',
@@ -392,6 +851,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
         description: !git.available ? 'not available' : git.repository || !workspace ? (git.version ?? 'installed') : 'workspace not usable',
         detail: git.detail,
       },
+      ...(gemini ? [agentRow('gemini', 'Gemini CLI (referee)', gemini.available, gemini.version, gemini.detail, geminiAccount)] : []),
     ];
   }
 
@@ -445,7 +905,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       updateContext();
     }
     // Announced after `busy` is released: an unanswered notification must not block the next run.
-    if (finished?.limitReset) void paused(finished).catch((error: unknown) => output.error(message(error)));
+    if (finished?.limitReset || finished?.offlineSince) void paused(finished).catch((error: unknown) => output.error(message(error)));
     else if (finished) void announce(finished).catch((error: unknown) => output.error(message(error)));
     // Queued chat messages run once the lock is free; the timer lets the caller finish first.
     setTimeout(() => void chat.drain(), 0);
@@ -537,6 +997,72 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
 
   const hasChanges = (run: RunRecord): boolean => run.worktree?.state === 'active' && orchestrator.activeRun?.id !== run.id;
 
+  /** Suggests a commit message in Source Control after applying, unless the user already typed one. */
+  function fillCommitMessage(run: RunRecord): void {
+    try {
+      const api = (vscode.extensions.getExtension('vscode.git')?.exports as GitExtension | undefined)?.getAPI(1);
+      const root = path.resolve(run.worktree?.repositoryRoot ?? run.workspacePath).toLowerCase();
+      const repository = api?.repositories.find((item) => path.resolve(item.rootUri.fsPath).toLowerCase() === root);
+      if (!repository || repository.inputBox.value.trim()) return;
+      const final = [...run.stages].reverse().find((stage) => !stage.review && stage.status === 'completed' && stage.result?.text);
+      const summary = final?.result?.text.split('\n').map((line) => line.trim()).find((line) => line && !line.startsWith('#') && !line.startsWith('```'));
+      repository.inputBox.value = [titleFor(run.objective), '', ...(summary ? [summary.slice(0, 300), ''] : []), `Made with Dual Agent: ${describeOutcome(run)}.`].join('\n');
+    } catch (error) {
+      output.debug(`No commit message suggested: ${message(error)}`);
+    }
+  }
+
+  /** Prefills the chat with a request about a problem or a selection in the editor. */
+  async function askAbout(kind: 'fix' | 'explain' | 'ask', uri?: vscode.Uri, range?: vscode.Range, problem?: string): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    const document = uri ? await vscode.workspace.openTextDocument(uri) : editor?.document;
+    if (!document) throw new Error('Open a file first.');
+    const folder = vscode.workspace.getWorkspaceFolder(document.uri);
+    const file = folder ? path.relative(folder.uri.fsPath, document.uri.fsPath).split(path.sep).join('/') : path.basename(document.uri.fsPath);
+    const selection = range ?? (editor && editor.document === document && !editor.selection.isEmpty ? editor.selection : undefined);
+    const where = selection ? `${file}:${selection.start.line + 1}${selection.end.line > selection.start.line ? `-${selection.end.line + 1}` : ''}` : file;
+    const issues =
+      problem ??
+      vscode.languages
+        .getDiagnostics(document.uri)
+        .filter((item) => (selection ? item.range.intersection(selection) : true) && item.severity <= vscode.DiagnosticSeverity.Warning)
+        .slice(0, 5)
+        .map((item) => item.message.split('\n')[0] ?? '')
+        .join('; ');
+    const text =
+      kind === 'fix'
+        ? `Fix ${issues ? `this problem in ${where}: ${issues}` : `the problems in ${where}`}. Keep the change small and explain the cause.`
+        : kind === 'explain'
+          ? `Explain ${issues ? `this problem in ${where}: ${issues}` : `the code in ${where}`}: what causes it and how to fix it.`
+          : `About ${where}: `;
+    await vscode.commands.executeCommand(`${CHAT_VIEW}.focus`);
+    await chat.prefill(text, kind === 'fix' ? 'edit' : 'chat');
+    chat.focusComposer();
+  }
+
+  const codeActions: vscode.CodeActionProvider = {
+    provideCodeActions: (document, range, context) => {
+      if (document.uri.scheme !== 'file' || !context.diagnostics.length) return [];
+      const problem = context.diagnostics.map((item) => item.message.split('\n')[0] ?? '').join('; ');
+      const fix = new vscode.CodeAction('Fix with Dual Agent', vscode.CodeActionKind.QuickFix);
+      fix.command = { command: 'dualAgent.fixProblem', title: 'Fix with Dual Agent', arguments: [document.uri, range, problem] };
+      fix.diagnostics = [...context.diagnostics];
+      const explain = new vscode.CodeAction('Explain with Dual Agent', vscode.CodeActionKind.QuickFix);
+      explain.command = { command: 'dualAgent.explainProblem', title: 'Explain with Dual Agent', arguments: [document.uri, range, problem] };
+      return [fix, explain];
+    },
+  };
+  /** The agent a command was run for: a row of the Agents view, an ID, or nothing to ask. */
+  const providerOf = (argument: unknown): AccountProvider | undefined => {
+    const id = typeof argument === 'string' ? argument : (argument as Partial<ToolRow> | undefined)?.id;
+    return id === 'claude' || id === 'codex' || id === 'gemini' ? id : undefined;
+  };
+  const editorArguments = (args: unknown[]): [vscode.Uri | undefined, vscode.Range | undefined, string | undefined] => [
+    args[0] instanceof vscode.Uri ? args[0] : undefined,
+    args[1] instanceof vscode.Range ? args[1] : undefined,
+    typeof args[2] === 'string' ? args[2] : undefined,
+  ];
+
   context.subscriptions.push(
     output,
     runsView,
@@ -555,6 +1081,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       updateContext();
       chat.refresh();
     }),
+    broker,
+    findings,
+    outcomeItem,
+    vscode.languages.registerCodeActionsProvider({ scheme: 'file' }, codeActions, { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }),
+    vscode.window.onDidChangeActiveTextEditor(() => chat.editorChanged()),
+    vscode.window.onDidChangeTextEditorSelection(() => chat.editorChanged()),
+    vscode.languages.onDidChangeDiagnostics(() => chat.editorChanged()),
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      if (path.resolve(document.uri.fsPath) === path.resolve(briefPath)) void chat.refreshBrief();
+    }),
+
+    command('dualAgent.signIn', (argument) => signIn(providerOf(argument))),
+    command('dualAgent.signOut', (argument) => signOutOf(providerOf(argument))),
+    command('dualAgent.refreshLimits', async () => {
+      await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: 'Dual Agent: asking for the current limits' }, () => refreshLimits());
+      chat.refresh();
+    }),
+    command('dualAgent.fixProblem', (...args) => askAbout('fix', ...editorArguments(args))),
+    command('dualAgent.explainProblem', (...args) => askAbout('explain', ...editorArguments(args))),
+    command('dualAgent.askAboutSelection', (...args) => askAbout('ask', ...editorArguments(args))),
+    command('dualAgent.editBrief', () => chatHost.editBrief()),
+    command('dualAgent.exportConversation', () => chat.receive({ type: 'exportConversation' })),
+    command('dualAgent.clearFindings', () => findings.clear()),
 
     command('dualAgent.openChat', async () => {
       await vscode.commands.executeCommand(`${CHAT_VIEW}.focus`);
@@ -657,6 +1206,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       if (!run?.worktree) return;
       const worktree = run.worktree;
       const changes = await changesOf(run);
+      if (worktree.gitDir) {
+        // The agents edited the folder itself; keeping the changes only drops the snapshot that could undo them.
+        const keep = await vscode.window.showWarningMessage(
+          changes.length ? `Keep the ${changes.length} file change(s) the agents made?` : 'The agents did not change any files. Remove the snapshot?',
+          {
+            modal: true,
+            detail: 'The folder is not a Git repository, so the agents edited it directly after Dual Agent took a snapshot. Keeping the changes deletes the snapshot; after that, Dual Agent cannot undo them.',
+          },
+          'Keep Changes',
+        );
+        if (keep !== 'Keep Changes') return;
+        await markWorktree(worktree, 'applied');
+        await removeWorktree(worktree, worktreeRoot).catch((error: unknown) => output.warn(`Snapshot not removed: ${message(error)}`));
+        return;
+      }
       if (!changes.length) {
         const choice = await vscode.window.showInformationMessage('Dual Agent: this run did not change any files.', 'Discard Worktree');
         if (choice) await vscode.commands.executeCommand('dualAgent.discardChanges', run.id);
@@ -680,6 +1244,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       }
       await markWorktree(worktree, 'applied');
       await removeWorktree(worktree, worktreeRoot).catch((error: unknown) => output.warn(`Worktree not removed: ${message(error)}`));
+      fillCommitMessage(run);
       const next = await vscode.window.showInformationMessage(
         `Dual Agent: applied ${changes.length} file(s). Nothing is staged or committed; review them in Source Control.`,
         'Open Source Control',
@@ -690,13 +1255,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       const run = await resolveRun(argument, hasChanges, 'Whose changes should be discarded?');
       if (!run?.worktree) return;
       if (orchestrator.activeRun?.id === run.id) throw new Error('Cancel the run before discarding its changes.');
-      const choice = await vscode.window.showWarningMessage(
-        'Discard this run\'s changes?',
-        { modal: true, detail: 'The isolated worktree and every change in it are deleted. Your workspace is not touched. This cannot be undone.' },
-        'Discard Changes',
-      );
-      if (choice !== 'Discard Changes') return;
       const worktree = run.worktree;
+      const direct = Boolean(worktree.gitDir);
+      const choice = await vscode.window.showWarningMessage(
+        direct ? 'Undo the agents\' changes to your folder?' : 'Discard this run\'s changes?',
+        {
+          modal: true,
+          detail: direct
+            ? 'Every file the agents changed is put back as it was when the message started, and files they created are deleted. Folders the snapshot skips, such as node_modules, .venv, and build output, are left as they are. This cannot be undone.'
+            : 'The isolated worktree and every change in it are deleted. Your workspace is not touched. This cannot be undone.',
+        },
+        direct ? 'Undo Changes' : 'Discard Changes',
+      );
+      if (choice !== (direct ? 'Undo Changes' : 'Discard Changes')) return;
+      if (direct) await restoreWorktree(worktree, worktree.baseCommit);
       await removeWorktree(worktree, worktreeRoot);
       await markWorktree(worktree, 'discarded');
     }),
@@ -711,18 +1283,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       if (orchestrator.activeRun || busy) reconfigurePending = true;
       else reconfigure();
       if (event.affectsConfiguration('dualAgent.codex')) codexModels = undefined;
+      if (event.affectsConfiguration('dualAgent.usage')) {
+        watchLocalUsage();
+        scheduleLocalScan(0);
+      }
       void agentsView.refresh();
       chat.refresh();
     }),
     { dispose: () => detach() },
     { dispose: () => continuations.dispose() },
+    {
+      dispose: () => {
+        if (localTimer) clearTimeout(localTimer);
+        for (const watcher of localWatchers.splice(0)) watcher.close();
+      },
+    },
     // Stops any agent still running when the extension shuts down.
-    { dispose: () => void orchestrator.cancel() },
+    { dispose: () => void orchestrator.cancel('VS Code closed while the message was running.') },
   );
 
   reportProblems(configuration);
   attach();
   updateContext();
+  watchLocalUsage();
+  // The first read waits until VS Code has finished starting.
+  scheduleLocalScan(10_000);
+  setTimeout(() => void agentsView.refresh(), 5_000);
   try {
     const recovered = await orchestrator.recoverInterrupted();
     if (recovered.length) output.warn(`${recovered.length} run(s) were interrupted when VS Code closed; resume them from the Runs view.`);
@@ -738,6 +1324,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
   };
 }
 
+interface GitExtension {
+  getAPI(version: 1): { repositories: { rootUri: vscode.Uri; inputBox: { value: string } }[] };
+}
+
 function reportProblems(configuration: ExtensionConfiguration): void {
   if (configuration.problems.length) {
     void vscode.window.showWarningMessage(`Dual Agent settings ignored: ${configuration.problems.join(' ')}`);
@@ -748,10 +1338,11 @@ function createOrchestrator(
   configuration: ExtensionConfiguration,
   runStore: FileRunStore,
   dependencies: OrchestratorDependencies,
+  permissionBridge?: { configFile: string; tool: string },
 ): WorkflowOrchestrator {
   return new WorkflowOrchestrator(
     {
-      claude: new ClaudeCliAdapter(configuration.claude),
+      claude: new ClaudeCliAdapter({ ...configuration.claude, ...(permissionBridge ? { permissionBridge } : {}) }),
       codex: new CodexCliAdapter(configuration.codex),
     },
     runStore,

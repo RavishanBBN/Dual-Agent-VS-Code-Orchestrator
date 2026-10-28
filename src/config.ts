@@ -22,6 +22,16 @@ export interface ExtensionConfiguration {
   redactSecrets: boolean;
   /** Continue a run that stopped at both agents' usage limits once the first limit resets. */
   autoContinue: boolean;
+  /** Gemini CLI rules on the findings of a failed check before Claude revises, when enabled. */
+  gemini: { enabled: boolean; command: string; model: string };
+  /** Include the active editor's file, selection, and problems in new messages. */
+  includeEditorContext: boolean;
+  /** Play a short sound when a long message finishes. */
+  sound: boolean;
+  /** Show reviewers' findings as problems in the editor. */
+  findingsInEditor: boolean;
+  /** Read the CLIs' own usage logs, so usage outside Dual Agent is counted too. */
+  readLocalLogs: boolean;
   /** Settings that were ignored because their values were invalid. */
   problems: string[];
 }
@@ -128,6 +138,7 @@ export function readConfiguration(): ExtensionConfiguration {
       timeoutMs,
       billingMode,
       environmentPassthrough,
+      codexAgentNetwork: user<unknown>('codex.agentNetwork', true) !== false,
       ...(codexModel ? { model: codexModel } : {}),
       ...(codexEffort ? { effort: codexEffort } : {}),
     },
@@ -138,6 +149,7 @@ export function readConfiguration(): ExtensionConfiguration {
       environmentPassthrough,
       claudeMaxTurns: Math.round(bounded('claude.maxTurns', 24, 1, 100)),
       claudeAllowedTools,
+      claudeUserMcp: user<unknown>('claude.userMcpServers', false) === true,
       ...(claudeModel ? { model: claudeModel } : {}),
       ...(claudeEffort ? { effort: claudeEffort } : {}),
     },
@@ -157,6 +169,15 @@ export function readConfiguration(): ExtensionConfiguration {
     resumeClaudeSessions: user<unknown>('claude.resumeSessions', true) !== false,
     redactSecrets: user<unknown>('privacy.redactSecrets', true) !== false,
     autoContinue: user<unknown>('limits.autoContinue', true) !== false,
+    gemini: {
+      enabled: user<unknown>('gemini.enabled', false) === true,
+      command: command('gemini.command', 'gemini'),
+      model: model('gemini.model'),
+    },
+    includeEditorContext: user<unknown>('chat.includeEditorContext', true) !== false,
+    sound: user<unknown>('chat.sound', true) !== false,
+    findingsInEditor: user<unknown>('findings.showInEditor', true) !== false,
+    readLocalLogs: user<unknown>('usage.readLocalLogs', true) !== false,
     problems,
   };
 }
