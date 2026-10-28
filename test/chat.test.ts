@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { newConversation, type ConversationTurn } from '../src/core/conversation.js';
 import type { AgentStreamEvent, RunRecord, StageRecord } from '../src/core/types.js';
 import { fileReference, linkTarget, parseWebviewMessage } from '../src/ui/chat/protocol.js';
-import { applyLiveEvent, transcript, type LiveStage } from '../src/ui/chat/transcript.js';
+import { applyLiveEvent, transcript, usageOverview, type LiveStage } from '../src/ui/chat/transcript.js';
 import { isFileLink, renderMarkdown } from '../src/webview/markdown.js';
 
 describe('chat protocol', () => {
@@ -178,7 +178,8 @@ describe('chat transcript', () => {
     expect(view?.stages[0]?.activities[0]?.running).toBeUndefined();
     expect(view?.stages[1]?.verdict).toEqual({ outcome: 'fail', summary: 'fail: 1 high', findings: [{ severity: 'high', title: 'Off by one', location: 'a.js:3' }] });
     expect(view?.outcome).toEqual({ text: "Claude revised the answer after Codex found 1 high issue", tone: 'warn' });
-    expect(view?.usage).toBe('Claude 2.0k tokens');
+    expect(view?.usage?.claude).toEqual({ input: 1_200, cached: 300, output: 500, reasoning: 0 });
+    expect(view?.stages[0]?.usage).toEqual({ input: 1_200, cached: 300, output: 500, reasoning: 0 });
   });
 
   it('shows the worktree changes only on the latest edit turn, and keeps answers of pruned runs', () => {
@@ -203,6 +204,48 @@ describe('chat transcript', () => {
     const [view] = transcript({ ...base, conversation, runs: new Map([['r1', failed]]) });
     expect(view).toMatchObject({ canResume: true, error: 'usage limit', outcome: { tone: 'bad' } });
     expect(view?.stages[0]?.primary).toBe(true);
+  });
+});
+
+describe('token usage', () => {
+  const tokens = (input: number, output: number, cost?: number) => ({
+    inputTokens: input,
+    cachedInputTokens: Math.floor(input / 2),
+    outputTokens: output,
+    reasoningOutputTokens: 0,
+    ...(cost !== undefined ? { estimatedCostUsd: cost } : {}),
+  });
+  const none = tokens(0, 0);
+  const at = (id: string, createdAt: string, claude: ReturnType<typeof tokens>, codex: ReturnType<typeof tokens>): RunRecord => ({
+    ...run(id, []),
+    createdAt,
+    usage: { claude, codex },
+  });
+  const day = Date.parse('2026-10-28T00:00:00Z');
+  const window = (runs: RunRecord[]) => ({ runs, dayStartMs: day, weekStartMs: day - 6 * 86_400_000 });
+
+  it('totals the conversation, today, the last 7 days, and all runs separately', () => {
+    const runs = [
+      at('today', '2026-10-28T09:00:00Z', tokens(1_000, 100, 0.05), tokens(800, 50)),
+      at('week', '2026-10-24T09:00:00Z', tokens(2_000, 200, 0.1), none),
+      at('old', '2026-09-01T09:00:00Z', tokens(4_000, 400), tokens(100, 10)),
+    ];
+    const conversation = { ...newConversation('/repo'), turns: [turn('t1', 'today'), turn('t2', 'pruned', { usage: { claude: tokens(500, 50), codex: none } })] };
+    const [mine, today, week, all] = usageOverview(conversation, window(runs));
+    // The conversation counts a pruned run's usage from its turn.
+    expect(mine).toMatchObject({ label: 'This conversation', runs: 2, usage: { claude: { input: 1_500, output: 150 }, codex: { input: 800, output: 50 } } });
+    expect(today).toMatchObject({ label: 'Today', runs: 1, usage: { claude: { input: 1_000, costUsd: 0.05 } } });
+    expect(week).toMatchObject({ label: 'Last 7 days', runs: 2, usage: { claude: { input: 3_000, output: 300 } } });
+    expect(week?.usage.claude.costUsd).toBeCloseTo(0.15);
+    expect(all).toMatchObject({ label: 'All runs', runs: 3, usage: { claude: { input: 7_000 }, codex: { input: 900, output: 60 } } });
+  });
+
+  it('reports nothing for a new conversation and keeps a pruned turn\'s usage on its message', () => {
+    const [mine] = usageOverview(undefined, window([]));
+    expect(mine).toEqual({ label: 'This conversation', runs: 0, usage: { claude: { input: 0, cached: 0, output: 0, reasoning: 0 }, codex: { input: 0, cached: 0, output: 0, reasoning: 0 } } });
+    const conversation = { ...newConversation('/repo'), turns: [turn('t1', 'gone', { answer: 'Old', usage: { claude: tokens(300, 30), codex: none } })] };
+    const [view] = transcript({ live: new Map(), changes: new Map(), thumbnail: () => undefined, conversation, runs: new Map() });
+    expect(view?.usage?.claude).toEqual({ input: 300, cached: 150, output: 30, reasoning: 0 });
   });
 });
 

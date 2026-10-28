@@ -99,11 +99,12 @@ interface ChatTurnState {
   outcome?: { text: string };
   attachments: unknown[];
   changes?: { files: { path: string }[]; state: string };
+  usage?: Record<'claude' | 'codex', { input: number; output: number }>;
 }
 
 interface DualAgentTestApi {
   chatReady(): boolean;
-  chatState(): { turns: ChatTurnState[]; consent?: { turnId: string }; composer: { pending: unknown[]; choices: { codex: { models: { id: string }[] } } } };
+  chatState(): { usage: { label: string; usage: Record<'claude' | 'codex', { input: number; output: number }> }[]; turns: ChatTurnState[]; consent?: { turnId: string }; composer: { pending: unknown[]; choices: { codex: { models: { id: string }[] } } } };
   chatMessage(message: unknown): Promise<void>;
 }
 
@@ -150,6 +151,13 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   assert.equal(claudeCall[claudeCall.indexOf('--tools') + 1], 'Read,Grep,Glob', 'a chat answer is read-only');
   const codexCall = recordedCalls('codex').at(-1)?.args ?? [];
   for (const expected of ['--model', 'fake-codex-model', 'model_reasoning_effort=low', '--skip-git-repo-check']) assert.ok(codexCall.includes(expected), `Codex got ${expected}`);
+
+  // The fake CLIs report 10 + 5 tokens for Claude and 8 + 4 for Codex per stage.
+  assert.deepEqual(answer?.usage, { claude: { input: 10, cached: 0, output: 5, reasoning: 0 }, codex: { input: 8, cached: 0, output: 4, reasoning: 0 } });
+  const conversationUsage = api.chatState().usage[0];
+  assert.equal(conversationUsage?.label, 'This conversation');
+  assert.equal(conversationUsage?.usage.claude.input, 10);
+  await vscode.commands.executeCommand('dualAgent.showUsage');
 
   await api.chatMessage({ type: 'send', text: 'And for an empty list?', mode: 'chat' });
   const followUp = recordedCalls('claude').at(-1)?.args ?? [];

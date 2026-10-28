@@ -1021,3 +1021,94 @@ pre {
   font-size: 0.85em;
   margin: 6px 0 0;
 }
+
+/* ---- Token usage ---- */
+
+.usage-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.usage-button:hover,
+.usage-button.active {
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  color: var(--vscode-foreground);
+}
+
+.usage-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 0;
+}
+
+.usage-line .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.usage-panel {
+  padding: 8px 12px;
+}
+
+.usage-panel section {
+  margin-bottom: 10px;
+}
+
+.usage-period {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.usage-table {
+  flex-basis: 100%;
+  margin: 4px 0;
+}
+
+.usage-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88em;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 2px 6px;
+  text-align: right;
+  font-weight: normal;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-table thead th {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.usage-table tbody th {
+  text-align: left;
+  white-space: nowrap;
+}
+
+.usage-table .pill-dot {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.usage-table .agent-claude .pill-dot {
+  background: var(--claude);
+}
+
+.usage-table .agent-codex .pill-dot {
+  background: var(--codex);
+}

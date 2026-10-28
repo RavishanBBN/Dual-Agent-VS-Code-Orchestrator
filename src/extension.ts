@@ -459,6 +459,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       chat.focusComposer();
     }),
     command('dualAgent.openChatInEditor', () => chatProvider.openInEditor()),
+    command('dualAgent.showUsage', async () => {
+      await vscode.commands.executeCommand(`${CHAT_VIEW}.focus`);
+      chat.showUsage();
+    }),
 
     command('dualAgent.runImplementation', () => startRun('implementation')),
     command('dualAgent.runBrainstorming', () => startRun('brainstorming')),

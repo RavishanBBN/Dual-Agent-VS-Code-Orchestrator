@@ -15,3 +15,15 @@ export function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
 export function totalUsageByAgent(): Record<AgentId, TokenUsage> {
   return { claude: emptyUsage(), codex: emptyUsage() };
 }
+
+/** Input plus output; cached input and reasoning are already parts of those. */
+export function totalTokens(usage: TokenUsage): number {
+  return usage.inputTokens + usage.outputTokens;
+}
+
+/** Adds up usage per agent, such as every run of a conversation or of a day. */
+export function sumByAgent(items: Iterable<Record<AgentId, TokenUsage>>): Record<AgentId, TokenUsage> {
+  let total = totalUsageByAgent();
+  for (const item of items) total = { claude: addUsage(total.claude, item.claude), codex: addUsage(total.codex, item.codex) };
+  return total;
+}

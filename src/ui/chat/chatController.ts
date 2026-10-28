@@ -41,7 +41,7 @@ import {
   type Tone,
   type WebviewMessage,
 } from './protocol.js';
-import { applyLiveEvent, attachmentView, conversationSummaries, transcript, type LiveStage } from './transcript.js';
+import { applyLiveEvent, attachmentView, conversationSummaries, transcript, usageOverview, type LiveStage } from './transcript.js';
 
 const COMPOSER_KEY = 'dualAgent.chat.composer';
 const CURRENT_KEY = 'dualAgent.chat.current';
@@ -170,7 +170,7 @@ export class ChatController implements vscode.Disposable {
     this.loaded ??= (async () => {
       try {
         this.conversations = await this.store.list();
-        for (const run of await this.host.loadRuns()) if (run.conversationId) this.runs.set(run.id, run);
+        for (const run of await this.host.loadRuns()) this.runs.set(run.id, run);
         const currentId = this.memento.workspace.get<string>(CURRENT_KEY);
         this.current = this.conversations.find((conversation) => conversation.id === currentId);
         await this.refreshChanges();
@@ -221,6 +221,17 @@ export class ChatController implements vscode.Disposable {
     this.onTitle?.(this.current?.title ?? 'New conversation');
   }
 
+  /** Opens the usage panel in the chat, once a chat page has loaded. */
+  public showUsage(): void {
+    if (!this.ready.size) {
+      this.usageRequested = true;
+      return;
+    }
+    for (const webview of this.ready) this.post(webview, { type: 'showUsage' });
+  }
+
+  private usageRequested = false;
+
   public focusComposer(): void {
     for (const webview of this.webviews.keys()) this.post(webview, { type: 'focus' });
   }
@@ -255,8 +266,11 @@ export class ChatController implements vscode.Disposable {
     const awaitingApprovalRunId = this.host.pendingApprovalRunId();
     const thumbnail = (attachment: AttachmentRef): string | undefined =>
       attachment.kind === 'image' && !attachment.workspaceRelative ? toUri(attachment.path) : undefined;
+    const today = new Date();
+    const dayStartMs = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
     const state: ChatState = {
       title: conversation?.title ?? 'New conversation',
+      usage: usageOverview(conversation, { runs: this.runs.values(), dayStartMs, weekStartMs: dayStartMs - 6 * 86_400_000 }),
       conversations: conversationSummaries(this.conversations, Date.now()),
       turns: conversation
         ? transcript({
@@ -301,9 +315,13 @@ export class ChatController implements vscode.Disposable {
 
   public handleEvent(event: OrchestratorEvent): void {
     const run = event.run;
-    if (!run.conversationId) return;
+    // Every run counts toward the usage totals; only conversation runs appear in the transcript.
+    if (event.type === 'run-updated') this.runs.set(run.id, run);
+    if (!run.conversationId) {
+      if (event.type === 'run-updated' && isFinished(run.status)) this.schedule();
+      return;
+    }
     if (event.type === 'run-updated') {
-      this.runs.set(run.id, run);
       const starting = this.starting;
       if (starting && !starting.turn.runId && run.conversationId === starting.conversation.id) {
         starting.turn.runId = run.id;
@@ -356,7 +374,7 @@ export class ChatController implements vscode.Disposable {
 
   /** Called after changes are applied or discarded, which updates every run that shared the worktree. */
   public async runsChanged(): Promise<void> {
-    for (const run of await this.host.loadRuns()) if (run.conversationId) this.runs.set(run.id, run);
+    for (const run of await this.host.loadRuns()) this.runs.set(run.id, run);
     await this.refreshChanges();
     this.schedule();
   }
@@ -632,6 +650,10 @@ export class ChatController implements vscode.Disposable {
     switch (incoming.type) {
       case 'ready':
         if (webview) this.ready.add(webview);
+        if (webview && this.usageRequested) {
+          this.usageRequested = false;
+          setTimeout(() => this.post(webview, { type: 'showUsage' }), 50);
+        }
         if (webview) this.post(webview, { type: 'state', state: this.state(this.webviews.get(webview)?.toUri ?? (() => '')) });
         return;
       case 'send':

@@ -12,6 +12,9 @@ import type {
   HostMessage,
   StageView,
   TurnView,
+  UsageByAgent,
+  UsageNumbers,
+  UsagePeriod,
   WebviewMessage,
 } from '../ui/chat/protocol.js';
 import { isFileLink, renderMarkdown } from './markdown.js';
@@ -53,6 +56,7 @@ const ICONS = {
   stop: 'M4 4h8v8H4z',
   attach: 'M10.5 3.5 5 9a1.4 1.4 0 0 0 2 2l5.8-5.8a2.8 2.8 0 0 0-4-4L3 7a4.2 4.2 0 0 0 6 6l4.5-4.5-.7-.7L8.3 12.3a3.2 3.2 0 0 1-4.6-4.6l5.8-5.8a1.8 1.8 0 0 1 2.6 2.6L6.3 10.3a.4.4 0 0 1-.6-.6l5.5-5.5z',
   plus: 'M7.5 2h1v5.5H14v1H8.5V14h-1V8.5H2v-1h5.5z',
+  chart: 'M2 13h12v1H2zm1-5h2v4H3zm4-4h2v8H7zm4-2h2v10h-2z',
   history: 'M8 2a6 6 0 1 1-5.7 7.9l1-.3A5 5 0 1 0 4 5H6v1H2V2h1v2.2A6 6 0 0 1 8 2zm-.5 3h1v3.3l2.3 1.4-.5.8-2.8-1.7z',
   trash: 'M6 2h4v1h3v1H3V3h3zm-2 3h8l-.6 9H4.6zm2 1v7h1V6zm3 0v7h1V6z',
   chevron: 'M6 4l4 4-4 4-.7-.7L8.6 8 5.3 4.7z',
@@ -100,6 +104,100 @@ function Markdown({ text }: { text: string }) {
   const html = useMemo(() => renderMarkdown(text), [text]);
   // renderMarkdown escapes all HTML from the text; links and code buttons are handled by the click delegate.
   return <div class="markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+// ---- Token usage ----
+
+const number = new Intl.NumberFormat();
+
+/** 1234 as "1.2k", 2500000 as "2.5M". */
+function compact(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+  return String(tokens);
+}
+
+const total = (usage: UsageNumbers): number => usage.input + usage.output;
+const agentsTotal = (usage: UsageByAgent): number => total(usage.claude) + total(usage.codex);
+
+function breakdown(usage: UsageNumbers): string {
+  const cached = usage.cached ? ` (${number.format(usage.cached)} cached)` : '';
+  const reasoning = usage.reasoning ? ` (${number.format(usage.reasoning)} reasoning)` : '';
+  return `Input ${number.format(usage.input)}${cached} · Output ${number.format(usage.output)}${reasoning}`;
+}
+
+/** Input, cached, output, and total per agent, with the Claude CLI's cost estimate when it gave one. */
+function UsageTable({ usage }: { usage: UsageByAgent }) {
+  const cost = usage.claude.costUsd;
+  return (
+    <div class="usage-table">
+      <table>
+        <thead>
+          <tr>
+            <th />
+            <th>Input</th>
+            <th>Cached</th>
+            <th>Output</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {AGENTS.map((agent) => {
+            const row = usage[agent.id];
+            return (
+              <tr key={agent.id} class={`agent-${agent.id}`}>
+                <th>
+                  <span class="pill-dot" /> {agent.label}
+                </th>
+                <td>{compact(row.input)}</td>
+                <td>{compact(row.cached)}</td>
+                <td title={row.reasoning ? `${number.format(row.reasoning)} of it reasoning` : undefined}>{compact(row.output)}</td>
+                <td>
+                  <strong>{compact(total(row))}</strong>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {cost !== undefined && cost > 0 ? <div class="muted small">Claude CLI estimate at API prices: ${cost.toFixed(cost < 1 ? 3 : 2)}</div> : null}
+    </div>
+  );
+}
+
+function UsageLine({ usage }: { usage: UsageByAgent }) {
+  const [open, setOpen] = useState(false);
+  const parts = AGENTS.filter((agent) => total(usage[agent.id]) > 0).map((agent) => `${agent.label} ${compact(total(usage[agent.id]))}`);
+  return (
+    <>
+      <button type="button" class="link-button quiet usage-line" title="Show token usage" onClick={() => setOpen(!open)}>
+        <Icon path={ICONS.chart} /> {parts.join(' · ')} tokens
+      </button>
+      {open ? <UsageTable usage={usage} /> : null}
+    </>
+  );
+}
+
+function UsagePanel({ periods }: { periods: UsagePeriod[] }) {
+  return (
+    <div class="history usage-panel">
+      {periods.map((period) => (
+        <section key={period.label}>
+          <div class="usage-period">
+            <strong>{period.label}</strong>
+            <span class="muted small">
+              {compact(agentsTotal(period.usage))} tokens · {period.runs} message{period.runs === 1 ? '' : 's'} and runs
+            </span>
+          </div>
+          {agentsTotal(period.usage) ? <UsageTable usage={period.usage} /> : null}
+        </section>
+      ))}
+      <p class="muted small">
+        Counted from what each CLI reports after every stage, including failed attempts. Input includes cached input. Your subscription's remaining limits are not
+        reported by the CLIs.
+      </p>
+    </div>
+  );
 }
 
 function Pill({ tone, children }: { tone: string; children: ComponentChildren }) {
@@ -203,6 +301,11 @@ function Stage({ stage, runId, expanded, toggle }: { stage: StageView; runId?: s
         <span class="stage-title">{running ? `${stage.title}…` : stage.title}</span>
         <Verdict stage={stage} />
         {!expanded && steps ? <span class="muted small">{steps} step{steps === 1 ? '' : 's'}</span> : null}
+        {stage.usage ? (
+          <span class="muted small" title={breakdown(stage.usage)}>
+            {compact(total(stage.usage))} tokens
+          </span>
+        ) : null}
         {stage.duration ? <span class="muted small">{stage.duration}</span> : null}
         {stage.status === 'failed' ? <Icon path={ICONS.error} /> : null}
         <span class={`chevron${expanded ? ' open' : ''}`}>
@@ -370,7 +473,7 @@ function Turn({ turn, consent }: { turn: TurnView; consent?: ConsentView }) {
       {turn.error && !turn.stages.some((stage) => stage.error) ? <div class="note bad">{turn.error}</div> : null}
       <footer class="turn-footer">
         {turn.outcome ? <Pill tone={turn.outcome.tone}>{turn.outcome.text}</Pill> : null}
-        {turn.usage ? <span class="muted">{turn.usage}</span> : null}
+        {turn.usage ? <UsageLine usage={turn.usage} /> : null}
         <span class="spacer" />
         {final ? (
           <button type="button" class="link-button" onClick={() => send({ type: 'copy', text: final.text })}>
@@ -686,6 +789,7 @@ function App() {
   const [state, setState] = useState<ChatState | undefined>(undefined);
   const [mentions, setMentions] = useState<{ query: string; items: { path: string; description: string }[] } | undefined>(undefined);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [usageOpen, setUsageOpen] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
 
@@ -694,6 +798,10 @@ function App() {
       const data = event.data;
       if (data?.type === 'state') setState(data.state);
       else if (data?.type === 'mentions') setMentions({ query: data.query, items: data.items });
+      else if (data?.type === 'showUsage') {
+        setUsageOpen(true);
+        setHistoryOpen(false);
+      }
     };
     window.addEventListener('message', listener);
     send({ type: 'ready' });
@@ -729,7 +837,27 @@ function App() {
           <span class="title">{state.title}</span>
           {state.folder ? <span class="muted">{state.folder}</span> : null}
         </div>
-        <button type="button" class={`icon-button${historyOpen ? ' active' : ''}`} title="Conversation history" onClick={() => setHistoryOpen(!historyOpen)}>
+        <button
+          type="button"
+          class={`usage-button${usageOpen ? ' active' : ''}`}
+          title="Token usage"
+          onClick={() => {
+            setUsageOpen(!usageOpen);
+            setHistoryOpen(false);
+          }}
+        >
+          <Icon path={ICONS.chart} />
+          <span>{compact(agentsTotal(state.usage[0]?.usage ?? { claude: { input: 0, cached: 0, output: 0, reasoning: 0 }, codex: { input: 0, cached: 0, output: 0, reasoning: 0 } }))}</span>
+        </button>
+        <button
+          type="button"
+          class={`icon-button${historyOpen ? ' active' : ''}`}
+          title="Conversation history"
+          onClick={() => {
+            setHistoryOpen(!historyOpen);
+            setUsageOpen(false);
+          }}
+        >
           <Icon path={ICONS.history} />
         </button>
         <button type="button" class="icon-button" title="New conversation" disabled={state.running} onClick={() => send({ type: 'newConversation' })}>
@@ -737,6 +865,7 @@ function App() {
         </button>
       </header>
       {historyOpen ? <History state={state} close={() => setHistoryOpen(false)} /> : null}
+      {usageOpen ? <UsagePanel periods={state.usage} /> : null}
       <div
         class="transcript"
         ref={scroller}

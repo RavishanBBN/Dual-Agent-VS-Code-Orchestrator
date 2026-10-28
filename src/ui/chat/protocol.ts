@@ -37,6 +37,25 @@ export interface ActivityView {
   running?: boolean;
 }
 
+/** Tokens one agent used; input includes cached input, and output includes reasoning. */
+export interface UsageNumbers {
+  input: number;
+  cached: number;
+  output: number;
+  reasoning: number;
+  /** The Claude CLI's API-equivalent estimate; subscriptions are not billed per token. */
+  costUsd?: number;
+}
+
+export type UsageByAgent = Record<AgentId, UsageNumbers>;
+
+export interface UsagePeriod {
+  label: string;
+  /** Messages and runs counted in the period. */
+  runs: number;
+  usage: UsageByAgent;
+}
+
 export interface FindingView {
   severity: string;
   title: string;
@@ -61,6 +80,7 @@ export interface StageView {
   primary: boolean;
   /** How long a finished stage took, such as "12s". */
   duration?: string;
+  usage?: UsageNumbers;
 }
 
 export interface ChangeView {
@@ -91,7 +111,8 @@ export interface TurnView {
   changes?: { runId: string; files: ChangeView[]; state: 'active' | 'applied' | 'discarded' };
   checks: CheckView[];
   awaitingApproval: boolean;
-  usage?: string;
+  /** Tokens the message used, including failed attempts. */
+  usage?: UsageByAgent;
   canResume: boolean;
 }
 
@@ -142,12 +163,15 @@ export interface ChatState {
   consent?: ConsentView;
   /** A short message for the user, such as a refused attachment. */
   notice?: { text: string; tone: Tone };
+  /** Token totals for this conversation, today, the last 7 days, and all runs in this workspace. */
+  usage: UsagePeriod[];
 }
 
 export type HostMessage =
   | { type: 'state'; state: ChatState }
   | { type: 'mentions'; query: string; items: { path: string; description: string }[] }
-  | { type: 'focus' };
+  | { type: 'focus' }
+  | { type: 'showUsage' };
 
 // ---- Webview → extension ----
 

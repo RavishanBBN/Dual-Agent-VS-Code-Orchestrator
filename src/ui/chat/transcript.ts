@@ -5,10 +5,21 @@ import { describeOutcome, finalStage } from '../../core/conversation.js';
 import { canResume } from '../../core/orchestrator.js';
 import type { AgentActivity, AgentId, AgentStreamEvent, AttachmentRef, RunRecord, StageRecord, TokenUsage } from '../../core/types.js';
 import { checksPassed } from '../../core/types.js';
+import { sumByAgent, totalTokens } from '../../core/usage.js';
 import { summarizeVerdict } from '../../core/verdict.js';
 import type { WorktreeChange } from '../../core/worktree.js';
 import { describeCheck, relativeTime } from '../presentation.js';
-import type { ActivityView, AttachmentView, ConversationSummary, StageView, Tone, TurnView } from './protocol.js';
+import type {
+  ActivityView,
+  AttachmentView,
+  ConversationSummary,
+  StageView,
+  Tone,
+  TurnView,
+  UsageByAgent,
+  UsageNumbers,
+  UsagePeriod,
+} from './protocol.js';
 
 /** Text streamed by the stage that is running, which the run record does not hold yet. Steps are on the stage. */
 export interface LiveStage {
@@ -53,16 +64,53 @@ export interface TranscriptInput {
 
 const AGENT_NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
 
-function compact(tokens: number): string {
-  return tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(1)}M` : tokens >= 1_000 ? `${(tokens / 1_000).toFixed(1)}k` : String(tokens);
+export function usageNumbers(usage: TokenUsage): UsageNumbers {
+  return {
+    input: usage.inputTokens,
+    cached: usage.cachedInputTokens,
+    output: usage.outputTokens,
+    reasoning: usage.reasoningOutputTokens,
+    ...(usage.estimatedCostUsd !== undefined ? { costUsd: usage.estimatedCostUsd } : {}),
+  };
 }
 
-function usageLine(usage: Record<AgentId, TokenUsage>): string | undefined {
-  const parts = (['claude', 'codex'] as const)
-    .map((agent) => ({ agent, total: usage[agent].inputTokens + usage[agent].cachedInputTokens + usage[agent].outputTokens }))
-    .filter((item) => item.total > 0)
-    .map((item) => `${AGENT_NAMES[item.agent]} ${compact(item.total)} tokens`);
-  return parts.length ? parts.join(' · ') : undefined;
+function byAgent(usage: Record<AgentId, TokenUsage>): UsageByAgent {
+  return { claude: usageNumbers(usage.claude), codex: usageNumbers(usage.codex) };
+}
+
+const used = (usage: Record<AgentId, TokenUsage>): boolean => totalTokens(usage.claude) + totalTokens(usage.codex) > 0;
+
+export interface UsageWindow {
+  /** All runs in the workspace's history, including the one running. */
+  runs: Iterable<RunRecord>;
+  /** Local midnight today, and seven days before, in milliseconds. */
+  dayStartMs: number;
+  weekStartMs: number;
+}
+
+/**
+ * Token totals for the current conversation, today, the last seven days, and every run in the history.
+ * A conversation counts the usage kept on its turns, so totals survive the pruning of old runs.
+ */
+export function usageOverview(conversation: Conversation | undefined, window: UsageWindow): UsagePeriod[] {
+  const runs = [...window.runs];
+  const byId = new Map(runs.map((run) => [run.id, run]));
+  const conversationUsage = (conversation?.turns ?? []).flatMap((turn) => {
+    const usage = (turn.runId ? byId.get(turn.runId)?.usage : undefined) ?? turn.usage;
+    return usage ? [usage] : [];
+  });
+  const since = (start: number): RunRecord[] => runs.filter((run) => Date.parse(run.createdAt) >= start);
+  const period = (label: string, items: Record<AgentId, TokenUsage>[]): UsagePeriod => ({
+    label,
+    runs: items.filter(used).length,
+    usage: byAgent(sumByAgent(items)),
+  });
+  return [
+    period('This conversation', conversationUsage),
+    period('Today', since(window.dayStartMs).map((run) => run.usage)),
+    period('Last 7 days', since(window.weekStartMs).map((run) => run.usage)),
+    period('All runs', runs.map((run) => run.usage)),
+  ];
 }
 
 export function attachmentView(attachment: AttachmentRef, thumbnail?: string): AttachmentView {
@@ -124,6 +172,7 @@ function stageViews(run: RunRecord, live: ReadonlyMap<string, LiveStage> | undef
     if (stage.fallbackReason) view.fallback = stage.fallbackReason;
     const took = duration(stage);
     if (took) view.duration = took;
+    if (stage.result && totalTokens(stage.result.usage) > 0) view.usage = usageNumbers(stage.result.usage);
     return view;
   });
 }
@@ -154,13 +203,13 @@ function turnView(turn: ConversationTurn, input: TranscriptInput, latestEditRun:
       { index: 0, id: 'answer', title: 'Answer', agent: 'claude', label: 'Claude', status: 'completed', text: turn.answer, activities: [], primary: true },
     ];
   }
+  if (!run && turn.usage && used(turn.usage)) view.usage = byAgent(turn.usage);
   const error = run?.error ?? turn.error;
   if (error && view.status !== 'completed') view.error = error;
   if (run) {
     const checked = [...run.stages].reverse().find((stage) => stage.checks?.length);
     view.checks = (checked?.checks ?? []).map((check) => ({ command: check.command.join(' '), passed: checksPassed([check]), summary: describeCheck(check) }));
-    const usage = usageLine(run.usage);
-    if (usage) view.usage = usage;
+    if (used(run.usage)) view.usage = byAgent(run.usage);
     // The worktree is shared by the conversation's edit turns, so only the latest one shows its changes.
     if (run.worktree && run.id === latestEditRun && !active) {
       const files = (input.changes.get(run.id) ?? []).map((change) => ({ path: change.path, status: CHANGE_LETTERS[change.status] }));

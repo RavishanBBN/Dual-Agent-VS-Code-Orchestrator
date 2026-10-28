@@ -30,6 +30,10 @@ describe('provider stream parsers', () => {
     );
     expect(result?.text).toBe('done');
     expect(result?.usage?.estimatedCostUsd).toBe(0.12);
+    // Cache reads and writes count as input, as they do for Codex, so totals are comparable.
+    expect(result?.usage).toMatchObject({ inputTokens: 25, cachedInputTokens: 5, outputTokens: 4 });
+    const cached = parseClaudeLine('{"type":"result","result":"x","usage":{"input_tokens":2,"cache_creation_input_tokens":207,"cache_read_input_tokens":14304,"output_tokens":267,"output_tokens_details":{"thinking_tokens":40}}}');
+    expect(cached?.usage).toEqual({ inputTokens: 14_513, cachedInputTokens: 14_304, outputTokens: 267, reasoningOutputTokens: 40 });
   });
 
   it('ignores non-JSON lines and accumulates the last final text', () => {

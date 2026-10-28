@@ -15,10 +15,14 @@ export type StageStatus = 'pending' | 'running' | 'completed' | 'failed' | 'canc
 export type IsolationMode = 'worktree' | 'none';
 
 export interface TokenUsage {
+  /** Every input token, including those served from the provider's cache. */
   inputTokens: number;
+  /** The part of the input served from the cache. */
   cachedInputTokens: number;
   outputTokens: number;
+  /** The part of the output spent on reasoning or thinking, when the provider reports it. */
   reasoningOutputTokens: number;
+  /** The API-equivalent price the Claude CLI estimates; subscription use is not billed per token. */
   estimatedCostUsd?: number;
 }
 

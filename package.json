@@ -40,27 +40,35 @@
           "title": "Dual Agent",
           "icon": "media/icon.svg"
         }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "dualAgentChat",
+          "title": "Dual Agent",
+          "icon": "media/icon.svg"
+        }
       ]
     },
     "views": {
       "dualAgent": [
         {
-          "type": "webview",
-          "id": "dualAgent.chat",
-          "name": "Chat",
-          "contextualTitle": "Dual Agent"
-        },
-        {
           "id": "dualAgent.runs",
           "name": "Runs",
-          "contextualTitle": "Dual Agent",
-          "visibility": "collapsed"
+          "contextualTitle": "Dual Agent"
         },
         {
           "id": "dualAgent.agents",
           "name": "Agents",
           "contextualTitle": "Dual Agent",
           "visibility": "collapsed"
+        }
+      ],
+      "dualAgentChat": [
+        {
+          "type": "webview",
+          "id": "dualAgent.chat",
+          "name": "Chat",
+          "contextualTitle": "Dual Agent"
         }
       ]
     },
@@ -83,6 +91,12 @@
         "title": "Open Chat in Editor",
         "category": "Dual Agent",
         "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "dualAgent.showUsage",
+        "title": "Show Token Usage",
+        "category": "Dual Agent",
+        "icon": "$(graph)"
       },
       {
         "command": "dualAgent.runImplementation",
@@ -205,6 +219,11 @@
           "command": "dualAgent.openChatInEditor",
           "when": "view == dualAgent.chat",
           "group": "navigation@2"
+        },
+        {
+          "command": "dualAgent.showUsage",
+          "when": "view == dualAgent.chat",
+          "group": "navigation@3"
         },
         {
           "command": "dualAgent.cancel",
@@ -564,7 +583,7 @@
     "viewsWelcome": [
       {
         "view": "dualAgent.runs",
-        "contents": "Claude plans and implements, Codex reviews independently, and you approve the plan and the final diff.\n[Start Implementation Run](command:dualAgent.runImplementation)\n[Start Brainstorming Run](command:dualAgent.runBrainstorming)\nBoth CLIs must be installed and signed in. [Check Agent Setup](command:dualAgent.doctor)",
+        "contents": "Talk to Claude and Codex in the chat on the right-hand side bar.\n[Open Chat](command:dualAgent.openChat)\nClaude plans and implements, Codex reviews independently, and you approve the plan and the final diff.\n[Start Implementation Run](command:dualAgent.runImplementation)\n[Start Brainstorming Run](command:dualAgent.runBrainstorming)\nBoth CLIs must be installed and signed in. [Check Agent Setup](command:dualAgent.doctor)",
         "when": "workspaceFolderCount > 0"
       },
       {

@@ -163,6 +163,22 @@ export function parseCodexLine(line: string): ParsedLine | undefined {
   return { event: { agent: 'codex', category: 'lifecycle', message: type, raw: value } };
 }
 
+/**
+ * Claude reports uncached input, cache reads, and cache writes separately. They are combined so that, as for
+ * Codex, input counts every input token and cached input is the part served from the cache.
+ */
+function claudeUsage(usage: JsonObject | undefined, cost: number | undefined): TokenUsage {
+  const read = numberAt(usage, 'cache_read_input_tokens', 'cached_input_tokens', 'cachedInputTokens');
+  const written = numberAt(usage, 'cache_creation_input_tokens');
+  return {
+    inputTokens: numberAt(usage, 'input_tokens', 'inputTokens') + read + written,
+    cachedInputTokens: read,
+    outputTokens: numberAt(usage, 'output_tokens', 'outputTokens'),
+    reasoningOutputTokens: numberAt(asObject(usage?.output_tokens_details), 'thinking_tokens', 'reasoning_tokens'),
+    ...(cost !== undefined ? { estimatedCostUsd: cost } : {}),
+  };
+}
+
 /** An edit's input as a compact diff, so the IN box shows what changed rather than raw JSON. */
 function editPreview(input: JsonObject | undefined): string {
   const lines = (prefix: string, text: string): string =>
@@ -293,13 +309,7 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
       terminal: true,
       ...(sessionId ? { sessionId } : {}),
       ...(failed ? { failure } : result ? { text: result } : {}),
-      usage: {
-        inputTokens: numberAt(usage, 'input_tokens', 'inputTokens'),
-        cachedInputTokens: numberAt(usage, 'cache_read_input_tokens', 'cached_input_tokens', 'cachedInputTokens'),
-        outputTokens: numberAt(usage, 'output_tokens', 'outputTokens'),
-        reasoningOutputTokens: 0,
-        ...(cost !== undefined ? { estimatedCostUsd: cost } : {}),
-      },
+      usage: claudeUsage(usage, cost),
       event: {
         agent: 'claude',
         category: failed ? 'diagnostic' : 'usage',

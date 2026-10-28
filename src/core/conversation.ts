@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import path from 'node:path';
 
 import { trimMiddle } from './context.js';
-import type { AgentId, AgentOptions, AttachmentRef, ReviewVerdict, RunRecord, RunStatus, WorkflowKind } from './types.js';
+import type { AgentId, AgentOptions, AttachmentRef, ReviewVerdict, RunRecord, RunStatus, TokenUsage, WorkflowKind } from './types.js';
 
 /** Characters of a final answer kept on the turn, so a conversation outlives the pruning of its runs. */
 const ANSWER_LIMIT = 20_000;
@@ -27,6 +27,8 @@ export interface ConversationTurn {
   outcome?: string;
   /** The last session of each agent in this turn, continued by the next turn. */
   sessions?: Partial<Record<AgentId, string>>;
+  /** Tokens the run used, kept so conversation totals survive the pruning of old runs. */
+  usage?: Record<AgentId, TokenUsage>;
   error?: string;
 }
 
@@ -96,6 +98,7 @@ export function recordRun(turn: ConversationTurn, run: RunRecord): void {
   const final = finalStage(run);
   if (final?.result?.text) turn.answer = trimMiddle(final.result.text, ANSWER_LIMIT);
   turn.outcome = describeOutcome(run);
+  turn.usage = { claude: { ...run.usage.claude }, codex: { ...run.usage.codex } };
   if (run.error) turn.error = run.error;
   const sessions: Partial<Record<AgentId, string>> = {};
   for (const stage of run.stages) {
