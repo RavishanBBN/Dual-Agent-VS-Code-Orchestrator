@@ -9,6 +9,7 @@ import {
   conversationHistory,
   describeOutcome,
   FileConversationStore,
+  missedTurns,
   newConversation,
   recordRun,
   titleFor,
@@ -130,6 +131,40 @@ describe('conversation records', () => {
   });
 });
 
+describe('turns a session missed', () => {
+  it('starts new sessions from a retried message on', () => {
+    const conversation = {
+      ...newConversation('/repo'),
+      turns: [turn('a', { sessions: { claude: 'one' } }), turn('b', { freshSessions: true }), turn('c', { sessions: { codex: 'x' } })],
+    };
+    expect(continuedSessions(conversation)).toEqual({ codex: 'x' });
+  });
+
+  it("gives a continued session the turns answered without it, and nothing when it saw them all", () => {
+    const conversation = {
+      ...newConversation('/repo'),
+      turns: [
+        turn('first', { sessions: { claude: 'c1' }, answer: 'One' }),
+        turn('second', { answer: 'Two, by Codex alone' }),
+        turn('third', { sessions: { codex: 'x' }, answer: 'Three' }),
+      ],
+    };
+    const missed = missedTurns(conversation, { claude: 'c1' }, 10_000);
+    expect(missed.claude).toContain('Two, by Codex alone');
+    expect(missed.claude).toContain('Three');
+    expect(missed.claude).not.toContain('One');
+    expect(missedTurns({ ...conversation, turns: conversation.turns.slice(0, 1) }, { claude: 'c1' }, 10_000)).toEqual({});
+  });
+
+  it("records the answer of the stage in Claude's role when Codex gave it alone", () => {
+    const solo = chatRun([stage('claude-answer', 'codex', 'Codex alone'), stage('codex-check', 'codex', 'ok', { review: true })]);
+    solo.stages[0] = { ...stage('claude-answer', 'claude', 'Codex alone'), assignedAgent: 'codex' };
+    const record = turn('q');
+    recordRun(record, solo);
+    expect(record.answer).toBe('Codex alone');
+  });
+});
+
 describe('FileConversationStore', () => {
   it('saves each conversation in its own file and lists them newest first', async () => {
     const store = new FileConversationStore(await temporaryDirectory('conversations'));
@@ -164,6 +199,16 @@ describe('FileConversationStore', () => {
     const removed = await store.prune(1, (conversation) => conversation.workspacePath === '/a');
     expect(removed.map((item) => item.workspacePath)).toEqual(['/b']);
     expect((await store.list()).map((item) => item.workspacePath).sort()).toEqual(['/a', '/c']);
+  });
+
+  it('deletes every conversation at once', async () => {
+    const store = new FileConversationStore(await temporaryDirectory('conversations'));
+    await store.save(newConversation('/a'));
+    await store.save(newConversation('/b'));
+    await store.clear();
+    expect(await store.list()).toEqual([]);
+    await store.save(newConversation('/c'));
+    expect(await store.list()).toHaveLength(1);
   });
 });
 

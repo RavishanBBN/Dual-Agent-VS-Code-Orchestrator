@@ -10,6 +10,8 @@ import type {
   ComposerView,
   ConsentView,
   HostMessage,
+  LimitView,
+  QueuedView,
   StageView,
   TurnView,
   UsageByAgent,
@@ -17,7 +19,7 @@ import type {
   UsagePeriod,
   WebviewMessage,
 } from '../ui/chat/protocol.js';
-import { isFileLink, renderMarkdown } from './markdown.js';
+import { isFileLink, trustedMarkdown } from './markdown.js';
 import './styles.css';
 
 interface VsCodeApi {
@@ -68,6 +70,10 @@ const ICONS = {
   spinner: 'M8 1.5a6.5 6.5 0 1 0 6.5 6.5h-1.3A5.2 5.2 0 1 1 8 2.8z',
   close: 'M4.7 4 8 7.3 11.3 4l.7.7L8.7 8l3.3 3.3-.7.7L8 8.7 4.7 12l-.7-.7L7.3 8 4 4.7z',
   file: 'M4 1h5.5L13 4.5V15H4zm1 1v12h7V5H9V2z',
+  retry: 'M8 2.5a5.5 5.5 0 1 1-5.5 5.5h1A4.5 4.5 0 1 0 8 3.5V6L4.8 3 8 0z',
+  pencil: 'M11.3 1.7 14.3 4.7 5 14H2v-3zm0 1.4L3 11.4V13h1.6L12.9 4.7z',
+  clock: 'M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zm0 1a6 6 0 1 0 0 12A6 6 0 0 0 8 2zm-.5 2h1v3.8l2.6 1.5-.5.9-3.1-1.8z',
+  queue: 'M2 3h12v1H2zm0 4h12v1H2zm0 4h7v1H2zm9-1 3 1.5-3 1.5z',
 };
 
 const ACTIVITY_ICONS: Record<ActivityView['kind'], string> = {
@@ -102,10 +108,17 @@ async function attachFiles(files: Iterable<File>): Promise<void> {
 }
 
 function Markdown({ text }: { text: string }) {
-  const html = useMemo(() => renderMarkdown(text), [text]);
-  // renderMarkdown escapes all HTML from the text; links and code buttons are handled by the click delegate.
+  const html = useMemo(() => trustedMarkdown(text), [text]);
+  // The renderer escapes all HTML from the text; links and code buttons are handled by the click delegate.
   return <div class="markdown" dangerouslySetInnerHTML={{ __html: html }} />;
 }
+
+// Script errors and content the CSP blocked go to the extension's output log, where they can be diagnosed.
+window.addEventListener('error', (event) => send({ type: 'pageError', message: `${event.message} (${event.filename}:${event.lineno})` }));
+window.addEventListener('unhandledrejection', (event: PromiseRejectionEvent) => send({ type: 'pageError', message: `Unhandled rejection: ${String(event.reason)}` }));
+document.addEventListener('securitypolicyviolation', (event) =>
+  send({ type: 'pageError', message: `Blocked by the content security policy: ${event.violatedDirective} ${event.blockedURI}` }),
+);
 
 // ---- Token usage ----
 
@@ -403,6 +416,84 @@ function Changes({ turn }: { turn: TurnView }) {
   );
 }
 
+/** A message that stopped because both agents are at their usage limits. */
+function Paused({ turn }: { turn: TurnView }) {
+  const paused = turn.paused;
+  if (!paused) return null;
+  const runId = paused.runId;
+  return (
+    <div class="card attention paused">
+      <strong>
+        <Icon path={ICONS.clock} /> Paused at the usage limits
+      </strong>
+      <p>
+        {paused.continuesAt
+          ? `This message continues automatically at ${paused.continuesAt}, where it stopped, and the queued messages follow.`
+          : `The first limit resets at ${paused.reset}. Continue then, or now if the limits have already reset.`}
+      </p>
+      <div class="actions">
+        {paused.continuesAt ? (
+          <button type="button" onClick={() => send({ type: 'cancelContinuation', runId })}>
+            Do not continue
+          </button>
+        ) : (
+          <button type="button" class="primary" onClick={() => send({ type: 'continueAfterLimit', runId })}>
+            Continue when limits reset
+          </button>
+        )}
+        <button type="button" onClick={() => send({ type: 'resume', runId })}>
+          Continue now
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const AGENT_LABELS: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
+
+/** Which agents are at their usage limits, and what that means for the next message. */
+function LimitBanner({ limits }: { limits: LimitView[] }) {
+  const [first, second] = limits;
+  if (!first) return null;
+  const until = (limit: LimitView): string => `${limit.estimated ? 'tried again at' : 'until'} ${limit.until}`;
+  const other = first.agent === 'claude' ? 'Codex' : 'Claude';
+  return (
+    <div class="limit-banner" role="status">
+      <Icon path={ICONS.clock} />
+      <span>
+        {second
+          ? `Claude and Codex are both at their usage limits (${AGENT_LABELS[first.agent]} ${until(first)}, ${AGENT_LABELS[second.agent]} ${until(second)}). New messages wait in the queue.`
+          : `${AGENT_LABELS[first.agent]} is at its usage limit, ${until(first)}. ${other} works alone meanwhile; ${AGENT_LABELS[first.agent]} rejoins and catches up after the reset.`}
+      </span>
+    </div>
+  );
+}
+
+function Queue({ items }: { items: QueuedView[] }) {
+  if (!items.length) return null;
+  return (
+    <div class="queue" aria-label="Queued messages">
+      <div class="queue-title muted small">
+        <Icon path={ICONS.queue} /> {items.length} queued
+      </div>
+      <ol>
+        {items.map((item) => (
+          <li key={item.id}>
+            <span class="queue-text" title={item.text}>
+              {item.conversation ? <span class="muted">{item.conversation}: </span> : null}
+              {item.text}
+            </span>
+            {item.mode !== 'chat' ? <span class="mode-tag">{MODES.find((mode) => mode.id === item.mode)?.label ?? item.mode}</span> : null}
+            <button type="button" class="icon-button small" title="Remove from the queue" onClick={() => send({ type: 'unqueue', id: item.id })}>
+              <Icon path={ICONS.close} />
+            </button>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function Consent({ consent }: { consent: ConsentView }) {
   return (
     <div class="card attention">
@@ -430,7 +521,8 @@ function Consent({ consent }: { consent: ConsentView }) {
 function Turn({ turn, consent }: { turn: TurnView; consent?: ConsentView }) {
   const [overrides, setOverrides] = useState<Record<number, boolean>>({});
   const mode = MODES.find((item) => item.id === turn.mode);
-  const final = [...turn.stages].reverse().find((stage) => stage.primary && stage.status === 'completed' && stage.agent === 'claude');
+  // The primary stage is the answer, whichever agent gave it.
+  const final = [...turn.stages].reverse().find((stage) => stage.primary && stage.status === 'completed' && stage.text);
   const time = new Date(turn.createdAt);
   return (
     <article class="turn">
@@ -471,6 +563,7 @@ function Turn({ turn, consent }: { turn: TurnView; consent?: ConsentView }) {
         </ul>
       ) : null}
       <Changes turn={turn} />
+      <Paused turn={turn} />
       {turn.error && !turn.stages.some((stage) => stage.error) ? <div class="note bad">{turn.error}</div> : null}
       <footer class="turn-footer">
         {turn.outcome ? <Pill tone={turn.outcome.tone}>{turn.outcome.text}</Pill> : null}
@@ -481,7 +574,17 @@ function Turn({ turn, consent }: { turn: TurnView; consent?: ConsentView }) {
             Copy answer
           </button>
         ) : null}
-        {turn.canResume && turn.runId ? (
+        {turn.canRetry ? (
+          <>
+            <button type="button" class="link-button" title="Run this message again; later messages and their file changes are undone" onClick={() => send({ type: 'retry', turnId: turn.id })}>
+              Retry
+            </button>
+            <button type="button" class="link-button" title="Change this message and send it again" onClick={() => send({ type: 'editMessage', turnId: turn.id })}>
+              Edit
+            </button>
+          </>
+        ) : null}
+        {turn.canResume && turn.runId && !turn.paused ? (
           <button type="button" class="link-button" onClick={() => send({ type: 'resume', runId: turn.runId ?? '' })}>
             Resume
           </button>
@@ -597,6 +700,10 @@ function Composer({ state, mentions }: { state: ChatState; mentions: { query: st
   useEffect(() => {
     const focus = (event: MessageEvent<HostMessage>): void => {
       if (event.data?.type === 'focus') input.current?.focus();
+      if (event.data?.type === 'fillComposer') {
+        setDraft(event.data.text);
+        input.current?.focus();
+      }
     };
     window.addEventListener('message', focus);
     return () => window.removeEventListener('message', focus);
@@ -604,7 +711,8 @@ function Composer({ state, mentions }: { state: ChatState; mentions: { query: st
 
   const submit = (): void => {
     const text = draft.trim();
-    if (!text || state.running || disabled) return;
+    // While a message runs, sending puts the new one in the queue.
+    if (!text || disabled) return;
     send({ type: 'send', text, mode: composer.mode });
     setDraft('');
     setMention(undefined);
@@ -690,13 +798,38 @@ function Composer({ state, mentions }: { state: ChatState; mentions: { query: st
         </ul>
       ) : null}
       {settingsOpen ? <AgentSettings composer={composer} close={() => setSettingsOpen(false)} /> : null}
+      {composer.editing ? (
+        <div class="editing">
+          <Icon path={ICONS.pencil} />
+          <span>
+            Editing <q>{composer.editing.preview}</q>. Sending replaces it and the messages after it.
+          </span>
+          <button
+            type="button"
+            class="icon-button small"
+            title="Stop editing"
+            onClick={() => {
+              send({ type: 'cancelEdit' });
+              setDraft('');
+            }}
+          >
+            <Icon path={ICONS.close} />
+          </button>
+        </div>
+      ) : null}
       <Attachments items={composer.pending} removable />
       <textarea
         ref={input}
         rows={1}
         value={draft}
         disabled={disabled}
-        placeholder={disabled ? state.blocked : 'Ask Claude and Codex…  @ to mention a file, Shift+Enter for a new line'}
+        placeholder={
+          disabled
+            ? state.blocked
+            : state.running
+              ? 'Type the next message; it waits in the queue until this one finishes'
+              : 'Ask Claude and Codex…  @ to mention a file, Shift+Enter for a new line'
+        }
         onInput={(event) => {
           const element = event.currentTarget;
           setDraft(element.value);
@@ -758,6 +891,11 @@ function Composer({ state, mentions }: { state: ChatState; mentions: { query: st
           );
         })}
         <span class="spacer" />
+        {state.running && draft.trim() ? (
+          <button type="button" class="icon-button" title="Queue this message (Enter); it runs when the current one finishes" onClick={submit}>
+            <Icon path={ICONS.queue} />
+          </button>
+        ) : null}
         {state.running ? (
           <button type="button" class="send stop" title="Stop" onClick={() => send({ type: 'stop' })}>
             <Icon path={ICONS.stop} />
@@ -885,6 +1023,9 @@ function App() {
       {usageOpen ? <UsagePanel periods={state.usage} /> : null}
       <div
         class="transcript"
+        role="log"
+        aria-label="Conversation"
+        aria-busy={state.running}
         ref={scroller}
         onClick={onClick}
         onScroll={(event) => {
@@ -903,6 +1044,8 @@ function App() {
           </button>
         </div>
       ) : null}
+      <LimitBanner limits={state.limits} />
+      <Queue items={state.queue} />
       <Composer state={state} mentions={mentions} />
     </div>
   );

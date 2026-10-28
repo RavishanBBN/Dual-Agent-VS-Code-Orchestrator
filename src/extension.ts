@@ -10,15 +10,19 @@ import { listCodexModels, type CodexModel } from './adapters/models.js';
 import { readConfiguration, type ExtensionConfiguration } from './config.js';
 import { extractPdfTextInWorker } from './core/attachments.js';
 import { checkGit } from './core/git.js';
+import { AgentLimits, formatReset, type AgentLimit } from './core/limits.js';
+import { redactSecrets } from './core/redact.js';
 import { canResume, editsFiles, WorkflowOrchestrator, type OrchestratorDependencies } from './core/orchestrator.js';
 import { renderRunReport } from './core/report.js';
 import { FileRunStore } from './core/store.js';
 import type { AgentStreamEvent, OrchestratorEvent, RunRecord, WorkflowKind, WorktreeInfo } from './core/types.js';
 import {
   applyWorktree,
+  checkpointWorktree,
   createWorktree,
   listWorktreeChanges,
   removeWorktree,
+  restoreWorktree,
   worktreeExists,
   WorktreeError,
   type WorktreeChange,
@@ -27,6 +31,7 @@ import { ApprovalCoordinator, RunStatusBar } from './ui/approvals.js';
 import { ChatController, type ChatHost } from './ui/chat/chatController.js';
 import { CHAT_VIEW, ChatViewProvider } from './ui/chat/chatProvider.js';
 import type { ChatState } from './ui/chat/protocol.js';
+import { continueAt, ContinuationScheduler, type Continuation, type ContinuationOutcome } from './ui/continuations.js';
 import { BASE_SCHEME, baseUri, BaseFileProvider, reportUri, RUN_SCHEME, RunDocumentProvider, stageUri } from './ui/documents.js';
 import {
   applyDetail,
@@ -39,6 +44,9 @@ import {
 import { AgentsView, isRunNode, RunsView, type ToolRow } from './ui/views.js';
 
 const ALLOW = 'Allow and Start';
+/** Usage limits are per account, so they are kept in global state; paused runs belong to the workspace. */
+const LIMITS_KEY = 'dualAgent.agentLimits';
+const CONTINUATIONS_KEY = 'dualAgent.continuations';
 /** Agent messages are shown whole in stage documents; the output channel gets a readable excerpt. */
 const LOG_EXCERPT = 400;
 
@@ -96,6 +104,8 @@ export interface DualAgentTestApi {
   chatReady(): boolean;
   chatState(): ChatState;
   chatMessage(message: unknown): Promise<void>;
+  /** Script errors and blocked content the chat webviews reported. */
+  chatErrors(): readonly string[];
 }
 
 /** The folder new conversations work in: the active editor's folder first, then the first local folder. */
@@ -117,6 +127,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
   let busy = false;
   let reconfigurePending = false;
   let detach = (): void => undefined;
+  // Shared by every run, so an agent at its usage limit is skipped until the limit resets.
+  const limits = new AgentLimits(context.globalState.get<AgentLimit[]>(LIMITS_KEY) ?? []);
 
   const runsView = new RunsView({
     activeRunId: () => orchestrator.activeRun?.id,
@@ -144,7 +156,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       worktreeExists,
       runChecks: (request) => runChecks(configuration.checks, request),
       requestApproval: (run, stage, signal) => approvals.request(run, stage, signal),
+      limits,
     };
+  }
+
+  /** Changes when the setup or verification commands change, so consent is asked again. */
+  function commandsSignature(): string {
+    const current = readConfiguration();
+    return JSON.stringify([current.isolation, current.setupCommands, current.verificationCommands]);
   }
   let orchestrator = createOrchestrator(configuration, store, dependencies());
 
@@ -170,10 +189,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
     },
     cancel: () => void orchestrator.cancel(),
     consentDetails: (folder, kind) => consentDetail(readConfiguration(), folder, false, kind).split('\n\n'),
-    commandsSignature: () => {
-      const current = readConfiguration();
-      return JSON.stringify([current.isolation, current.setupCommands, current.verificationCommands]);
-    },
+    commandsSignature,
     maxContextCharacters: () => configuration.maxContextCharacters,
     loadRuns: () => store.list(),
     listChanges: (worktree) => listWorktreeChanges(worktree),
@@ -194,9 +210,96 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       if (run) await openDocument(reportUri(run));
     },
     log: (text) => output.warn(text),
+    limits: () => limits.all(),
+    continuation: (runId) => continuations.get(runId)?.at,
+    pendingContinuations: () => continuations.size,
+    scheduleContinuation: (runId) => void scheduleContinuation(runId),
+    cancelContinuation: (runId) => {
+      if (continuations.cancel(runId)) output.info(`Automatic continuation of run ${runId} cancelled.`);
+    },
+    checkpointWorktree,
+    rewindWorktree: async (worktree, tree) => {
+      if (tree) {
+        await restoreWorktree(worktree, tree);
+        output.info(`Worktree put back to an earlier checkpoint for a retry: ${worktree.path}`);
+        await chat.runsChanged();
+        return;
+      }
+      await removeWorktree(worktree, worktreeRoot);
+      await markWorktree(worktree, 'discarded');
+    },
   };
   const chat = new ChatController(chatHost, { global: context.globalState, workspace: context.workspaceState });
   const chatProvider = new ChatViewProvider(context.extensionUri, chat);
+  const continuations = new ContinuationScheduler(
+    context.workspaceState.get<unknown[]>(CONTINUATIONS_KEY) ?? [],
+    (items) => void context.workspaceState.update(CONTINUATIONS_KEY, items),
+    (item) => continueAfterLimit(item),
+  );
+  continuations.onChange(() => chat.refresh());
+  limits.onChange(() => {
+    void context.globalState.update(LIMITS_KEY, limits.toJSON());
+    chat.refresh();
+  });
+
+  /** Schedules a run that stopped at the usage limits to continue once the first limit resets. */
+  async function scheduleContinuation(runId: string): Promise<void> {
+    const run = await findRun(runId);
+    if (!run?.limitReset || !canResume(run)) return;
+    const at = continueAt(run.limitReset);
+    continuations.schedule({ runId, at, commands: commandsSignature() });
+    output.info(`Run ${runId} continues automatically at ${formatReset(at)}.`);
+  }
+
+  /** Continues a run whose usage limits have reset, unless what it was allowed to run has changed. */
+  async function continueAfterLimit(item: Continuation): Promise<ContinuationOutcome> {
+    if (busy || orchestrator.activeRun) return 'retry';
+    const run = await findRun(item.runId);
+    if (!run || !canResume(run) || !run.limitReset || !vscode.workspace.isTrusted) return 'done';
+    if (run.allowWrites && item.commands !== commandsSignature()) {
+      output.warn(`Run ${run.id} was not continued automatically: its setup or verification commands changed while it was paused.`);
+      void vscode.window
+        .showWarningMessage(
+          'Dual Agent: the usage limits have reset, but the setup or verification commands changed while the run was paused, so it was not continued automatically.',
+          'Resume',
+        )
+        .then((choice) => (choice ? vscode.commands.executeCommand('dualAgent.resumeRun', run.id) : undefined));
+      return 'done';
+    }
+    output.info(`Usage limits reset; continuing run ${run.id}.`);
+    if (run.conversationId) {
+      await chat.continueAfterLimit(run.id);
+    } else {
+      await exclusive(async () => {
+        if (!orchestrator.activeRun) reconfigure();
+        return orchestrator.resume(run.id, run.allowWrites);
+      });
+    }
+    return 'done';
+  }
+
+  /** Tells the user a run stopped at the usage limits, and schedules it to continue when that is on. */
+  async function paused(run: RunRecord): Promise<void> {
+    if (!run.limitReset) return;
+    const auto = readConfiguration().autoContinue;
+    if (auto) await scheduleContinuation(run.id);
+    // The chat shows a card for its own messages; a hidden chat, or a run from the Runs view, gets a notification.
+    if (run.conversationId && chat.hasVisibleView) return;
+    const reason = run.error ?? 'Both agents are at their usage limits.';
+    if (auto) {
+      const choice = await vscode.window.showWarningMessage(
+        `Dual Agent: ${reason} It continues automatically at ${formatReset(continueAt(run.limitReset))}.`,
+        'Continue Now',
+        'Do Not Continue',
+      );
+      if (choice === 'Continue Now') await continuations.runNow(run.id);
+      else if (choice === 'Do Not Continue') continuations.cancel(run.id);
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(`Dual Agent: ${reason}`, 'Continue When Limits Reset', 'Resume Now');
+    if (choice === 'Continue When Limits Reset') await scheduleContinuation(run.id);
+    else if (choice === 'Resume Now') await vscode.commands.executeCommand('dualAgent.resumeRun', run.id);
+  }
 
   /** Records that a worktree's changes were applied or discarded on every run that shared it. */
   async function markWorktree(worktree: WorktreeInfo, state: 'applied' | 'discarded'): Promise<void> {
@@ -254,7 +357,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
   }
 
   function logAgentEvent(agentEvent: AgentStreamEvent): void {
-    const text = agentEvent.message.replace(/\s+/g, ' ').trim();
+    // The log is plain text that may be shared in bug reports, so credentials are masked here too.
+    const text = redactSecrets(agentEvent.message).text.replace(/\s+/g, ' ').trim();
     const excerpt = text.length > LOG_EXCERPT ? `${text.slice(0, LOG_EXCERPT)}…` : text;
     const line = `[${agentEvent.agent}] ${excerpt}`;
     if (agentEvent.category === 'diagnostic') output.warn(line);
@@ -341,7 +445,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       updateContext();
     }
     // Announced after `busy` is released: an unanswered notification must not block the next run.
-    if (finished) void announce(finished).catch((error: unknown) => output.error(message(error)));
+    if (finished?.limitReset) void paused(finished).catch((error: unknown) => output.error(message(error)));
+    else if (finished) void announce(finished).catch((error: unknown) => output.error(message(error)));
+    // Queued chat messages run once the lock is free; the timer lets the caller finish first.
+    setTimeout(() => void chat.drain(), 0);
   }
 
   async function startRun(kind: WorkflowKind): Promise<void> {
@@ -481,6 +588,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       else void vscode.window.showInformationMessage(`Dual Agent: ${summary}`);
     }),
     command('dualAgent.showOutput', () => output.show()),
+    command('dualAgent.clearHistory', () =>
+      exclusive(async () => {
+        const waiting = new Set((await store.list()).filter((run) => run.worktree?.state === 'active').map((run) => run.worktree?.path)).size;
+        if (waiting) throw new Error(`${waiting} isolated worktree(s) still hold changes. Apply or discard them first, then delete the history.`);
+        const choice = await vscode.window.showWarningMessage(
+          'Delete all Dual Agent history for this workspace?',
+          { modal: true, detail: 'Every conversation, attachment, and run record is deleted. Files in your workspace are not touched. This cannot be undone.' },
+          'Delete History',
+        );
+        if (choice !== 'Delete History') return undefined;
+        await chat.clearHistory();
+        await store.clear();
+        runsView.setRuns([]);
+        output.info('History deleted.');
+        void vscode.window.showInformationMessage('Dual Agent: history deleted.');
+        return undefined;
+      }),
+    ),
     command('dualAgent.refreshRuns', async () => runsView.setRuns(await store.list())),
     command('dualAgent.openDocument', (uri) => (uri instanceof vscode.Uri ? openDocument(uri) : undefined)),
     command('dualAgent.openReport', async (argument) => {
@@ -489,12 +614,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
     }),
     command('dualAgent.exportRun', async (argument) => {
       const run = await resolveRun(argument, () => true, 'Which run should be exported?');
-      if (run) await exportReport(run);
+      if (run) await exportReport(run, configuration.redactSecrets);
     }),
     command('dualAgent.exportLatestRun', async () => {
       const latest = await store.latest();
       if (!latest) throw new Error('There is no run to export.');
-      await exportReport(latest);
+      await exportReport(latest, configuration.redactSecrets);
     }),
     command('dualAgent.reviewChanges', async (argument) => {
       const run = await resolveRun(argument, hasChanges, 'Whose changes should be reviewed?');
@@ -590,6 +715,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
       chat.refresh();
     }),
     { dispose: () => detach() },
+    { dispose: () => continuations.dispose() },
     // Stops any agent still running when the extension shuts down.
     { dispose: () => void orchestrator.cancel() },
   );
@@ -604,7 +730,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<DualAg
   } catch (error) {
     output.error(`Run history could not be read: ${message(error)}`);
   }
-  return { chatReady: () => chat.hasReadyView, chatState: () => chat.snapshot(), chatMessage: (value) => chat.receive(value) };
+  return {
+    chatReady: () => chat.hasReadyView,
+    chatState: () => chat.snapshot(),
+    chatMessage: (value) => chat.receive(value),
+    chatErrors: () => chat.pageErrors,
+  };
 }
 
 function reportProblems(configuration: ExtensionConfiguration): void {
@@ -633,19 +764,22 @@ function createOrchestrator(
       resumeSessions: configuration.resumeClaudeSessions ? ['claude'] : [],
       setupCommands: configuration.setupCommands,
       verificationCommands: configuration.verificationCommands,
+      redactSecrets: configuration.redactSecrets,
     },
     dependencies,
   );
 }
 
-async function exportReport(run: RunRecord): Promise<void> {
+async function exportReport(run: RunRecord, redact: boolean): Promise<void> {
   const target = await vscode.window.showSaveDialog({
     // Reports contain prompts and agent output; defaulting outside the repository avoids committing them.
     defaultUri: vscode.Uri.file(path.join(os.homedir(), `dual-agent-run-${run.id.slice(0, 8)}.md`)),
     filters: { Markdown: ['md'] },
   });
   if (!target) return;
-  await writeFile(target.fsPath, renderRunReport(run), 'utf8');
+  // A report leaves private storage, so credentials an agent quoted are masked unless masking is turned off.
+  const report = renderRunReport(run);
+  await writeFile(target.fsPath, redact ? redactSecrets(report).text : report, 'utf8');
   await vscode.window.showTextDocument(target);
 }
 

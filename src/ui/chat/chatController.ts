@@ -19,12 +19,14 @@ import {
   continuedSessions,
   conversationHistory,
   FileConversationStore,
+  missedTurns,
   newConversation,
   recordRun,
   titleFor,
   type Conversation,
   type ConversationTurn,
 } from '../../core/conversation.js';
+import { formatReset, type AgentLimit } from '../../core/limits.js';
 import { editsFiles } from '../../core/orchestrator.js';
 import type { AgentId, AgentOptions, AttachmentRef, OrchestratorEvent, RunRecord, StartOptions, WorkflowKind, WorktreeInfo } from '../../core/types.js';
 import { isFinished } from '../../core/types.js';
@@ -45,8 +47,11 @@ import { applyLiveEvent, attachmentView, conversationSummaries, transcript, usag
 
 const COMPOSER_KEY = 'dualAgent.chat.composer';
 const CURRENT_KEY = 'dualAgent.chat.current';
+const QUEUE_KEY = 'dualAgent.chat.queue';
+const QUEUE_LIMIT = 20;
 const MAX_CONVERSATIONS = 50;
 const PUSH_DELAY_MS = 100;
+const PAGE_ERROR_LIMIT = 20;
 /** Share of the context budget given to the conversation's earlier turns. */
 const HISTORY_SHARE = 0.3;
 const MODES: readonly WorkflowKind[] = ['chat', 'research', 'edit', 'brainstorming', 'implementation'];
@@ -80,6 +85,45 @@ export interface ChatHost {
   openStage(runId: string, index: number): Promise<void>;
   openReport(runId: string): Promise<void>;
   log(message: string): void;
+  /** Usage limits in force, earliest reset first; while one agent is limited, the other works alone. */
+  limits(): AgentLimit[];
+  /** When a run that stopped at the usage limits continues on its own, if it is scheduled to. */
+  continuation(runId: string): string | undefined;
+  /** Runs waiting to continue after the usage limits reset; queued messages wait for them. */
+  pendingContinuations(): number;
+  scheduleContinuation(runId: string): void;
+  cancelContinuation(runId: string): void;
+  /** Records the worktree's files, so a later retry can put them back. */
+  checkpointWorktree(worktree: WorktreeInfo): Promise<string>;
+  /** Puts the worktree back to a checkpoint, or discards it when there is no checkpoint tree. */
+  rewindWorktree(worktree: WorktreeInfo, tree: string | undefined): Promise<void>;
+}
+
+/** A message waiting for the running one to finish, or for the agents' usage limits to reset. */
+interface QueuedMessage {
+  id: string;
+  conversationId: string;
+  text: string;
+  mode: WorkflowKind;
+  attachments: AttachmentRef[];
+  agentOptions: Record<AgentId, AgentOptions>;
+  web: boolean;
+  /** A retried message: its run starts new sessions instead of continuing ones that saw what it replaces. */
+  fresh?: boolean;
+}
+
+function isQueuedMessage(value: unknown): value is QueuedMessage {
+  const item = value as Partial<QueuedMessage> | null;
+  return (
+    typeof item === 'object' &&
+    item !== null &&
+    typeof item.id === 'string' &&
+    typeof item.conversationId === 'string' &&
+    typeof item.text === 'string' &&
+    typeof item.mode === 'string' &&
+    MODES.includes(item.mode) &&
+    Array.isArray(item.attachments)
+  );
 }
 
 interface Composer {
@@ -129,6 +173,17 @@ export class ChatController implements vscode.Disposable {
   private readonly ready = new Set<vscode.Webview>();
   private pushTimer: NodeJS.Timeout | undefined;
   private loaded: Promise<void> | undefined;
+  /** Errors the webviews reported this session, for the smoke test. */
+  public readonly pageErrors: string[] = [];
+  /** Messages sent while another was running, run in order once it finishes. */
+  private queue: QueuedMessage[] = [];
+  /** A message is between being sent and its run starting, for example while its consent card waits. */
+  private sending = false;
+  private draining = false;
+  /** Drains the queue once the agents' usage limits reset. */
+  private limitTimer: NodeJS.Timeout | undefined;
+  /** The earlier message whose text is in the composer; sending replaces it. */
+  private editing: { conversationId: string; turnId: string } | undefined;
 
   public constructor(
     private readonly host: ChatHost,
@@ -137,6 +192,11 @@ export class ChatController implements vscode.Disposable {
     this.store = new FileConversationStore(host.storagePath);
     this.attachmentRoot = path.join(host.storagePath, 'attachments');
     this.composer = this.readComposer();
+    this.queue = (memento.workspace.get<unknown[]>(QUEUE_KEY) ?? []).filter(isQueuedMessage);
+  }
+
+  private saveQueue(): void {
+    void this.memento.workspace.update(QUEUE_KEY, this.queue);
   }
 
   /** Folders a webview may load files from: stored attachments, for thumbnails. */
@@ -183,6 +243,8 @@ export class ChatController implements vscode.Disposable {
         this.codexModels = models;
         this.schedule();
       });
+      // Messages queued before VS Code closed run once it has started.
+      if (this.queue.length) setTimeout(() => void this.drain(), 2_000);
     })();
     return this.loaded;
   }
@@ -283,9 +345,11 @@ export class ChatController implements vscode.Disposable {
             ...(activeRunId ? { activeRunId } : {}),
             ...(awaitingApprovalRunId ? { awaitingApprovalRunId } : {}),
             thumbnail,
+            idle: !this.host.isBusy() && !this.sending,
+            continuation: (runId) => this.host.continuation(runId),
           })
         : [],
-      running: this.host.isBusy(),
+      running: this.host.isBusy() || this.sending,
       composer: {
         mode: this.composer.mode,
         web: this.composer.web || this.composer.mode === 'research',
@@ -293,7 +357,14 @@ export class ChatController implements vscode.Disposable {
         pending: pending.map((attachment) => attachmentView(attachment, thumbnail(attachment))),
         choices: this.choices(),
       },
+      queue: this.queue.map((item) => {
+        const owner = item.conversationId === conversation?.id ? undefined : this.conversations.find((entry) => entry.id === item.conversationId);
+        return { id: item.id, text: item.text, mode: item.mode, ...(owner ? { conversation: owner.title } : {}) };
+      }),
+      limits: this.host.limits().map((limit) => ({ agent: limit.agent, until: formatReset(limit.until), estimated: limit.estimated })),
     };
+    const edited = this.editing && conversation?.id === this.editing.conversationId ? conversation.turns.find((turn) => turn.id === this.editing?.turnId) : undefined;
+    if (edited) state.composer.editing = { turnId: edited.id, preview: titleFor(edited.message) };
     if ('blocked' in folder) state.blocked = folder.blocked;
     else state.folder = conversation ? path.basename(conversation.workspacePath) : folder.name;
     if (conversation) state.conversationId = conversation.id;
@@ -430,7 +501,25 @@ export class ChatController implements vscode.Disposable {
     await removeAttachmentFolder(this.attachmentRoot, this.conversationFolder(conversation)).catch(() => undefined);
     this.conversations = this.conversations.filter((item) => item !== conversation);
     this.pending.delete(id);
+    this.queue = this.queue.filter((item) => item.conversationId !== id);
+    this.saveQueue();
+    if (this.editing?.conversationId === id) this.editing = undefined;
     if (this.current === conversation) this.select(undefined);
+  }
+
+  /** Deletes every conversation and attachment. The caller holds the run lock and deletes the run records. */
+  public async clearHistory(): Promise<void> {
+    await this.load();
+    await this.store.clear();
+    await rm(this.attachmentRoot, { recursive: true, force: true });
+    this.conversations = [];
+    this.select(undefined);
+    for (const map of [this.runs, this.live, this.changes, this.pending, this.allowedEdits]) map.clear();
+    this.queue = [];
+    this.saveQueue();
+    this.editing = undefined;
+    this.notice = undefined;
+    this.schedule();
   }
 
   private async save(conversation: Conversation): Promise<void> {
@@ -546,23 +635,169 @@ export class ChatController implements vscode.Disposable {
     return undefined;
   }
 
-  private async send(text: string, mode: WorkflowKind): Promise<void> {
-    if (this.host.isBusy()) {
-      this.show('Another message is still running. Stop it or wait for it to finish.');
+  /** Sends the composer's message: now, or into the queue while another message runs or the agents are at their limits. */
+  private async submit(text: string, mode: WorkflowKind): Promise<void> {
+    if (this.editing) {
+      const target = this.editing;
+      this.editing = undefined;
+      await this.retry(target.turnId, text, mode);
       return;
     }
     const conversation = this.ensureConversation();
-    const attachments = this.pending.get(conversation.id) ?? [];
+    const item: QueuedMessage = {
+      id: randomUUID(),
+      conversationId: conversation.id,
+      text: text.trim(),
+      mode,
+      attachments: this.pending.get(conversation.id) ?? [],
+      agentOptions: { claude: { ...this.composer.options.claude }, codex: { ...this.composer.options.codex } },
+      web: this.composer.web || mode === 'research',
+    };
     this.pending.delete(conversation.id);
+    const waitFor = this.waitReason();
+    if (waitFor) {
+      if (this.queue.length >= QUEUE_LIMIT) {
+        this.pending.set(conversation.id, item.attachments);
+        this.show(`At most ${QUEUE_LIMIT} messages can wait in the queue.`, 'warn');
+        return;
+      }
+      this.queue.push(item);
+      this.saveQueue();
+      this.show(`Queued: it runs ${waitFor}.`, 'neutral');
+      this.armLimitTimer();
+      return;
+    }
+    await this.runMessage(item);
+  }
+
+  /** Why a new message has to wait, as the end of "it runs …", or undefined when it can run now. */
+  private waitReason(): string | undefined {
+    if (this.host.isBusy() || this.sending || this.draining) return 'after the current message';
+    if (this.queue.length) return 'after the messages ahead of it';
+    if (this.host.pendingContinuations()) return 'after the paused message continues';
+    const limits = this.host.limits();
+    if (limits.length >= 2) return `when the first usage limit resets, at ${formatReset(limits[0]?.until ?? new Date())}`;
+    return undefined;
+  }
+
+  /** Runs queued messages in order while nothing else is running and the agents can work. */
+  public async drain(): Promise<void> {
+    if (this.draining) return;
+    await this.load();
+    this.draining = true;
+    try {
+      while (this.queue.length && !this.host.isBusy() && !this.sending && !this.host.pendingContinuations() && this.host.limits().length < 2) {
+        const item = this.queue.shift();
+        this.saveQueue();
+        if (item) await this.runMessage(item);
+      }
+    } finally {
+      this.draining = false;
+      this.schedule();
+    }
+    this.armLimitTimer();
+  }
+
+  /** While both agents are at their limits, checks the queue again when the first limit resets. */
+  private armLimitTimer(): void {
+    if (this.limitTimer) clearTimeout(this.limitTimer);
+    this.limitTimer = undefined;
+    const [first, second] = this.host.limits();
+    if (!this.queue.length || !first || !second) return;
+    const delay = Math.min(2_147_483_647, Math.max(1_000, Date.parse(first.until) - Date.now() + 60_000));
+    this.limitTimer = setTimeout(() => void this.drain(), delay);
+  }
+
+  /**
+   * Runs an earlier message again: the messages after it are removed, the file changes made from it on are
+   * undone in the conversation's isolated copy, and the agents start new sessions so nothing removed carries over.
+   */
+  private async retry(turnId: string, text?: string, mode?: WorkflowKind): Promise<void> {
+    await this.load();
+    if (this.host.isBusy() || this.sending) {
+      this.show('Wait for the running message to finish, or stop it, before retrying an earlier one.');
+      return;
+    }
+    const conversation = this.conversations.find((item) => item.turns.some((turn) => turn.id === turnId));
+    const index = conversation?.turns.findIndex((turn) => turn.id === turnId) ?? -1;
+    const turn = conversation?.turns[index];
+    if (!conversation || !turn) return;
+    const later = conversation.turns.slice(index + 1);
+    const undo = this.rewindPlan(conversation.turns.slice(index));
+    const effects: string[] = [];
+    if (later.length) effects.push(`The ${later.length} message${later.length === 1 ? '' : 's'} after it ${later.length === 1 ? 'is' : 'are'} removed from the conversation.`);
+    if (undo?.kind === 'restore') effects.push('File changes made from this message on are undone in the isolated copy.');
+    if (undo?.kind === 'discard') effects.push('The isolated copy holding the changes from this message on is discarded.');
+    if (undo?.kind === 'applied') effects.push('Changes already applied to your workspace are not undone; review them in Source Control.');
+    // Retrying the last message undoes only its own work, which is what retrying means; anything more is confirmed.
+    if (later.length || undo?.kind === 'applied') {
+      const choice = await vscode.window.showWarningMessage(`${text === undefined ? 'Retry' : 'Edit and resend'} this message?`, { modal: true, detail: effects.join(' ') }, 'Retry');
+      if (choice !== 'Retry') return;
+    }
+    try {
+      if (undo?.kind === 'restore') await this.host.rewindWorktree(undo.worktree, undo.tree);
+      else if (undo?.kind === 'discard') await this.host.rewindWorktree(undo.worktree, undefined);
+    } catch (error) {
+      this.show(`The file changes could not be undone, so nothing was retried: ${message(error)}`, 'bad');
+      return;
+    }
+    conversation.turns.splice(index);
+    this.select(conversation);
+    await this.save(conversation);
+    await this.refreshChanges();
+    this.notice = undefined;
+    await this.runMessage({
+      id: randomUUID(),
+      conversationId: conversation.id,
+      text: (text ?? turn.message).trim(),
+      mode: mode ?? turn.mode,
+      attachments: turn.attachments,
+      // The current choices apply, so a retry can use a stronger model or more effort.
+      agentOptions: { claude: { ...this.composer.options.claude }, codex: { ...this.composer.options.codex } },
+      web: this.composer.web || turn.web === true || (mode ?? turn.mode) === 'research',
+      fresh: true,
+    });
+  }
+
+  /** What retrying from the first of `turns` does to files: the first checkpoint among them decides. */
+  private rewindPlan(
+    turns: readonly ConversationTurn[],
+  ): { kind: 'restore'; worktree: WorktreeInfo; tree: string } | { kind: 'discard'; worktree: WorktreeInfo } | { kind: 'applied' } | undefined {
+    for (const turn of turns) {
+      const worktree = turn.checkpoint && turn.runId ? this.runs.get(turn.runId)?.worktree : undefined;
+      if (!turn.checkpoint || !worktree) continue;
+      if (worktree.state === 'applied') return { kind: 'applied' };
+      if (worktree.state !== 'active') return undefined;
+      return turn.checkpoint.tree ? { kind: 'restore', worktree, tree: turn.checkpoint.tree } : { kind: 'discard', worktree };
+    }
+    return undefined;
+  }
+
+  private async runMessage(item: QueuedMessage): Promise<void> {
+    const conversation = this.conversations.find((entry) => entry.id === item.conversationId);
+    if (!conversation) return;
+    if (this.current !== conversation) this.select(conversation);
+    this.sending = true;
+    try {
+      await this.startMessage(conversation, item);
+    } finally {
+      this.sending = false;
+      this.schedule();
+    }
+  }
+
+  private async startMessage(conversation: Conversation, item: QueuedMessage): Promise<void> {
+    const { mode, attachments } = item;
     const earlier = { ...conversation, turns: [...conversation.turns] };
     const turn: ConversationTurn = {
       id: randomUUID(),
       createdAt: new Date().toISOString(),
       mode,
-      message: text.trim(),
+      message: item.text,
       attachments,
-      agentOptions: { claude: { ...this.composer.options.claude }, codex: { ...this.composer.options.codex } },
-      ...(this.composer.web || mode === 'research' ? { web: true } : {}),
+      agentOptions: item.agentOptions,
+      ...(item.web ? { web: true } : {}),
+      ...(item.fresh ? { freshSessions: true } : {}),
     };
     if (!conversation.turns.length) conversation.title = titleFor(turn.message);
     conversation.turns.push(turn);
@@ -583,14 +818,18 @@ export class ChatController implements vscode.Disposable {
       this.starting = { conversation, turn };
       try {
         const worktree = editsFiles(mode) ? await this.conversationWorktree(conversation) : undefined;
-        const history = conversationHistory(earlier, Math.floor(this.host.maxContextCharacters() * HISTORY_SHARE));
-        const sessions = continuedSessions(earlier);
+        if (editsFiles(mode)) await this.checkpoint(turn, worktree);
+        const budget = Math.floor(this.host.maxContextCharacters() * HISTORY_SHARE);
+        const history = conversationHistory(earlier, budget);
+        const sessions = item.fresh ? {} : continuedSessions(earlier);
+        const catchUp = missedTurns(earlier, sessions, budget);
         const options: StartOptions = {
           conversationId: conversation.id,
           ...(attachments.length ? { attachments } : {}),
-          ...(turn.agentOptions ? { agentOptions: turn.agentOptions } : {}),
+          agentOptions: item.agentOptions,
           ...(history ? { history } : {}),
           ...(Object.keys(sessions).length ? { continueSessions: sessions } : {}),
+          ...(Object.keys(catchUp).length ? { catchUp } : {}),
           ...(worktree ? { worktree } : {}),
           ...(turn.web ? { web: true } : {}),
         };
@@ -611,6 +850,35 @@ export class ChatController implements vscode.Disposable {
     });
   }
 
+  /** Records the conversation's worktree before an edit turn, so retrying from it can undo the turn. */
+  private async checkpoint(turn: ConversationTurn, worktree: WorktreeInfo | undefined): Promise<void> {
+    if (!worktree) {
+      turn.checkpoint = {};
+      return;
+    }
+    try {
+      turn.checkpoint = { tree: await this.host.checkpointWorktree(worktree) };
+    } catch (error) {
+      // Without a checkpoint the turn still runs; retrying from it cannot undo its file changes.
+      this.host.log(`No checkpoint before this edit: ${message(error)}`);
+    }
+  }
+
+  /**
+   * Continues a message that stopped at the usage limits, once they have reset. It needs no new consent: the
+   * extension calls this only for a run allowed to edit with the same commands that are configured now.
+   */
+  public async continueAfterLimit(runId: string): Promise<void> {
+    await this.load();
+    const run = this.runs.get(runId);
+    if (!run) return;
+    await this.host.exclusive(async () => {
+      const finished = await this.host.resume(runId, run.allowWrites);
+      await this.finishing.get(finished.id);
+      return finished;
+    });
+  }
+
   private async resume(runId: string): Promise<void> {
     const run = this.runs.get(runId);
     const conversation = this.conversations.find((item) => item.id === run?.conversationId);
@@ -620,6 +888,8 @@ export class ChatController implements vscode.Disposable {
       this.show('Another message is still running.');
       return;
     }
+    // Continuing by hand replaces an automatic continuation.
+    this.host.cancelContinuation(runId);
     // Resuming always asks again, as it does from the Runs view.
     this.allowedEdits.delete(conversation.id);
     const allowWrites = editsFiles(run.kind) && (await this.askConsent(conversation, turn));
@@ -662,8 +932,38 @@ export class ChatController implements vscode.Disposable {
         if (webview) this.post(webview, { type: 'state', state: this.state(this.webviews.get(webview)?.toUri ?? (() => '')) });
         return;
       case 'send':
-        await this.send(incoming.text, incoming.mode);
+        await this.submit(incoming.text, incoming.mode);
         return;
+      case 'retry':
+        await this.retry(incoming.turnId);
+        return;
+      case 'editMessage': {
+        const turn = this.current?.turns.find((item) => item.id === incoming.turnId);
+        if (!this.current || !turn) return;
+        this.editing = { conversationId: this.current.id, turnId: turn.id };
+        this.composer.mode = turn.mode;
+        for (const webview of this.webviews.keys()) this.post(webview, { type: 'fillComposer', text: turn.message });
+        break;
+      }
+      case 'cancelEdit':
+        this.editing = undefined;
+        break;
+      case 'unqueue': {
+        const index = this.queue.findIndex((item) => item.id === incoming.id);
+        if (index >= 0) {
+          const [removed] = this.queue.splice(index, 1);
+          this.saveQueue();
+          for (const attachment of removed?.attachments ?? []) await this.deleteStored(attachment);
+        }
+        break;
+      }
+      case 'continueAfterLimit':
+        this.host.scheduleContinuation(incoming.runId);
+        break;
+      case 'cancelContinuation':
+        this.host.cancelContinuation(incoming.runId);
+        void this.drain();
+        break;
       case 'stop':
         this.consent?.settle('deny');
         this.host.cancel();
@@ -783,6 +1083,10 @@ export class ChatController implements vscode.Disposable {
       case 'dismissNotice':
         this.notice = undefined;
         break;
+      case 'pageError':
+        if (this.pageErrors.length < PAGE_ERROR_LIMIT) this.pageErrors.push(incoming.message);
+        this.host.log(`Chat view error: ${incoming.message}`);
+        return;
     }
     this.schedule();
   }
