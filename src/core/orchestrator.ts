@@ -1,13 +1,19 @@
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 
+import { sanitizeAgentOptions } from './agentOptions.js';
+import { attachmentText } from './attachments.js';
 import { buildStagePrompt, describeCheck } from './context.js';
 import { AgentExecutionError, canFallback } from './errors.js';
 import { captureGitSnapshot } from './gitSnapshot.js';
 import type {
   AgentAdapter,
   AgentId,
+  AgentOptions,
   AgentRunRequest,
+  AgentStreamEvent,
   ApprovalDecision,
+  AttachmentRef,
   CheckResult,
   GitSnapshot,
   OrchestratorEvent,
@@ -16,6 +22,7 @@ import type {
   RunStore,
   StageRecord,
   StageResult,
+  StartOptions,
   WorkflowKind,
   WorkflowStageDefinition,
   WorktreeInfo,
@@ -23,7 +30,7 @@ import type {
 import { checksPassed, isFinished } from './types.js';
 import { addUsage, totalUsageByAgent } from './usage.js';
 import { parseVerdict, summarizeVerdict } from './verdict.js';
-import { fixRoundStages, getWorkflow } from './workflows.js';
+import { fixRoundStages, getWorkflow, reviseStage } from './workflows.js';
 
 export interface PreparedWorktree {
   info: WorktreeInfo;
@@ -48,6 +55,8 @@ export interface OrchestratorDependencies {
   runChecks?: (request: CheckRequest) => Promise<CheckResult[]>;
   /** Asks the user to approve the plan. Required when plan approval is enabled. */
   requestApproval?: (run: RunRecord, stage: StageRecord, signal: AbortSignal) => Promise<ApprovalDecision>;
+  /** Reads the attachment text to include in an agent's prompt; defaults to reading the stored files. */
+  readAttachmentText?: (attachments: readonly AttachmentRef[], agent: AgentId) => Promise<Record<string, string>>;
 }
 
 /** Ends a run as cancelled because the user decided to stop it. */
@@ -74,8 +83,25 @@ export function workingDirectory(run: RunRecord): string {
   return run.worktree?.state === 'active' ? run.worktree.workingDirectory : run.workspacePath;
 }
 
+/** Workflows whose stages edit files, so they need consent, Git, and (by default) a worktree. */
+export function editsFiles(kind: WorkflowKind): boolean {
+  return kind === 'implementation' || kind === 'edit';
+}
+
 function untrustedDirectories(run: RunRecord): string[] {
   return run.worktree ? [run.workspacePath, run.worktree.path, run.worktree.repositoryRoot] : [run.workspacePath];
+}
+
+/** Images to pass as arguments, and the folders outside the workspace that hold the run's attachments. */
+function attachmentAccess(run: RunRecord): { images: string[]; folders: string[] } {
+  const images: string[] = [];
+  const folders = new Set<string>();
+  for (const attachment of run.attachments ?? []) {
+    if (attachment.kind === 'image') images.push(attachment.path);
+    // Workspace files are read in place; stored copies live in the conversation's attachment folder.
+    if (!attachment.workspaceRelative) folders.add(path.dirname(attachment.path));
+  }
+  return { images, folders: [...folders] };
 }
 
 function stageRecord(definition: WorkflowStageDefinition, allowWrites: boolean): StageRecord {
@@ -91,7 +117,25 @@ function stageRecord(definition: WorkflowStageDefinition, allowWrites: boolean):
 function resetStage(stage: StageRecord): void {
   stage.status = 'pending';
   stage.assignedAgent = stage.agent;
-  for (const key of ['startedAt', 'completedAt', 'result', 'error', 'fallbackReason', 'verdict', 'checks'] as const) delete stage[key];
+  for (const key of ['startedAt', 'completedAt', 'result', 'error', 'fallbackReason', 'verdict', 'checks', 'activities'] as const) delete stage[key];
+}
+
+/** Steps kept per stage; the earliest are dropped first so the run history stays small. */
+export const STAGE_ACTIVITY_LIMIT = 60;
+
+/** Keeps the agent's steps on the stage, and attaches a later result to the step it belongs to. */
+function recordActivity(stage: StageRecord, event: AgentStreamEvent): void {
+  if (event.activity) {
+    stage.activities ??= [];
+    stage.activities.push({ ...event.activity });
+    if (stage.activities.length > STAGE_ACTIVITY_LIMIT) stage.activities.splice(0, stage.activities.length - STAGE_ACTIVITY_LIMIT);
+  }
+  const result = event.activityResult;
+  const step = result ? stage.activities?.find((activity) => activity.id === result.id) : undefined;
+  if (result && step) {
+    if (result.output) step.output = result.output;
+    if (result.failed) step.failed = true;
+  }
 }
 
 export class WorkflowOrchestrator {
@@ -128,14 +172,16 @@ export class WorkflowOrchestrator {
     objective: string,
     workspacePath: string,
     allowWrites: boolean,
+    options: StartOptions = {},
   ): Promise<RunRecord> {
     if (this.active) throw new Error('A workflow is already running. Cancel it before starting another.');
     if (!objective.trim()) throw new Error('An objective is required.');
-    if (kind === 'implementation' && !allowWrites) {
-      throw new Error('Implementation workflows require explicit workspace-write consent.');
+    if (editsFiles(kind) && !allowWrites) {
+      throw new Error('Workflows that edit files require explicit workspace-write consent.');
     }
 
     const created = now();
+    const isolation = editsFiles(kind) ? (this.options.isolation ?? 'none') : 'none';
     const run: RunRecord = {
       schemaVersion: 1,
       id: randomUUID(),
@@ -149,8 +195,18 @@ export class WorkflowOrchestrator {
       stages: getWorkflow(kind).map((stage) => stageRecord(stage, allowWrites)),
       usage: totalUsageByAgent(),
       warnings: [],
-      isolation: kind === 'implementation' ? (this.options.isolation ?? 'none') : 'none',
+      isolation,
+      ...(options.conversationId ? { conversationId: options.conversationId } : {}),
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
+      ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}),
+      ...(options.history ? { history: options.history } : {}),
+      ...(options.continueSessions ? { continueSessions: options.continueSessions } : {}),
     };
+    // A conversation keeps editing the same worktree until its changes are applied or discarded.
+    const reused = options.worktree;
+    if (isolation === 'worktree' && reused?.state === 'active' && (await (this.dependencies.worktreeExists?.(reused) ?? Promise.resolve(true)))) {
+      run.worktree = { ...reused };
+    }
     return this.execute(run);
   }
 
@@ -169,8 +225,8 @@ export class WorkflowOrchestrator {
           : `Only failed or cancelled runs can be resumed; this run is ${run.status}.`,
       );
     }
-    if (run.kind === 'implementation' && !allowWrites) {
-      throw new Error('Implementation workflows require explicit workspace-write consent.');
+    if (editsFiles(run.kind) && !allowWrites) {
+      throw new Error('Workflows that edit files require explicit workspace-write consent.');
     }
     if (run.worktree && !(await (this.dependencies.worktreeExists?.(run.worktree) ?? Promise.resolve(true)))) {
       throw new Error('The isolated worktree for this run no longer exists, so it cannot be resumed.');
@@ -219,16 +275,16 @@ export class WorkflowOrchestrator {
 
     try {
       await this.update(run);
-      if (run.kind === 'implementation' && run.isolation === 'worktree') await this.ensureWorktree(run, signal);
+      if (editsFiles(run.kind) && run.isolation === 'worktree') await this.ensureWorktree(run, signal);
       for (const adapter of Object.values(this.adapters)) {
         for (const warning of (await adapter.preflightWarnings?.(workingDirectory(run))) ?? []) this.warn(run, warning);
       }
       let snapshot: GitSnapshot | undefined;
-      if (run.kind === 'implementation') {
+      if (editsFiles(run.kind)) {
         snapshot = await this.snapshot(run);
         if (!snapshot.available) {
           throw new Error(
-            `Implementation workflows need a working Git repository so reviewers see every change and it can be reverted. ${snapshot.warnings.join(' ')}`,
+            `Editing files needs a working Git repository so reviewers see every change and it can be reverted. ${snapshot.warnings.join(' ')}`,
           );
         }
       }
@@ -246,6 +302,7 @@ export class WorkflowOrchestrator {
         snapshot = undefined;
         if (stage.permission === 'workspace-write') await this.verify(run, stage, signal);
         if (stage.gate) this.gate(run, index, stage);
+        if (stage.onFail === 'revise') this.revise(run, index, stage);
       }
       run.status = run.unresolved ? 'completed-with-findings' : 'completed';
       run.completedAt = now();
@@ -326,8 +383,11 @@ export class WorkflowOrchestrator {
     const snapshot = initialSnapshot ?? (await this.snapshot(run));
     if (signal.aborted) throw new Error('Workflow cancelled.');
 
+    const inline = (agent: AgentId): Promise<Record<string, string>> =>
+      run.attachments?.length ? (this.dependencies.readAttachmentText ?? attachmentText)(run.attachments, agent) : Promise.resolve({});
     try {
-      stage.result = await this.attempt(run, stage, stage.agent, this.prompts(run, stage, stage.agent, snapshot, false), signal);
+      const prompts = this.prompts(run, stage, stage.agent, snapshot, false, await inline(stage.agent));
+      stage.result = await this.attempt(run, stage, stage.agent, prompts, signal);
     } catch (error) {
       if (!this.options.fallbackOnQuota || !canFallback(error) || signal.aborted) throw error;
       const fallback: AgentId = stage.agent === 'claude' ? 'codex' : 'claude';
@@ -338,7 +398,7 @@ export class WorkflowOrchestrator {
       // The failed attempt may have changed files before it stopped, so the fallback needs a fresh view.
       const fresh = await this.snapshot(run);
       if (signal.aborted) throw new Error('Workflow cancelled.');
-      stage.result = await this.attempt(run, stage, fallback, this.prompts(run, stage, fallback, fresh, true), signal);
+      stage.result = await this.attempt(run, stage, fallback, this.prompts(run, stage, fallback, fresh, true, await inline(fallback)), signal);
     }
 
     if (stage.review) stage.verdict = parseVerdict(stage.result.text);
@@ -353,18 +413,29 @@ export class WorkflowOrchestrator {
    * Builds the prompt for a new session and, when this agent's sessions are resumed, a shorter prompt for
    * its previous session in this run. A fallback provider always starts fresh.
    */
-  private prompts(run: RunRecord, stage: StageRecord, agent: AgentId, snapshot: GitSnapshot, fallback: boolean): StagePrompts {
+  private prompts(
+    run: RunRecord,
+    stage: StageRecord,
+    agent: AgentId,
+    snapshot: GitSnapshot,
+    fallback: boolean,
+    inlineText: Record<string, string>,
+  ): StagePrompts {
     const max = this.options.maxContextCharacters;
-    const prompt = buildStagePrompt(run, stage, snapshot, max, fallback ? { fallback: true } : {});
+    const prompt = buildStagePrompt(run, stage, snapshot, max, { attachmentText: inlineText, ...(fallback ? { fallback: true } : {}) });
     if (fallback || !this.options.resumeSessions?.includes(agent)) return { prompt };
     const index = run.stages.indexOf(stage);
     const previous = run.stages
       .slice(0, index === -1 ? undefined : index)
       .reverse()
       .find((item) => item.status === 'completed' && item.assignedAgent === agent && item.result?.providerSessionId);
-    const sessionId = previous?.result?.providerSessionId;
+    // The first stage of a conversation turn continues the session from the previous turn.
+    const sessionId = previous?.result?.providerSessionId ?? run.continueSessions?.[agent];
     if (!sessionId) return { prompt };
-    return { prompt, resume: { sessionId, prompt: buildStagePrompt(run, stage, snapshot, max, { resumedSessionId: sessionId }) } };
+    return {
+      prompt,
+      resume: { sessionId, prompt: buildStagePrompt(run, stage, snapshot, max, { resumedSessionId: sessionId, attachmentText: inlineText }) },
+    };
   }
 
   private async attempt(
@@ -374,14 +445,22 @@ export class WorkflowOrchestrator {
     prompts: StagePrompts,
     signal: AbortSignal,
   ): Promise<StageResult> {
+    const { images, folders } = attachmentAccess(run);
+    const options = this.agentOptions(run, agent);
     const request: AgentRunRequest = {
       prompt: prompts.prompt,
       cwd: workingDirectory(run),
       untrustedDirectories: untrustedDirectories(run),
       permission: stage.permission,
       signal,
-      onEvent: (agentEvent) => this.emit({ type: 'agent-event', run, agentEvent }),
+      onEvent: (agentEvent) => {
+        recordActivity(stage, agentEvent);
+        this.emit({ type: 'agent-event', run, agentEvent, stageId: stage.id });
+      },
       ...(prompts.resume ? { resume: prompts.resume } : {}),
+      ...(Object.keys(options).length ? { options } : {}),
+      ...(images.length ? { images } : {}),
+      ...(folders.length ? { readableDirectories: folders } : {}),
     };
     try {
       return await this.adapters[agent].run(request);
@@ -390,6 +469,11 @@ export class WorkflowOrchestrator {
       if (error instanceof AgentExecutionError && error.usage) run.usage[agent] = addUsage(run.usage[agent], error.usage);
       throw error;
     }
+  }
+
+  /** The run's chosen model and effort for the agent actually running, revalidated because runs are stored. */
+  private agentOptions(run: RunRecord, agent: AgentId): AgentOptions {
+    return sanitizeAgentOptions(agent, run.agentOptions?.[agent]);
   }
 
   /** Runs the configured verification commands after a stage that could edit files. */
@@ -440,6 +524,21 @@ export class WorkflowOrchestrator {
     if (!run.allowWrites || rounds >= (this.options.maxFixRounds ?? 0)) return;
     run.stages.splice(index + 1, 0, ...fixRoundStages(rounds + 1, reason).map((item) => stageRecord(item, run.allowWrites)));
     this.log(run, `The final gate did not pass (${reason}); starting fix round ${rounds + 1}.`);
+  }
+
+  /**
+   * After a chat check that did not pass, adds one read-only Claude stage that weighs the findings and gives
+   * the final answer. It is not checked again, so a message costs at most three agent calls.
+   */
+  private revise(run: RunRecord, index: number, stage: StageRecord): void {
+    if (stage.verdict?.outcome === 'pass') return;
+    if (run.stages.slice(index + 1).some((item) => item.id === 'claude-revise')) return;
+    const reason =
+      !stage.verdict || stage.verdict.outcome === 'missing'
+        ? 'the check gave no machine-readable verdict'
+        : `the check reported ${summarizeVerdict(stage.verdict)}`;
+    run.stages.splice(index + 1, 0, stageRecord(reviseStage(reason), run.allowWrites));
+    this.log(run, `Codex's check did not pass (${reason}); Claude revises the answer.`);
   }
 
   private async snapshot(run: RunRecord): Promise<GitSnapshot> {

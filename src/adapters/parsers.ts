@@ -1,5 +1,20 @@
-import type { AgentStreamEvent, StageResult, TokenUsage } from '../core/types.js';
+import type { AgentActivity, AgentStreamEvent, StageResult, TokenUsage } from '../core/types.js';
 import { emptyUsage } from '../core/types.js';
+
+const TITLE_LIMIT = 160;
+/** Tool input and output are kept short: they are shown in the chat and stored with the run. */
+const INPUT_LIMIT = 600;
+const OUTPUT_LIMIT = 1_200;
+
+function clip(value: string, limit: number): string {
+  const single = limit === TITLE_LIMIT ? value.replace(/\s+/g, ' ').trim() : value.trim();
+  return single.length > limit ? `${single.slice(0, limit - 1)}…` : single;
+}
+
+function stringAt(object: JsonObject | undefined, key: string): string {
+  const value = object?.[key];
+  return typeof value === 'string' ? value : '';
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -31,14 +46,57 @@ function textContent(value: unknown): string {
 
 export interface ParsedLine {
   event?: AgentStreamEvent;
+  /** Further events from the same line, such as one activity per tool call in a Claude message. */
+  extraEvents?: AgentStreamEvent[];
   text?: string;
   sessionId?: string;
+  /** Model the provider reported for the session. */
+  model?: string;
   usage?: TokenUsage;
   terminal?: boolean;
   /** A provider-reported failure of the turn. The stage fails even if the process exits cleanly. */
   failure?: string;
   /** A provider-reported error that may have been recovered from, kept to explain a later failure. */
   error?: string;
+}
+
+/** Describes a Codex item other than a message, such as a command it ran or files it changed. */
+function codexActivity(item: JsonObject | undefined): AgentActivity | undefined {
+  const type = stringAt(item, 'type');
+  if (type === 'command_execution') {
+    const exitCode = typeof item?.exit_code === 'number' ? item.exit_code : undefined;
+    const command = stringAt(item, 'command');
+    const output = stringAt(item, 'aggregated_output');
+    return {
+      kind: 'command',
+      tool: 'Shell',
+      title: clip(command || 'Ran a command', TITLE_LIMIT),
+      ...(command ? { input: clip(command, INPUT_LIMIT) } : {}),
+      ...(output || exitCode !== undefined ? { output: clip(`${output}${exitCode ? `\n(exit code ${exitCode})` : ''}`, OUTPUT_LIMIT) } : {}),
+      ...(exitCode !== undefined && exitCode !== 0 ? { failed: true } : {}),
+    };
+  }
+  if (type === 'file_change') {
+    const changes = Array.isArray(item?.changes) ? item.changes : [];
+    const lines = changes
+      .map(asObject)
+      .map((change) => `${stringAt(change, 'kind') || 'update'} ${stringAt(change, 'path')}`.trim())
+      .filter(Boolean);
+    return { kind: 'edit', tool: 'Edit', title: clip(lines.map((line) => line.split(' ').slice(1).join(' ')).join(', ') || 'Changed files', TITLE_LIMIT), input: clip(lines.join('\n'), INPUT_LIMIT) };
+  }
+  if (type === 'reasoning') {
+    const text = stringAt(item, 'text');
+    return text ? { kind: 'reasoning', tool: 'Thinking', title: clip(text.split('\n')[0] ?? '', TITLE_LIMIT), output: clip(text, OUTPUT_LIMIT) } : undefined;
+  }
+  if (type === 'web_search') {
+    const query = stringAt(item, 'query');
+    return { kind: 'web', tool: 'Web search', title: clip(query, TITLE_LIMIT), ...(query ? { input: query } : {}) };
+  }
+  if (type === 'mcp_tool_call') {
+    const name = [stringAt(item, 'server'), stringAt(item, 'tool')].filter(Boolean).join('.');
+    return { kind: 'tool', tool: name || 'Tool', title: clip(name, TITLE_LIMIT) };
+  }
+  return undefined;
 }
 
 export function parseCodexLine(line: string): ParsedLine | undefined {
@@ -61,13 +119,15 @@ export function parseCodexLine(line: string): ParsedLine | undefined {
     const item = asObject(value.item);
     const itemType = typeof item?.type === 'string' ? item.type : 'item';
     const text = typeof item?.text === 'string' ? item.text : '';
+    const activity = itemType === 'agent_message' ? undefined : codexActivity(item);
     return {
       ...(text && itemType === 'agent_message' ? { text } : {}),
       event: {
         agent: 'codex',
         category: itemType === 'agent_message' ? 'message' : 'tool',
-        message: text || `Completed ${itemType}.`,
+        message: activity?.title ?? (text || `Completed ${itemType}.`),
         raw: value,
+        ...(activity ? { activity } : {}),
       },
     };
   }
@@ -103,6 +163,57 @@ export function parseCodexLine(line: string): ParsedLine | undefined {
   return { event: { agent: 'codex', category: 'lifecycle', message: type, raw: value } };
 }
 
+/** An edit's input as a compact diff, so the IN box shows what changed rather than raw JSON. */
+function editPreview(input: JsonObject | undefined): string {
+  const lines = (prefix: string, text: string): string =>
+    text
+      .split('\n')
+      .slice(0, 6)
+      .map((line) => `${prefix} ${line}`)
+      .join('\n');
+  const old = stringAt(input, 'old_string');
+  const next = stringAt(input, 'new_string') || stringAt(input, 'new_source') || stringAt(input, 'content');
+  return [old ? lines('-', old) : '', next ? lines('+', next) : ''].filter(Boolean).join('\n');
+}
+
+/** Describes one Claude tool call from its name and input, as Claude Code shows it: the tool, then its subject. */
+function claudeActivity(name: string, input: JsonObject | undefined, id: string): AgentActivity {
+  const file = stringAt(input, 'file_path') || stringAt(input, 'notebook_path') || stringAt(input, 'path');
+  const make = (kind: AgentActivity['kind'], title: string, given: string): AgentActivity => ({
+    kind,
+    tool: name || 'Tool',
+    title: clip(title, TITLE_LIMIT),
+    ...(given ? { input: clip(given, INPUT_LIMIT) } : {}),
+    ...(id ? { id } : {}),
+  });
+  switch (name) {
+    case 'Read':
+      return make('read', file, file);
+    case 'Grep': {
+      const pattern = stringAt(input, 'pattern');
+      return make('search', `"${pattern}"${file ? ` in ${file}` : ''}`, [pattern, file, stringAt(input, 'glob')].filter(Boolean).join('  '));
+    }
+    case 'Glob':
+      return make('search', stringAt(input, 'pattern'), [stringAt(input, 'pattern'), file].filter(Boolean).join('  '));
+    case 'Edit':
+    case 'MultiEdit':
+    case 'NotebookEdit':
+    case 'Write':
+      return make('edit', file, `${file}\n${editPreview(input)}`.trim());
+    case 'Bash':
+    case 'PowerShell': {
+      const command = stringAt(input, 'command');
+      return make('command', stringAt(input, 'description') || command, command);
+    }
+    case 'WebFetch':
+      return make('web', stringAt(input, 'url'), stringAt(input, 'url'));
+    case 'WebSearch':
+      return make('web', stringAt(input, 'query'), stringAt(input, 'query'));
+    default:
+      return make('tool', name, input ? JSON.stringify(input, null, 2) : '');
+  }
+}
+
 export function parseClaudeLine(line: string): ParsedLine | undefined {
   let value: JsonObject;
   try {
@@ -114,14 +225,58 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
   const type = typeof value.type === 'string' ? value.type : 'unknown';
   const sessionId = typeof value.session_id === 'string' ? value.session_id : undefined;
 
+  if (type === 'stream_event') {
+    // Partial messages: only streamed text is used; complete messages still arrive as `assistant` events.
+    const event = asObject(value.event);
+    const delta = asObject(event?.delta);
+    const text = event?.type === 'content_block_delta' && delta?.type === 'text_delta' ? stringAt(delta, 'text') : '';
+    if (!text) return { ...(sessionId ? { sessionId } : {}) };
+    return { ...(sessionId ? { sessionId } : {}), event: { agent: 'claude', category: 'message', message: '', delta: text } };
+  }
+
+  if (type === 'system' && value.subtype === 'init') {
+    const model = stringAt(value, 'model');
+    return {
+      ...(sessionId ? { sessionId } : {}),
+      ...(model ? { model } : {}),
+      event: { agent: 'claude', category: 'lifecycle', message: model ? `Claude session started (${model}).` : 'Claude session started.', raw: value },
+    };
+  }
+
   if (type === 'assistant') {
     const message = asObject(value.message);
     const text = textContent(message?.content);
+    const blocks = Array.isArray(message?.content) ? message.content.map(asObject) : [];
+    const activities = blocks
+      .filter((block) => block?.type === 'tool_use')
+      .map((block) => claudeActivity(stringAt(block, 'name'), asObject(block?.input), stringAt(block, 'id')));
+    const extraEvents = activities.map(
+      (activity): AgentStreamEvent => ({ agent: 'claude', category: 'tool', message: activity.title, activity }),
+    );
     return {
       ...(sessionId ? { sessionId } : {}),
       ...(text ? { text } : {}),
+      ...(extraEvents.length ? { extraEvents } : {}),
       event: { agent: 'claude', category: 'message', message: text || 'Claude produced a message.', raw: value },
     };
+  }
+
+  if (type === 'user') {
+    // Tool results come back as a user message, linked to the call by its ID.
+    const message = asObject(value.message);
+    const blocks = Array.isArray(message?.content) ? message.content.map(asObject) : [];
+    const results = blocks
+      .filter((block) => block?.type === 'tool_result' && stringAt(block, 'tool_use_id'))
+      .map(
+        (block): AgentStreamEvent => ({
+          agent: 'claude',
+          category: 'tool',
+          message: '',
+          activityResult: { id: stringAt(block, 'tool_use_id'), output: clip(textContent(block?.content), OUTPUT_LIMIT), failed: block?.is_error === true },
+        }),
+      );
+    const [first, ...rest] = results;
+    return { ...(sessionId ? { sessionId } : {}), ...(first ? { event: first } : {}), ...(rest.length ? { extraEvents: rest } : {}) };
   }
 
   if (type === 'result') {
@@ -163,6 +318,7 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
 export class StreamAccumulator {
   private lastText = '';
   private sessionId?: string;
+  private model?: string;
   private usage: TokenUsage = emptyUsage();
   private eventCount = 0;
   private failure?: string;
@@ -173,6 +329,7 @@ export class StreamAccumulator {
     this.eventCount += 1;
     if (parsed.text) this.lastText = parsed.text;
     if (parsed.sessionId) this.sessionId = parsed.sessionId;
+    if (parsed.model) this.model = parsed.model;
     if (parsed.usage) this.usage = parsed.usage;
     if (parsed.failure) this.failure = parsed.failure;
     if (parsed.error) this.lastError = parsed.error;
@@ -194,6 +351,7 @@ export class StreamAccumulator {
       usage: this.usage,
       rawEventCount: this.eventCount,
       ...(this.sessionId ? { providerSessionId: this.sessionId } : {}),
+      ...(this.model ? { model: this.model } : {}),
     };
   }
 }

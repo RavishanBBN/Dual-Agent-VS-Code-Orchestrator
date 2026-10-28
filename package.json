@@ -1,8 +1,8 @@
 {
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent Orchestrator",
-  "description": "Claude plans and implements, Codex independently reviews, and you approve: a reciprocal two-agent workflow in the VS Code sidebar, with isolated worktrees, verification gates, and subscription-safe execution.",
-  "version": "2.0.0",
+  "description": "A Claude Code-style chat where Claude answers and Codex checks the answer: conversations with attachments, model and effort pickers, isolated edits you review and apply, and reciprocal brainstorming and implementation workflows.",
+  "version": "2.1.0",
   "private": true,
   "publisher": "local",
   "license": "MIT",
@@ -45,18 +45,45 @@
     "views": {
       "dualAgent": [
         {
+          "type": "webview",
+          "id": "dualAgent.chat",
+          "name": "Chat",
+          "contextualTitle": "Dual Agent"
+        },
+        {
           "id": "dualAgent.runs",
           "name": "Runs",
-          "contextualTitle": "Dual Agent"
+          "contextualTitle": "Dual Agent",
+          "visibility": "collapsed"
         },
         {
           "id": "dualAgent.agents",
           "name": "Agents",
-          "contextualTitle": "Dual Agent"
+          "contextualTitle": "Dual Agent",
+          "visibility": "collapsed"
         }
       ]
     },
     "commands": [
+      {
+        "command": "dualAgent.openChat",
+        "title": "Open Chat",
+        "category": "Dual Agent",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "dualAgent.newConversation",
+        "title": "New Conversation",
+        "category": "Dual Agent",
+        "icon": "$(add)",
+        "enablement": "!dualAgent.running"
+      },
+      {
+        "command": "dualAgent.openChatInEditor",
+        "title": "Open Chat in Editor",
+        "category": "Dual Agent",
+        "icon": "$(comment-discussion)"
+      },
       {
         "command": "dualAgent.runImplementation",
         "title": "Start Implementation Run",
@@ -169,6 +196,21 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "dualAgent.newConversation",
+          "when": "view == dualAgent.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "dualAgent.openChatInEditor",
+          "when": "view == dualAgent.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "dualAgent.cancel",
+          "when": "view == dualAgent.chat && dualAgent.running",
+          "group": "navigation@0"
+        },
         {
           "command": "dualAgent.cancel",
           "when": "view == dualAgent.runs && dualAgent.running",
@@ -313,6 +355,13 @@
           "command": "dualAgent.openChange",
           "when": "false"
         }
+      ],
+      "editor/title": [
+        {
+          "command": "dualAgent.openChatInEditor",
+          "group": "navigation@100",
+          "when": "activeWebviewPanelId != 'dualAgent.chatPanel'"
+        }
       ]
     },
     "configuration": {
@@ -372,6 +421,22 @@
           "scope": "machine",
           "description": "Optional Codex model ID. Empty uses the CLI/account default."
         },
+        "dualAgent.codex.effort": {
+          "type": "string",
+          "enum": [
+            "",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra"
+          ],
+          "default": "",
+          "scope": "machine",
+          "description": "Default Codex reasoning effort (model_reasoning_effort). Empty uses the CLI default; not every model accepts every level."
+        },
         "dualAgent.context.maxCharacters": {
           "type": "number",
           "default": 90000,
@@ -388,7 +453,7 @@
         },
         "dualAgent.history.maxRuns": {
           "type": "number",
-          "default": 50,
+          "default": 100,
           "minimum": 5,
           "maximum": 500,
           "description": "Maximum number of workflow records retained in private workspace storage.",
@@ -401,7 +466,7 @@
           },
           "default": [],
           "scope": "machine",
-          "markdownDescription": "Claude Code permission rules granted to workspace-write stages only, for example `Bash(npm test:*)`. Print mode cannot ask for approval, so without rules here Claude cannot run shell commands such as tests. Each rule lets agents run that command against files they wrote."
+          "markdownDescription": "Claude Code permission rules granted to workspace-write stages only, for example `Bash(npm test:*)`. Claude stages have no shell unless a rule here names one: each rule makes its tool available and pre-approves the matching commands. Each rule lets agents run that command against files they wrote."
         },
         "dualAgent.environment.passthrough": {
           "type": "array",
@@ -479,6 +544,20 @@
           "default": true,
           "scope": "machine",
           "description": "Continue Claude's previous session in later Claude stages of the same run, so its earlier exploration and output are not sent again. A session that cannot be resumed is replaced by a new one automatically."
+        },
+        "dualAgent.claude.effort": {
+          "type": "string",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "",
+          "scope": "machine",
+          "description": "Default Claude reasoning effort for new chat messages and workflows. Empty uses the CLI default; the chat can change it per message."
         }
       }
     },
@@ -492,6 +571,13 @@
         "view": "dualAgent.runs",
         "contents": "Open a folder to run agents in it.\n[Open Folder](command:workbench.action.files.openFolder)",
         "when": "workspaceFolderCount == 0"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "dualAgent.openChat",
+        "key": "ctrl+alt+d",
+        "mac": "cmd+alt+d"
       }
     ]
   },
@@ -507,7 +593,11 @@
     "package": "npm run check && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links"
   },
   "dependencies": {
-    "cross-spawn": "^7.0.6"
+    "cross-spawn": "^7.0.6",
+    "fflate": "0.8.3",
+    "markdown-it": "15.0.3",
+    "preact": "10.29.8",
+    "unpdf": "1.8.1"
   },
   "overrides": {
     "@azure/msal-node": "7.1.0"

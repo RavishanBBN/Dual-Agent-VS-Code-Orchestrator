@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { AgentExecutionError } from '../src/core/errors.js';
-import { canResume, WorkflowOrchestrator, type CheckRequest, type OrchestratorDependencies } from '../src/core/orchestrator.js';
+import { canResume, STAGE_ACTIVITY_LIMIT, WorkflowOrchestrator, type CheckRequest, type OrchestratorDependencies } from '../src/core/orchestrator.js';
 import type {
   AgentAdapter,
   AgentHealth,
@@ -154,7 +154,7 @@ describe('WorkflowOrchestrator', () => {
     const { claude, codex, orchestrator } = setup({ snapshot: noGit });
     const run = await orchestrator.start('implementation', 'Change files.', process.cwd(), true);
     expect(run.status).toBe('failed');
-    expect(run.error).toContain('need a working Git repository');
+    expect(run.error).toContain('needs a working Git repository');
     expect(run.error).toContain('not a Git repository');
     expect(run.stages.every((stage) => stage.status === 'skipped')).toBe(true);
     expect(claude.calls).toHaveLength(0);
@@ -492,5 +492,163 @@ describe('worktree isolation', () => {
     const run = await orchestrator.start('brainstorming', 'Design it.', '/repo/app', false);
     expect(run.isolation).toBe('none');
     expect(claude.calls.every((request) => request.cwd === '/repo/app')).toBe(true);
+  });
+});
+
+describe('conversation turns', () => {
+  const info = { path: '/storage/wt', workingDirectory: '/storage/wt/app', repositoryRoot: '/repo', baseCommit: 'base', state: 'active' as const };
+  const image = { id: 'img1', name: 'screen.png', kind: 'image' as const, path: '/storage/attachments/c1/img1-screen.png', size: 10, mediaType: 'image/png' };
+  const notes = { id: 'txt1', name: 'notes.md', kind: 'text' as const, path: '/storage/attachments/c1/txt1-notes.md', size: 10 };
+  const mention = { id: 'ws1', name: 'math.js', kind: 'text' as const, path: '/repo/app/math.js', size: 10, workspaceRelative: 'math.js' };
+
+  it('answers a chat message with Claude and has Codex check it, without a revision when Codex agrees', async () => {
+    const { claude, codex, orchestrator } = setup();
+    codex.respond = () => verdict('pass');
+    const run = await orchestrator.start('chat', 'Why does average([]) throw?', '/repo/app', false);
+    expect(run.status).toBe('completed');
+    expect(run.stages.map((stage) => stage.id)).toEqual(['claude-answer', 'codex-check']);
+    expect(claude.calls).toHaveLength(1);
+    expect(claude.calls[0]?.prompt).toContain("## The user's latest message");
+    expect(codex.calls[0]?.prompt).toContain('Required verdict');
+  });
+
+  it('adds one read-only Claude revision when Codex finds a problem, and never checks again', async () => {
+    const { claude, codex, orchestrator } = setup();
+    codex.respond = () => verdict('fail');
+    const run = await orchestrator.start('chat', 'Why does average([]) throw?', '/repo/app', false);
+    expect(run.status).toBe('completed');
+    expect(run.stages.map((stage) => stage.id)).toEqual(['claude-answer', 'codex-check', 'claude-revise']);
+    expect(run.stages[2]).toMatchObject({ permission: 'read-only', status: 'completed' });
+    expect(claude.calls[1]?.prompt).toContain('1 high');
+    expect(claude.calls[1]?.prompt).toContain('Off-by-one in pager');
+    expect(codex.calls).toHaveLength(1);
+  });
+
+  it('treats a check without a verdict as failed, so Claude revises', async () => {
+    const { orchestrator } = setup();
+    const run = await orchestrator.start('chat', 'Explain the pager.', '/repo/app', false);
+    expect(run.stages.at(-1)?.id).toBe('claude-revise');
+  });
+
+  it('gives each agent the chosen model and effort, and the attachments in the form it can read', async () => {
+    const { claude, codex, orchestrator } = setup();
+    codex.respond = () => verdict('pass');
+    const run = await orchestrator.start('chat', 'What is in the screenshot?', '/repo/app', false, {
+      conversationId: 'c1',
+      attachments: [image, notes, mention],
+      agentOptions: { claude: { model: 'opus', effort: 'high' }, codex: { model: 'gpt-6-sol', effort: '--bad' } },
+    });
+    expect(run.conversationId).toBe('c1');
+    expect(claude.calls[0]?.options).toEqual({ model: 'opus', effort: 'high' });
+    // An invalid stored effort is dropped rather than passed on.
+    expect(codex.calls[0]?.options).toEqual({ model: 'gpt-6-sol' });
+    expect(codex.calls[0]?.images).toEqual([image.path]);
+    // Stored copies are readable; mentioned workspace files are read in place.
+    expect(claude.calls[0]?.readableDirectories).toEqual(['/storage/attachments/c1']);
+    expect(claude.calls[0]?.prompt).toContain('screen.png (image, 10 B)');
+    expect(claude.calls[0]?.prompt).toContain('Workspace file: math.js');
+    expect(claude.calls[0]?.prompt).toContain('Open them with your Read tool');
+    expect(codex.calls[0]?.prompt).toContain('Image attachments are attached to this prompt');
+  });
+
+  it("continues the previous turn's Claude session without repeating the conversation, while Codex starts fresh with it", async () => {
+    const { claude, codex, orchestrator } = setup({ options: { resumeSessions: ['claude'] }, claudeSession: 'ses_turn2' });
+    codex.respond = () => verdict('pass');
+    const history = '### User (chat)\nWhat does average do?\n\n### Answer (Codex agreed)\nIt averages numbers.';
+    const run = await orchestrator.start('chat', 'And for an empty list?', '/repo/app', false, {
+      history,
+      continueSessions: { claude: 'ses_turn1', codex: 'thr_1' },
+    });
+    expect(run.stages[0]?.result?.resumedSession).toBe(true);
+    expect(claude.calls[0]?.resume?.sessionId).toBe('ses_turn1');
+    expect(claude.calls[0]?.resume?.prompt).toContain("already in this session's history");
+    expect(claude.calls[0]?.resume?.prompt).not.toContain('It averages numbers.');
+    // The full prompt, used if the session is gone, still carries the history.
+    expect(claude.calls[0]?.prompt).toContain('It averages numbers.');
+    expect(codex.calls[0]?.resume).toBeUndefined();
+    expect(codex.calls[0]?.prompt).toContain('It averages numbers.');
+  });
+
+  it('requires consent for edits, then edits in a worktree and runs fix rounds after a failed review', async () => {
+    const created: string[] = [];
+    const { claude, codex, orchestrator } = setup({
+      options: { isolation: 'worktree', maxFixRounds: 1 },
+      dependencies: {
+        prepareWorktree: async (_workspace, runId) => {
+          created.push(runId);
+          return { info: { ...info }, warnings: [] };
+        },
+      },
+    });
+    await expect(orchestrator.start('edit', 'Return 0 for an empty list.', '/repo/app', false)).rejects.toThrow('explicit workspace-write consent');
+
+    let reviews = 0;
+    codex.respond = () => verdict((reviews += 1) === 1 ? 'fail' : 'pass');
+    const run = await orchestrator.start('edit', 'Return 0 for an empty list.', '/repo/app', true);
+    expect(run.status).toBe('completed');
+    expect(run.stages.map((stage) => stage.id)).toEqual(['claude-edit', 'codex-change-review', 'claude-fix-round-1', 'codex-reverification-round-1']);
+    expect(run.worktree?.path).toBe('/storage/wt');
+    expect(created).toHaveLength(1);
+    expect([...claude.calls, ...codex.calls].every((request) => request.cwd === '/storage/wt/app')).toBe(true);
+  });
+
+  it("keeps editing the conversation's worktree on the next turn, or makes a new one if it is gone", async () => {
+    const created: string[] = [];
+    let exists = true;
+    const { orchestrator } = setup({
+      options: { isolation: 'worktree', maxFixRounds: 0 },
+      dependencies: {
+        prepareWorktree: async (_workspace, runId) => {
+          created.push(runId);
+          return { info: { ...info, path: `/storage/${runId}` }, warnings: [] };
+        },
+        worktreeExists: async () => exists,
+      },
+    });
+    const reused = await orchestrator.start('edit', 'Also handle NaN.', '/repo/app', true, { worktree: { ...info, setupCompleted: true } });
+    expect(reused.worktree?.path).toBe('/storage/wt');
+    expect(created).toHaveLength(0);
+
+    exists = false;
+    const fresh = await orchestrator.start('edit', 'Also handle NaN.', '/repo/app', true, { worktree: { ...info } });
+    expect(created).toEqual([fresh.id]);
+    expect(fresh.worktree?.path).toBe(`/storage/${fresh.id}`);
+  });
+
+  it("keeps each stage's steps with their results, dropping the earliest beyond the limit", async () => {
+    const { claude, orchestrator } = setup();
+    claude.respond = (request) => {
+      if (stageOf(request) !== 'claude-answer') return 'revised';
+      request.onEvent({ agent: 'claude', category: 'tool', message: '', activity: { kind: 'command', tool: 'Bash', title: 'Run tests', input: 'npm test', id: 'call-1' } });
+      request.onEvent({ agent: 'claude', category: 'tool', message: '', activityResult: { id: 'call-1', output: '1 failing', failed: true } });
+      for (let index = 0; index < STAGE_ACTIVITY_LIMIT; index += 1) {
+        request.onEvent({ agent: 'claude', category: 'tool', message: '', activity: { kind: 'read', tool: 'Read', title: `file-${index}.js` } });
+      }
+      return 'answer';
+    };
+    const run = await orchestrator.start('chat', 'Do the tests pass?', '/repo/app', false);
+    const steps = run.stages[0]?.activities ?? [];
+    expect(steps).toHaveLength(STAGE_ACTIVITY_LIMIT);
+    expect(steps[0]?.title).toBe('file-0.js');
+    expect(steps.at(-1)?.title).toBe(`file-${STAGE_ACTIVITY_LIMIT - 1}.js`);
+
+    const { claude: other, orchestrator: second } = setup();
+    other.respond = (request) => {
+      request.onEvent({ agent: 'claude', category: 'tool', message: '', activity: { kind: 'command', tool: 'Bash', title: 'Run tests', input: 'npm test', id: 'call-1' } });
+      request.onEvent({ agent: 'claude', category: 'tool', message: '', activityResult: { id: 'call-1', output: '1 failing', failed: true } });
+      return 'answer';
+    };
+    const linked = await second.start('chat', 'Do the tests pass?', '/repo/app', false);
+    expect(linked.stages[0]?.activities).toEqual([{ kind: 'command', tool: 'Bash', title: 'Run tests', input: 'npm test', id: 'call-1', output: '1 failing', failed: true }]);
+  });
+
+  it('tags agent events with their stage', async () => {
+    const { orchestrator } = setup();
+    const stages: (string | undefined)[] = [];
+    orchestrator.onEvent((event) => {
+      if (event.type === 'agent-event') stages.push(event.stageId);
+    });
+    await orchestrator.start('chat', 'Hi', '/repo/app', false);
+    expect(stages).toEqual(['claude-answer', 'codex-check', 'claude-revise']);
   });
 });

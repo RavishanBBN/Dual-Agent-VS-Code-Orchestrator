@@ -89,6 +89,88 @@ export async function run(): Promise<void> {
   assert.match(stage.getText(), /Claude output for claude-proposal/);
 
   await reviewWorktreeChanges(userData);
+  await chatConversation(extension.exports as DualAgentTestApi);
+}
+
+interface ChatTurnState {
+  id: string;
+  status: string;
+  stages: { id: string; label: string; activities: { tool: string; title: string; input?: string; output?: string }[] }[];
+  outcome?: { text: string };
+  attachments: unknown[];
+  changes?: { files: { path: string }[]; state: string };
+}
+
+interface DualAgentTestApi {
+  chatReady(): boolean;
+  chatState(): { turns: ChatTurnState[]; consent?: { turnId: string }; composer: { pending: unknown[]; choices: { codex: { models: { id: string }[] } } } };
+  chatMessage(message: unknown): Promise<void>;
+}
+
+function recordedCalls(name: string): { args: string[]; cwd: string }[] {
+  const bin = process.env.DUAL_AGENT_SMOKE_BIN ?? '';
+  const file = path.join(bin, `${name}-calls.jsonl`);
+  return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { args: string[]; cwd: string }) : [];
+}
+
+async function waitFor<T>(read: () => T | undefined, what: string): Promise<T> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const value = read();
+    if (value) return value;
+    await sleep(250);
+  }
+  throw new Error(`Timed out waiting for ${what}.`);
+}
+
+/** Talks to Claude and Codex through the chat: a checked answer, a follow-up, an attachment, and an edit. */
+async function chatConversation(api: DualAgentTestApi): Promise<void> {
+  // The chat page must load its script under its Content-Security-Policy and ask for the state.
+  await vscode.commands.executeCommand('dualAgent.chat.focus');
+  await waitFor(() => api.chatReady() || undefined, 'the chat webview to load');
+  await waitFor(() => (api.chatState().composer.choices.codex.models.some((model) => model.id === 'fake-codex-model') ? true : undefined), 'the Codex model list');
+
+  await api.chatMessage({ type: 'newConversation' });
+  await api.chatMessage({ type: 'setOptions', agent: 'claude', model: 'opus', effort: 'high' });
+  await api.chatMessage({ type: 'setOptions', agent: 'codex', model: 'fake-codex-model', effort: 'low' });
+  await api.chatMessage({ type: 'attachData', name: 'notes.txt', data: Buffer.from('remember the empty list').toString('base64') });
+  assert.equal(api.chatState().composer.pending.length, 1, 'the attachment is waiting for the next message');
+
+  await api.chatMessage({ type: 'send', text: 'What does the README say?', mode: 'chat' });
+  const [answer] = api.chatState().turns.slice(-1);
+  assert.equal(answer?.status, 'completed');
+  assert.deepEqual(answer?.stages.map((stage) => stage.id), ['claude-answer', 'codex-check']);
+  assert.equal(answer?.outcome?.text, 'Codex agreed');
+  assert.equal(answer?.attachments.length, 1);
+  assert.equal(answer?.stages[0]?.label, 'Claude · fake-claude-model', "the model Claude reported is shown");
+  // Each agent's steps stay in the transcript after the run, with what went in and came out.
+  assert.deepEqual(answer?.stages[0]?.activities.map((step) => [step.tool, step.input]), [['Read', 'README.md']]);
+  assert.deepEqual(answer?.stages[1]?.activities.map((step) => [step.tool, step.input, step.output]), [['Shell', 'cat README.md', 'original readme']]);
+  const claudeCall = recordedCalls('claude').at(-1)?.args ?? [];
+  for (const expected of ['--model', 'opus', '--effort', 'high', '--add-dir', '--include-partial-messages']) assert.ok(claudeCall.includes(expected), `Claude got ${expected}`);
+  assert.equal(claudeCall[claudeCall.indexOf('--tools') + 1], 'Read,Grep,Glob', 'a chat answer is read-only');
+  const codexCall = recordedCalls('codex').at(-1)?.args ?? [];
+  for (const expected of ['--model', 'fake-codex-model', 'model_reasoning_effort=low', '--skip-git-repo-check']) assert.ok(codexCall.includes(expected), `Codex got ${expected}`);
+
+  await api.chatMessage({ type: 'send', text: 'And for an empty list?', mode: 'chat' });
+  const followUp = recordedCalls('claude').at(-1)?.args ?? [];
+  assert.equal(followUp[followUp.indexOf('--resume') + 1], 'smoke-claude-session', "the follow-up continues Claude's session");
+
+  // An edit asks for consent in the chat, then edits an isolated copy, never the workspace.
+  const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+  const sending = api.chatMessage({ type: 'send', text: 'Add a note file.', mode: 'edit' });
+  const consent = await waitFor(() => api.chatState().consent, 'the consent card');
+  await api.chatMessage({ type: 'consent', turnId: consent.turnId, decision: 'once' });
+  await sending;
+  const [edit] = api.chatState().turns.slice(-1);
+  assert.equal(edit?.status, 'completed');
+  assert.deepEqual(edit?.stages.map((stage) => stage.id), ['claude-edit', 'codex-change-review']);
+  assert.equal(edit?.changes?.state, 'active');
+  assert.deepEqual(edit?.changes?.files.map((file) => file.path), ['chat-edit.txt']);
+  assert.equal(existsSync(path.join(folder, 'chat-edit.txt')), false, 'the workspace is untouched until the change is applied');
+  const editCall = recordedCalls('claude').at(-1);
+  assert.ok(editCall && path.resolve(editCall.cwd) !== path.resolve(folder), 'Claude edited in the worktree');
+
+  await vscode.commands.executeCommand('dualAgent.openChatInEditor');
 }
 
 /** Records a finished implementation run with real worktree changes and opens them in the diff editors. */
