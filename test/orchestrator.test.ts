@@ -710,7 +710,7 @@ describe('conversation turns', () => {
     orchestrator.onEvent((event) => {
       if (event.type === 'agent-event') stages.push(event.stageId);
     });
-    await orchestrator.start('chat', 'Hi', '/repo/app', false);
+    await orchestrator.start('chat', 'Why is the build slow?', '/repo/app', false);
     expect(stages).toEqual(['claude-answer', 'codex-check', 'claude-revise']);
   });
 });

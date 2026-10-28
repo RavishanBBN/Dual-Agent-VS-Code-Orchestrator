@@ -181,6 +181,16 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   assert.equal(researchCall[researchCall.indexOf('--effort') + 1], 'high');
   assert.equal(recordedCalls('codex').at(-1)?.args[0], '--search');
 
+  // A greeting or a question about the assistant gets one quick reply, even in Edit mode: no consent, no check.
+  const codexCalls = recordedCalls('codex').length;
+  await api.chatMessage({ type: 'send', text: 'Hi, what are your skills?', mode: 'edit' });
+  const [intro] = api.chatState().turns.slice(-1);
+  assert.deepEqual(intro?.stages.map((stage) => stage.id), ['claude-intro']);
+  assert.equal(intro?.outcome?.text, 'Quick reply, nothing to check');
+  assert.equal(recordedCalls('codex').length, codexCalls, 'Codex was not called for a quick reply');
+  const introCall = recordedCalls('claude').at(-1)?.args ?? [];
+  assert.equal(introCall[introCall.indexOf('--tools') + 1], 'Read,Grep,Glob', 'the quick reply is read-only');
+
   // An edit asks for consent in the chat, then edits an isolated copy, never the workspace.
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
   const sending = api.chatMessage({ type: 'send', text: 'Add a note file.', mode: 'edit' });
