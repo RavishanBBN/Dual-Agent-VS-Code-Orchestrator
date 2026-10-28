@@ -1,14 +1,22 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { newConversation, type ConversationTurn } from '../src/core/conversation.js';
 import type { AgentStreamEvent, RunRecord, StageRecord } from '../src/core/types.js';
 import { fileReference, linkTarget, parseWebviewMessage } from '../src/ui/chat/protocol.js';
 import { applyLiveEvent, transcript, usageOverview, type LiveStage } from '../src/ui/chat/transcript.js';
-import { isFileLink, renderMarkdown } from '../src/webview/markdown.js';
+import { isFileLink, renderMarkdown, trustedMarkdown } from '../src/webview/markdown.js';
 
 describe('chat protocol', () => {
   it('accepts well-formed messages from the webview', () => {
     expect(parseWebviewMessage({ type: 'send', text: 'Why?', mode: 'chat' })).toEqual({ type: 'send', text: 'Why?', mode: 'chat' });
+    expect(parseWebviewMessage({ type: 'pageError', message: 'x'.repeat(5_000) })).toEqual({ type: 'pageError', message: 'x'.repeat(2_000) });
+    expect(parseWebviewMessage({ type: 'pageError', message: 42 })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'retry', turnId: 'turn-1' })).toEqual({ type: 'retry', turnId: 'turn-1' });
+    expect(parseWebviewMessage({ type: 'editMessage', turnId: '../x' })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'unqueue', id: 'q-1' })).toEqual({ type: 'unqueue', id: 'q-1' });
+    expect(parseWebviewMessage({ type: 'continueAfterLimit', runId: 'r-1' })).toEqual({ type: 'continueAfterLimit', runId: 'r-1' });
+    expect(parseWebviewMessage({ type: 'cancelContinuation' })).toBeUndefined();
+    expect(parseWebviewMessage({ type: 'cancelEdit', extra: true })).toEqual({ type: 'cancelEdit' });
     expect(parseWebviewMessage({ type: 'setOptions', agent: 'codex', model: 'gpt-6-sol', effort: 'high' })).toMatchObject({ agent: 'codex' });
     expect(parseWebviewMessage({ type: 'attachData', name: 'a.png', data: 'iVBORw0KGgo=' })).toMatchObject({ name: 'a.png' });
     expect(parseWebviewMessage({ type: 'openStage', runId: 'e3b0c442-98fc-1c14-9afb-f4c8996fb924', index: 2 })).toMatchObject({ index: 2 });
@@ -74,6 +82,25 @@ describe('chat Markdown', () => {
     expect(html).toContain('[bad](javascript:alert(1))');
     expect(isFileLink('src/math.js:4')).toBe(true);
     expect(isFileLink('https://example.com')).toBe(false);
+  });
+
+  it('produces HTML only through its own Trusted Types policy', async () => {
+    expect(trustedMarkdown('**hi**')).toBe(renderMarkdown('**hi**'));
+    const policies: string[] = [];
+    vi.stubGlobal('trustedTypes', {
+      createPolicy: (name: string, rules: { createHTML(input: string): string }) => {
+        policies.push(name);
+        return { createHTML: (input: string) => ({ trusted: rules.createHTML(input) }) };
+      },
+    });
+    try {
+      vi.resetModules();
+      const fresh = await import('../src/webview/markdown.js');
+      expect(fresh.trustedMarkdown('**hi** <b>')).toEqual({ trusted: '<p><strong>hi</strong> &lt;b&gt;</p>\n' });
+      expect(policies).toEqual(['dual-agent-markdown']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('never loads images, and gives code blocks a copy button with escaped code', () => {
@@ -199,6 +226,33 @@ describe('chat transcript', () => {
     expect(views[0]?.outcome).toEqual({ text: 'Codex agreed', tone: 'neutral' });
     expect(views[1]?.changes).toBeUndefined();
     expect(views[2]?.changes).toEqual({ runId: 'r2', files: [{ path: 'src/a.js', status: 'M' }], state: 'active' });
+  });
+
+  it('offers retry only when nothing runs, and shows a message paused at the usage limits', () => {
+    const reset = new Date(Date.now() + 3_600_000).toISOString();
+    const stopped = run('r1', [stage('claude-answer', 'claude', 'failed', '', { error: 'limits' })], { status: 'failed', error: 'Both at limits', limitReset: reset });
+    const conversation = { ...newConversation('/repo'), turns: [turn('t1', 'r1'), turn('t2')] };
+    const runs = new Map([['r1', stopped]]);
+    const [idle] = transcript({ ...base, conversation, runs, idle: true, continuation: () => reset });
+    expect(idle?.canRetry).toBe(true);
+    expect(idle?.paused?.runId).toBe('r1');
+    expect(idle?.paused?.reset).toBeTruthy();
+    expect(idle?.paused?.continuesAt).toBeTruthy();
+    const [busy, starting] = transcript({ ...base, conversation, runs, idle: false });
+    expect(busy?.canRetry).toBe(false);
+    expect(busy?.paused?.continuesAt).toBeUndefined();
+    // A turn whose run has not started yet cannot be retried.
+    expect(starting?.canRetry).toBe(false);
+  });
+
+  it("uses the stage in Claude's role as the answer even when Codex ran it alone", () => {
+    const solo = run('r1', [
+      stage('claude-answer', 'claude', 'completed', 'Codex standing in', { assignedAgent: 'codex', fallbackReason: 'Claude is at its usage limit' }),
+      stage('codex-check', 'codex', 'completed', 'ok', { review: true, verdict: { outcome: 'pass', findings: [] } }),
+    ]);
+    const conversation = { ...newConversation('/repo'), turns: [turn('t1', 'r1')] };
+    const [view] = transcript({ ...base, conversation, runs: new Map([['r1', solo]]) });
+    expect(view?.stages[0]).toMatchObject({ agent: 'codex', primary: true, fallback: 'Claude is at its usage limit' });
   });
 
   it('offers resume for a failed turn and shows its error', () => {

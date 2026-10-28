@@ -39,6 +39,8 @@ process.stdin.on('end', () => {
   const session = 'smoke-claude-session';
   // An edit stage changes a file in the folder it runs in, which is the isolated worktree.
   if (args.includes('acceptEdits')) fs.writeFileSync(path.join(process.cwd(), 'chat-edit.txt'), 'edited by fake claude\\n');
+  // A message asking for a second file adds one, so the smoke test can see a retry undo it.
+  if (args.includes('acceptEdits') && /second file/.test(input)) fs.writeFileSync(path.join(process.cwd(), 'second.txt'), 'second\\n');
   console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: session, model: 'fake-claude-model' }));
   console.log(JSON.stringify({ type: 'stream_event', session_id: session, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Working on ' + stage } } }));
   console.log(JSON.stringify({ type: 'assistant', session_id: session, message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'README.md' } }] } }));
