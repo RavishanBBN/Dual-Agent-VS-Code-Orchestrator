@@ -6,7 +6,7 @@
 
 ## Context
 
-In 1.x a run edited the user's working tree directly, nothing read Codex's final verdict, and checks reported by agents were only claims: Claude cannot run shell commands in print mode without explicit rules, and Codex's read-only sandbox blocks most test runners. A run was therefore marked completed even when the final review failed it. Its last stage could also still edit files after that review, and a cancelled run left partial edits in the workspace.
+In 1.x a run edited the user's working tree directly, nothing read Codex's final verdict, and checks reported by agents were only claims: Claude in print mode runs only shell commands that a rule allows or that Claude Code judges read-only, and Codex's read-only sandbox blocks most test runners. A run was therefore marked completed even when the final review failed it. Its last stage could also still edit files after that review, and a cancelled run left partial edits in the workspace.
 
 Running verification commands from the extension was deferred in 1.1 because those commands execute code the agents wrote, outside every sandbox.
 
