@@ -2,6 +2,121 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
+## [Unreleased]
+
+## [2.4.0] - 2026-10-28
+
+Agent mode runs commands and installs software with your approval, folders without Git can be edited, you choose which agent leads, and three new modes join Chat, Research, and Edit.
+
+### Added
+
+- **Agent mode.** It works like Claude Code in a terminal: Claude runs commands, installs packages, and edits the folder itself, then Codex checks the result. When the check fails, Claude finishes the task.
+  - **Asking first.** Claude asks before each command or edit it does not judge read-only. The chat shows a card with what the agent wants to do, the exact command or edit, and warnings for deletions, administrator rights, scripts piped from the internet, changes to the system, and paths outside the folder. The choices are **Allow**, **Allow *tool* for this message**, and **Deny**. A modal dialog asks instead while the chat is hidden.
+  - **The permission bridge.** Claude Code runs with `--permission-mode default` and `--permission-prompt-tool mcp__dualagent__approve`. That tool belongs to a small MCP server, bundled as `dist/permissionServer.js` and run on VS Code's own runtime, which asks the extension over a private local pipe. If the bridge cannot start, Claude cannot work in Agent mode, and the output log says why.
+  - **When Codex leads.** Codex cannot ask, so it works inside its workspace-write sandbox. The sandbox can reach the network to install packages unless `dualAgent.codex.agentNetwork` is off.
+  - **A snapshot first.** The folder is snapshotted before the first stage, so file changes can be kept or undone from the changes card. Installed software and other effects outside the folder cannot be undone, and the consent card says so.
+  - **The web.** The lead agent has the web, as it would in a terminal session.
+- **Folders without Git.** Edit, Test first, and Implement work in a folder that is not a Git repository or has no commit yet.
+  - **The snapshot.** The extension records the folder's files in a bare repository in its private worktree storage (`direct-<id>.git`). Dependency and build folders such as `node_modules`, `.venv`, `dist`, and `build`, files whose names suggest secrets, and whatever the folder's own `.gitignore` files exclude are left out. Nothing is written to the folder.
+  - **Direct edits.** The agents then edit the folder itself, and reviewers see the changes since the snapshot as a diff.
+  - **Keep or undo.** **Keep…** deletes the snapshot. **Undo all…** restores it: changed and deleted files are put back, and files the agents created are deleted; the excluded folders are left as they are. **Undo** on one file restores only that file, and retrying a message restores the folder to its checkpoint.
+  - **Limits.** A folder with more than 20,000 files outside the excluded folders is refused. A subfolder that is a Git repository of its own is named in a warning, because Undo cannot put back changes inside it.
+- **Choose the agents** in the composer or with `/agents`:
+  - **Claude + Codex**, the default.
+  - **Codex + Claude:** Codex does the work and Claude checks it.
+  - **Claude only** or **Codex only:** one agent runs each workflow's working stages, without a check, and the outcome says so. The other agent never stands in: at the chosen agent's usage limit the message pauses until the reset.
+- **Compare mode.** Claude and Codex answer independently: Codex sees neither Claude's answer nor its steps. Claude then merges the two answers into one, with a "Where we differed" list that names which answer was right on each point and why.
+- **Test first mode.** Codex writes tests that fail until the requested behavior exists; the failing checks after that stage are expected, so no repair follows. Claude makes the tests pass without weakening them, and Codex reviews the tests and the code together as the gate.
+- **Research additions.**
+  - **Gap matrix.** A question about research gaps or a body of literature gets a table of the key works by problem, method, data, main result, and limitation, followed by the open gaps.
+  - **Claim table.** Codex's check starts with a table of every material claim, its source, and whether the source supports it.
+  - **DOI and retraction checks.** Codex confirms each DOI resolves to the cited work and checks for retractions and corrections. A retracted source is a high-severity finding.
+  - **Sources card.** Research answers end with a machine-readable `sources` block, shown as a card with **BibTeX** and **RIS** export.
+  - **CSV.** Every table in an answer has a **CSV** button.
+- **Editor integration.** None of these sends anything by itself; each fills the message box.
+  - **Editor context.** The active file, the selected lines, and the file's errors and warnings go with the next message, shown as a chip you can turn off (`dualAgent.chat.includeEditorContext`).
+  - **Quick fixes.** **Fix with Dual Agent** prepares an Edit message and **Explain with Dual Agent** a Chat message about a problem in the editor.
+  - **Ask Dual Agent About This** in the editor's context menu, or `Ctrl+Alt+Shift+D` (`Cmd+Alt+Shift+D` on macOS).
+  - **Findings in the editor.** Reviewers' findings that name a file and line appear as problems in the editor and the Problems panel (`dualAgent.findings.showInEditor`). **Dual Agent: Clear Findings in the Editor** removes them.
+  - **Status bar.** The last message's outcome; clicking it opens the chat.
+  - **Commit message.** After **Apply**, Source Control gets a suggested commit message, unless its message box already has text.
+- **Apply or discard one file.** The changes card has **Apply** and **Discard** on each file; the other changes stay in the copy. To keep only part of a file, undo single changes with the arrows in the diff editor's margin before applying.
+- **Disagreement view.** When a check led to a revision, **See what changed** shows a word diff of the first answer against the revision, with **Keep the revision**, **Prefer the first answer**, and **Check again**.
+- **Subscription limits meter.** The usage panel shows each account's five-hour and weekly windows, how much of each is used, and when it resets. The header button turns to a warning at 90%.
+  - **Claude** reports its windows in `rate_limit_event` stream events.
+  - **Codex** records them in its session log. After each Codex stage, the extension reads the log of that stage's thread, and only its rate-limit fields.
+  - **Handover before a failure.** A window 98% used marks the agent as at its limit until that window resets, so the other agent takes over before a call fails. `AgentLimits.observe` applies this rule to readings from runs and from the CLIs' logs alike.
+- **Usage across the whole machine** (`dualAgent.usage.readLocalLogs`, on by default).
+  - **What it reads.** The CLIs' own logs: Claude Code's `~/.claude/projects/**/*.jsonl`, including subagent files, and Codex's `~/.codex/sessions/<year>/<month>/<day>/rollout-*.jsonl`, honoring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. Only lines with a usage marker are decoded, and only token counts per local day for the last 8 days, Claude's usage-limit messages, and Codex's rate-limit percentages are kept.
+  - **How.** Claude messages are counted once by message and request ID; Codex counts only the growth of its running total. Reading is incremental, skips files over 512 MB, and yields between files. It runs 10 seconds after start, 3 seconds after a change in either folder, and every 2 minutes.
+  - **Where it shows.** The usage panel gets an **On this machine** section, with today and the last 7 days, covering terminals, other editors, and Dual Agent alike, above **In Dual Agent**.
+  - **Effect on limits.** Codex readings from any session update the limits meter, and a limit found in either log hands work to the other agent before a call fails.
+- **Network outages.**
+  - **Recognized.** A new failure kind, `network`, covers the connection errors Claude Code, Codex, and Node report, such as "API Error: Connection error.", "stream disconnected … error sending request", `ENOTFOUND`, `ECONNREFUSED`, `ECONNRESET`, "fetch failed", and "dns error".
+  - **Online or offline.** After a connection error, the extension opens a TCP connection to `api.anthropic.com`, `chatgpt.com`, or `api.openai.com` on port 443, or to the configured proxy, and closes it, sending nothing.
+  - **Offline.** The message stops where it was, without trying the other agent, and continues by itself once the connection is back, checking every 15 seconds. The chat shows a **Waiting for the network** card with **Do not continue** and **Continue now** (or **Continue when online** when `dualAgent.limits.autoContinue` is off); a hidden chat gets a notification. Queued messages wait behind it, and the continuation survives a restart.
+  - **Online.** The error is one provider's outage, and the other agent covers the stage.
+- **Gemini as referee** (`dualAgent.gemini.enabled`, off by default).
+  - **When:** after a check fails and before the revision.
+  - **What:** Gemini CLI rules on each finding (upheld, partly upheld, or rejected) in its read-only plan mode. The ruling is shown in the check stage and given to the revision as evidence.
+  - **Setup:** `npm install -g @google/gemini-cli`, then run `gemini` once to sign in. A row in the Agents view shows whether it is ready.
+- **Slash commands.** Typing `/` lists them.
+  - `/chat`, `/research`, `/agent`, `/edit`, `/test`, `/compare`, `/brainstorm`, and `/implement` send one message in that mode.
+  - `/agents`, `/model`, `/effort`, and `/web` change the composer.
+  - `/new`, `/history`, `/export`, `/usage`, `/brief`, and `/help` open those features.
+- **Project brief.** A header button and **Dual Agent: Edit Project Brief** open `brief.md` in the extension's private workspace storage, not the repository. Both agents read it with every message, up to 4,000 characters.
+- **Run and Terminal on shell code blocks.**
+  - **Run** appears on one-line commands. It splits the arguments without a shell and refuses pipes, redirection, chaining, substitution, and variables. A modal confirmation names the folder. The command then runs as verification commands do, with the allowlisted environment, and its output is attached to the next message.
+  - **Terminal** puts a one-line command into a terminal named **Dual Agent** without pressing Enter. Blocks of several lines can only be copied, since a pasted line break would run them.
+- **Smaller additions.**
+  - **Export a conversation** as Markdown from the history panel, with `/export`, or with **Dual Agent: Export Conversation as Markdown**.
+  - **History search** over conversation titles and messages.
+  - **Starter prompts** in an empty conversation.
+  - **A chime** when a message that took longer than 15 seconds finishes (`dualAgent.chat.sound`).
+  - **Attach a folder,** such as a set of papers. Regular files are copied within the archive limits, skipping links, dependency and tooling folders such as `node_modules`, and names that suggest secrets. PDF and Office files get their text extracted.
+  - **Steps:** Claude's TodoWrite plan shows as a checklist step, and its thinking as a **Thinking** step.
+- **Your own MCP servers** (`dualAgent.claude.userMcpServers`, off by default) let Claude load MCP servers as Claude Code does in your terminal: those in your own Claude configuration, and a repository's `.mcp.json` servers only if you approved them in Claude Code. Off, Claude loads none.
+- **Sign in from VS Code.**
+  - **Dual Agent: Sign In** runs the CLI's own sign-in in a terminal named after it: Claude Code with a Claude subscription, the Anthropic Console, or SSO; Codex with a ChatGPT account, a device code, or an API key; Gemini CLI with a Google account.
+  - **Same configuration as the agents.** The terminal gets the agents' own environment, so the sign-in lands in the configuration folders the agents read.
+  - **API keys go straight to the CLI.** An API key is typed into a password box and passed to the CLI's standard input. Dual Agent does not keep it.
+  - **Status everywhere.** The **Agents** view shows each CLI's sign-in and plan, from `claude auth status` and `codex login status`, with **Sign In** and **Sign Out** on each row. The chat shows a banner when an agent the next message needs is signed out, and a message that failed because an agent is not signed in gets a **Sign in** button.
+  - **Sign out.** **Dual Agent: Sign Out** runs the CLI's own sign-out, after a confirmation.
+- **Refresh subscription limits.** **Refresh** in the limits meter, or **Dual Agent: Refresh Subscription Limits**, asks each agent for its current usage windows with one tiny call: Claude on Haiku, Codex at low effort. It runs only when you ask, because it uses a little of each subscription. A window whose reset time has passed now shows as empty instead of as it was.
+- **Waiting changes.** An Agent message that would continue an Edit message's isolated changes, or an Edit, Test first, or Implement message that would continue Agent mode's direct changes, asks what to do with them: apply or discard, or keep or undo, then continue. Before, it did not start.
+- ADR 0010.
+
+### Changed
+
+- **Marketplace name.** The extension is listed as **Dual Agent: Claude + Codex**, so searches for Claude and Codex find it. The description leads with what it does, and the keywords are broader. The extension ID, `NileshRavishan.dual-agent-orchestrator`, is unchanged, so installs and settings carry over.
+- **Codex in any folder.** Codex stages always pass `--skip-git-repo-check`. Editing stages work in an isolated worktree or in a folder the extension snapshotted first, so Git's own check is no longer needed.
+- **TodoWrite for read-only Claude stages.** They now get Read, Grep, Glob, and TodoWrite, which updates Claude's task list, not the workspace.
+- **Agents by role.** The answer shown is the last completed stage that does the work rather than checks it, whoever ran it. Outcome labels name the agents that actually ran, such as "Claude agreed" when Claude checked.
+- **Requests that need Agent mode.** Outside Agent mode, every stage that does the work is told to say in one line when a request needs Agent mode, such as installing software, and how to send it with `/agent`, and to do the part it can instead of refusing.
+- **Checks after every stage that can change files.** Verification commands now also run after Agent-mode stages.
+- **Fallback on connection errors.** A connection error while the machine is online is now eligible for fallback, like an unavailable provider.
+
+### Fixed
+
+- **Weekly limit resets.** Reset times that name a date are now read exactly, for example Codex's "try again at Oct 30th, 2026 5:51 PM" and Claude's "resets Nov 3, 9am". Before, they fell back to estimated retries every 15 to 120 minutes until the limit actually reset.
+- **Stop right after Send.** The Stop button ignores clicks within one second of sending. A double click on Send stopped the new message, which showed as "Stopped after 4s".
+- **Why a run stopped.** A cancelled run records why: "Stopped by you." or "VS Code closed while the message was running."
+
+### Security
+
+- **Permission bridge.**
+  - **Private channel.** The broker listens on a named pipe on Windows, or a Unix socket elsewhere, with a random name. It answers only requests that carry a random 32-byte token, compared in constant time.
+  - **Private configuration.** The MCP configuration that holds the token is written to the extension's private global storage with mode 0600, and deleted when the extension stops.
+  - **The user decides.** Every decision comes from the user. A request the bridge cannot deliver, or that arrives without the token, is denied.
+- **Run button.** It never uses a shell, refuses shell syntax, resolves the executable outside the folder, and asks first, because the command comes from agent output.
+- **Codex session logs.** The thread ID is checked to be a UUID before it is used in a path, and only rate-limit fields are read from that thread's log.
+- **The CLIs' logs.** The machine-wide reader decodes only lines with a usage marker and keeps only token counts, times, usage-limit messages, and rate-limit percentages. Conversations are never kept, logged, or sent; credential files are never opened; links are not followed. `dualAgent.usage.readLocalLogs` turns it off.
+- **Connectivity check.** It only opens and closes a TCP connection to a provider host or the proxy, and sends no data.
+- **CSV formulas.** A cell that starts with `=`, `+`, `-`, or `@` is saved with a leading `'`, unless it is a number, so a spreadsheet shows it as text instead of running it as a formula.
+- **Folder snapshots.** They hold no files whose names suggest secrets, store the exact bytes without line-ending conversion or filters, and live in the extension's storage; removing one deletes only the snapshot repository.
+- **Gemini referee.** Gemini CLI runs in its read-only plan mode, resolved outside the workspace, with the allowlisted environment.
+- **Sign-in.** The extension runs only each CLI's own sign-in, sign-out, and status commands, resolved outside the workspace and without a shell (a Windows batch shim starts through the absolute `COMSPEC`). It never opens a credential file: Claude's and Codex's status come from their status commands, and Gemini's from the sign-in type in its settings file. An API key reaches the CLI only on standard input.
+
 ## [2.3.1] - 2026-10-28
 
 The assistant introduces itself, and the chat runs on Preact 11.

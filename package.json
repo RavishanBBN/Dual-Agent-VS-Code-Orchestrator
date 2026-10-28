@@ -2,7 +2,7 @@
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent: Claude + Codex",
   "description": "Claude Code and Codex check each other’s work: Claude answers, Codex verifies. Chat, research with verified sources, isolated edits you review and apply, and one agent carries on when the other hits its limit.",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "private": true,
   "publisher": "NileshRavishan",
   "license": "MIT",
