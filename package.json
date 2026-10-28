@@ -719,7 +719,7 @@
     "cross-spawn": "7.0.6",
     "fflate": "0.8.3",
     "markdown-it": "15.0.3",
-    "preact": "10.29.8",
+    "preact": "11.0.1",
     "unpdf": "1.9.1"
   },
   "overrides": {
