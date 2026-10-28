@@ -20,6 +20,15 @@ describe('reading when a usage limit resets', () => {
     expect(parseLimitReset('limit reached; available at 14:45', NOW)).toEqual(new Date(2026, 9, 28, 14, 45, 0));
   });
 
+  it('reads the dated resets of weekly limits, in both providers\' wording', () => {
+    expect(parseLimitReset("You've hit your usage limit. Upgrade to Pro, or try again at Oct 30th, 2026 5:51 PM.", NOW)).toEqual(new Date(2026, 9, 30, 17, 51, 0));
+    expect(parseLimitReset('Weekly limit reached ∙ resets Nov 3, 9am', NOW)).toEqual(new Date(2026, 10, 3, 9, 0, 0));
+    expect(parseLimitReset("You've hit your limit · resets 3pm (Asia/Colombo)", NOW)).toEqual(new Date(2026, 9, 28, 15, 0, 0));
+    expect(parseLimitReset('limit resets on Thursday, Oct 29', NOW)).toEqual(new Date(2026, 9, 29, 0, 0, 0));
+    // A date without a year that has already passed this year is next year's, which is too far to trust.
+    expect(parseLimitReset('resets Jan 5, 9am', NOW)).toBeUndefined();
+  });
+
   it('ignores times in the past, implausibly far away, or missing', () => {
     expect(parseLimitReset('usage limit reached|1000000000', NOW)).toBeUndefined();
     expect(parseLimitReset('try again in 90 days', NOW)).toBeUndefined();

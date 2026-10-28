@@ -111,7 +111,7 @@ interface ChatTurnState {
 
 interface DualAgentTestApi {
   chatReady(): boolean;
-  chatState(): { usage: { label: string; usage: Record<'claude' | 'codex', { input: number; output: number }> }[]; turns: ChatTurnState[]; queue: { text: string }[]; consent?: { turnId: string }; composer: { pending: unknown[]; editing?: { turnId: string }; choices: { codex: { models: { id: string }[] } } } };
+  chatState(): { accounts: { provider: string; signedIn?: boolean }[]; usage: { label: string; usage: Record<'claude' | 'codex', { input: number; output: number }> }[]; turns: ChatTurnState[]; queue: { text: string }[]; consent?: { turnId: string }; composer: { mode: string; agents: string; pending: unknown[]; editing?: { turnId: string }; choices: { codex: { models: { id: string }[] } } } };
   chatMessage(message: unknown): Promise<void>;
   chatErrors(): readonly string[];
 }
@@ -137,6 +137,8 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   await vscode.commands.executeCommand('dualAgent.chat.focus');
   await waitFor(() => api.chatReady() || undefined, 'the chat webview to load');
   await waitFor(() => (api.chatState().composer.choices.codex.models.some((model) => model.id === 'fake-codex-model') ? true : undefined), 'the Codex model list');
+  // Each CLI's own status command says it is signed in, and the chat knows.
+  await waitFor(() => (['claude', 'codex'].every((provider) => api.chatState().accounts.some((account) => account.provider === provider && account.signedIn)) ? true : undefined), 'the sign-in status of both CLIs');
 
   await api.chatMessage({ type: 'newConversation' });
   await api.chatMessage({ type: 'setOptions', agent: 'claude', model: 'opus', effort: 'high' });
@@ -156,7 +158,7 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   assert.deepEqual(answer?.stages[1]?.activities.map((step) => [step.tool, step.input, step.output]), [['Shell', 'cat README.md', 'original readme']]);
   const claudeCall = recordedCalls('claude').at(-1)?.args ?? [];
   for (const expected of ['--model', 'opus', '--effort', 'high', '--add-dir', '--include-partial-messages']) assert.ok(claudeCall.includes(expected), `Claude got ${expected}`);
-  assert.equal(claudeCall[claudeCall.indexOf('--tools') + 1], 'Read,Grep,Glob', 'a chat answer is read-only');
+  assert.equal(claudeCall[claudeCall.indexOf('--tools') + 1], 'Read,Grep,Glob,TodoWrite', 'a chat answer is read-only');
   const codexCall = recordedCalls('codex').at(-1)?.args ?? [];
   for (const expected of ['--model', 'fake-codex-model', 'model_reasoning_effort=low', '--skip-git-repo-check']) assert.ok(codexCall.includes(expected), `Codex got ${expected}`);
 
@@ -177,7 +179,7 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   const [research] = api.chatState().turns.slice(-1);
   assert.deepEqual(research?.stages.map((stage) => stage.id), ['claude-research', 'codex-source-check']);
   const researchCall = recordedCalls('claude').at(-1)?.args ?? [];
-  assert.equal(researchCall[researchCall.indexOf('--tools') + 1], 'Read,Grep,Glob,WebSearch,WebFetch');
+  assert.equal(researchCall[researchCall.indexOf('--tools') + 1], 'Read,Grep,Glob,TodoWrite,WebSearch,WebFetch');
   assert.equal(researchCall[researchCall.indexOf('--effort') + 1], 'high');
   assert.equal(recordedCalls('codex').at(-1)?.args[0], '--search');
 
@@ -189,7 +191,7 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   assert.equal(intro?.outcome?.text, 'Quick reply, nothing to check');
   assert.equal(recordedCalls('codex').length, codexCalls, 'Codex was not called for a quick reply');
   const introCall = recordedCalls('claude').at(-1)?.args ?? [];
-  assert.equal(introCall[introCall.indexOf('--tools') + 1], 'Read,Grep,Glob', 'the quick reply is read-only');
+  assert.equal(introCall[introCall.indexOf('--tools') + 1], 'Read,Grep,Glob,TodoWrite', 'the quick reply is read-only');
 
   // An edit asks for consent in the chat, then edits an isolated copy, never the workspace.
   const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
@@ -237,6 +239,37 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
     'the queued message to run',
   );
   assert.equal(api.chatState().turns.at(-1)?.message, 'Queued question.');
+
+  // A message sent just as the queue finishes draining may wait its turn, so each step waits for its own answer.
+  const answered = async (text: string, mode: string): Promise<ChatTurnState> => {
+    await api.chatMessage({ type: 'send', text, mode });
+    return waitFor(() => api.chatState().turns.find((turn) => turn.message === text && turn.status === 'completed'), `the answer to "${text}"`);
+  };
+
+  // The user picks who works: Codex alone calls only Codex, and Codex leading makes Claude the checker.
+  const claudeCalls = recordedCalls('claude').length;
+  await api.chatMessage({ type: 'setAgents', agents: 'codex' });
+  assert.equal(api.chatState().composer.agents, 'codex');
+  const solo = await answered('Which file holds the pager?', 'chat');
+  assert.ok(solo.stages.every((item) => item.label.startsWith('Codex')), `only Codex worked: ${JSON.stringify(solo.stages.map((item) => [item.id, item.label]))}`);
+  assert.equal(recordedCalls('claude').length, claudeCalls, 'Claude was not called');
+  await api.chatMessage({ type: 'setAgents', agents: 'codex-claude' });
+  const swapped = await answered('Which file holds the search box?', 'chat');
+  assert.deepEqual(swapped.stages.map((item) => item.label.split(' ')[0]), ['Codex', 'Claude'], 'Codex answered and Claude checked');
+  await api.chatMessage({ type: 'setAgents', agents: 'claude-codex' });
+
+  // Compare: both answer without seeing each other, then Claude merges.
+  const compared = await answered('What is the best way to cache search results?', 'compare');
+  assert.deepEqual(compared.stages.map((item) => item.label.split(' ')[0]), ['Claude', 'Codex', 'Claude'], 'two answers and a merge');
+
+  // From the editor: "Fix with Dual Agent" and "Ask Dual Agent" fill the message box without sending.
+  const readme = vscode.Uri.joinPath(vscode.workspace.workspaceFolders?.[0]?.uri ?? vscode.Uri.file('.'), 'README.md');
+  const turns = api.chatState().turns.length;
+  await vscode.commands.executeCommand('dualAgent.fixProblem', readme, new vscode.Range(0, 0, 0, 5), 'Unexpected token');
+  assert.equal(api.chatState().composer.mode, 'edit', 'a fix is prepared as an edit');
+  await vscode.commands.executeCommand('dualAgent.askAboutSelection', readme, new vscode.Range(0, 0, 0, 5));
+  assert.equal(api.chatState().composer.mode, 'chat', 'a question is prepared as a chat message');
+  assert.equal(api.chatState().turns.length, turns, 'nothing was sent on its own');
 
   await vscode.commands.executeCommand('dualAgent.openChatInEditor');
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { AgentExecutionError } from '../src/core/errors.js';
+import { AgentLimits } from '../src/core/limits.js';
 import { canResume, STAGE_ACTIVITY_LIMIT, WorkflowOrchestrator, type CheckRequest, type OrchestratorDependencies } from '../src/core/orchestrator.js';
 import type {
   AgentAdapter,
@@ -190,6 +191,71 @@ describe('WorkflowOrchestrator', () => {
     expect(run.status).toBe('cancelled');
     expect(run.stages[0]?.status).toBe('cancelled');
     expect(claude.calls).toHaveLength(0);
+  });
+
+  it('records why a run stopped', async () => {
+    const store = new MemoryStore();
+    const claude = new FakeAdapter('claude');
+    const codex = new FakeAdapter('codex');
+    const orchestrator: WorkflowOrchestrator = new WorkflowOrchestrator({ claude, codex }, store, { maxContextCharacters: 20_000, fallbackOnQuota: true }, {
+      captureSnapshot: async () => {
+        orchestrator.cancel('VS Code closed while the message was running.');
+        return clean;
+      },
+    });
+    const run = await orchestrator.start('chat', 'Why does the pager skip a page?', process.cwd(), false);
+    expect(run.status).toBe('cancelled');
+    expect(run.error).toBe('VS Code closed while the message was running.');
+  });
+
+  it('hands over to the other agent before a nearly used-up window fails a call', async () => {
+    const limits = new AgentLimits([], () => Date.parse('2026-10-28T12:00:00Z'));
+    const resetsAt = '2026-10-28T15:00:00.000Z';
+    const { claude, codex, orchestrator } = setup({ dependencies: { limits } });
+    claude.respond = (request) => {
+      request.onEvent({
+        agent: 'claude',
+        category: 'usage',
+        message: 'limits',
+        quota: { agent: 'claude', windows: [{ name: 'five_hour', usedPercent: 99, resetsAt }], limited: false, observedAt: '2026-10-28T12:00:00.000Z' },
+      });
+      return 'The pager adds one twice.';
+    };
+    codex.respond = () => verdict('fail');
+    const run = await orchestrator.start('chat', 'Why does the pager skip a page?', process.cwd(), false);
+    expect(limits.active('claude')?.until).toBe(resetsAt);
+    // Claude would revise; with Claude set aside until the reset, Codex stands in.
+    expect(run.stages.find((stage) => stage.id === 'claude-revise')?.assignedAgent).toBe('codex');
+    expect(claude.calls).toHaveLength(1);
+  });
+
+  it('pauses a run when the machine goes offline, and continues it where it stopped once resumed', async () => {
+    let online = false;
+    const { claude, codex, orchestrator } = setup({ dependencies: { online: async () => online } });
+    let failing = true;
+    claude.respond = () => (failing ? new AgentExecutionError('API Error: Connection error.', 'network', 1) : 'The pager adds one twice.');
+    const run = await orchestrator.start('chat', 'Why does the pager skip a page?', process.cwd(), false);
+    expect(run.status).toBe('failed');
+    expect(run.offlineSince).toBeDefined();
+    expect(run.error).toContain('continues where it stopped when the connection is back');
+    // Offline, the other agent is not tried: it could not connect either.
+    expect(codex.calls).toHaveLength(0);
+
+    online = true;
+    failing = false;
+    const resumed = await orchestrator.resume(run.id, false);
+    expect(resumed.status).toBe('completed');
+    expect(resumed.offlineSince).toBeUndefined();
+  });
+
+  it('lets the other agent cover a connection error while the machine is online', async () => {
+    const { claude, codex, orchestrator } = setup({ dependencies: { online: async () => true } });
+    claude.respond = (request) => (/- ID: claude-answer/.test(request.prompt) ? new AgentExecutionError('API Error: Connection error.', 'network', 1) : 'ok');
+    codex.respond = (request) => (/- ID: codex-check/.test(request.prompt) ? verdict('pass') : 'Codex answered instead.');
+    const run = await orchestrator.start('chat', 'Why does the pager skip a page?', process.cwd(), false);
+    expect(run.status).toBe('completed');
+    expect(run.offlineSince).toBeUndefined();
+    expect(run.stages[0]?.assignedAgent).toBe('codex');
   });
 
   it('is never left stuck as running when run history cannot be saved', async () => {
@@ -712,5 +778,55 @@ describe('conversation turns', () => {
     });
     await orchestrator.start('chat', 'Why is the build slow?', '/repo/app', false);
     expect(stages).toEqual(['claude-answer', 'codex-check', 'claude-revise']);
+  });
+});
+
+describe('modes and agent choices', () => {
+  it('keeps Codex blind to Claude\'s answer in Compare, and gives Claude both to merge', async () => {
+    const { claude, codex, orchestrator } = setup();
+    claude.respond = (request) => (stageOf(request) === 'claude-answer' ? 'CLAUDE-FIRST-ANSWER uses a map.' : 'Merged.');
+    codex.respond = () => 'CODEX-ANSWER uses an LRU cache.';
+    const run = await orchestrator.start('compare', 'How should search results be cached?', process.cwd(), false);
+    expect(run.status).toBe('completed');
+    const blind = codex.calls.find((request) => stageOf(request) === 'codex-answer');
+    expect(blind?.prompt).not.toContain('CLAUDE-FIRST-ANSWER');
+    const merge = claude.calls.find((request) => stageOf(request) === 'claude-merge');
+    expect(merge?.prompt).toContain('CLAUDE-FIRST-ANSWER');
+    expect(merge?.prompt).toContain('CODEX-ANSWER');
+  });
+
+  it('expects the new tests to fail in Test first, and repairs only failures after the implementation', async () => {
+    const results = [[check(1)], [check(1)], [check(0)]];
+    const { codex, orchestrator } = setup({
+      options: { isolation: 'none', maxFixRounds: 1, verificationCommands: [['npm', 'test']] },
+      dependencies: { runChecks: async () => results.shift() ?? [check(0)] },
+    });
+    codex.respond = (request) => (stageOf(request) === 'codex-tdd-review' ? verdict('pass') : 'Tests written; they fail because pager.last() does not exist.');
+    const run = await orchestrator.start('tdd', 'Add pager.last().', process.cwd(), true);
+    // Failing tests after Codex wrote them are expected; the failure after Claude's implementation is repaired.
+    expect(run.stages.map((stage) => stage.id)).toEqual(['codex-tests', 'claude-tdd-implement', 'claude-repair', 'codex-tdd-review']);
+    expect(run.status).toBe('completed');
+  });
+
+  it('asks the referee to rule on a failed check before the revision, and gives the revision the ruling', async () => {
+    const rule = async (): Promise<{ text: string }> => ({ text: 'RULING: finding 1 upheld.' });
+    const { claude, codex, orchestrator } = setup({ dependencies: { referee: { name: 'Gemini', rule } } });
+    claude.respond = (request) => (stageOf(request) === 'claude-answer' ? 'The pager adds one twice.' : 'Revised.');
+    codex.respond = () => verdict('fail');
+    const run = await orchestrator.start('chat', 'Why does the pager skip a page?', process.cwd(), false);
+    const checkStage = run.stages.find((stage) => stage.id === 'codex-check');
+    expect(checkStage?.referee).toMatchObject({ referee: 'Gemini', text: 'RULING: finding 1 upheld.' });
+    expect(claude.calls.find((request) => stageOf(request) === 'claude-revise')?.prompt).toContain('RULING: finding 1 upheld.');
+  });
+
+  it('never hands one agent\'s stages to the other when the user chose it alone, and pauses at its limit', async () => {
+    const limits = new AgentLimits([], () => Date.parse('2026-10-28T12:00:00Z'));
+    limits.record('claude', 'Usage limit reached; it resets at 2026-10-28T15:00:00.000Z.');
+    const { claude, codex, orchestrator } = setup({ dependencies: { limits } });
+    const run = await orchestrator.start('chat', 'Why does the pager skip a page?', process.cwd(), false, { agents: 'claude' });
+    expect(run.status).toBe('failed');
+    expect(run.limitReset).toBe('2026-10-28T15:00:00.000Z');
+    expect(claude.calls).toHaveLength(0);
+    expect(codex.calls).toHaveLength(0);
   });
 });

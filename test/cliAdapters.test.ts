@@ -72,18 +72,18 @@ describe('provider arguments', () => {
     const args = claudeArguments({ ...base, claudeAllowedTools: ['Bash(npm test:*)'] }, 'read-only');
     expect(args).toEqual(expect.arrayContaining(['--setting-sources', 'user', '--strict-mcp-config']));
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
-    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
+    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite');
     expect(args).not.toContain('--allowedTools');
   });
 
   it('gives Claude write stages editing tools, and commands only through configured rules', () => {
     const plain = claudeArguments(base, 'workspace-write');
     expect(plain[plain.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
-    expect(plain[plain.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,Edit,Write,NotebookEdit');
+    expect(plain[plain.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite,Edit,Write,NotebookEdit');
     expect(plain).not.toContain('--allowedTools');
 
     const args = claudeArguments({ ...base, claudeAllowedTools: ['Bash(npm test:*)', 'Edit'], model: 'opus' }, 'workspace-write');
-    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,Edit,Write,NotebookEdit,Bash');
+    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite,Edit,Write,NotebookEdit,Bash');
     expect(args.slice(args.indexOf('--allowedTools'), args.indexOf('--allowedTools') + 3)).toEqual(['--allowedTools', 'Bash(npm test:*)', 'Edit']);
     expect(args.slice(-2)).toEqual(['--model', 'opus']);
   });
@@ -127,13 +127,13 @@ describe('provider arguments', () => {
 
   it('adds web tools only when allowed, and exact rules only for simple verification commands', () => {
     const plain = claudeArguments(base, 'read-only');
-    expect(plain[plain.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
+    expect(plain[plain.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite');
     const web = claudeArguments(base, 'read-only', undefined, { web: true });
-    expect(web[web.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,WebSearch,WebFetch');
+    expect(web[web.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite,WebSearch,WebFetch');
     expect(web.slice(web.indexOf('--allowedTools'), web.indexOf('--allowedTools') + 3)).toEqual(['--allowedTools', 'WebSearch', 'WebFetch']);
 
     const edit = claudeArguments(base, 'workspace-write', undefined, { allowedCommands: [['node', '--test'], ['npm', 'run', 'lint']] });
-    expect(edit[edit.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,Edit,Write,NotebookEdit,Bash');
+    expect(edit[edit.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite,Edit,Write,NotebookEdit,Bash');
     expect(edit).toEqual(expect.arrayContaining(['Bash(node --test:*)', 'Bash(npm run lint:*)']));
     // Read-only stages never get commands, and anything needing quoting is left out rather than widened.
     expect(claudeArguments(base, 'read-only', undefined, { allowedCommands: [['node', '--test']] })).not.toContain('Bash(node --test:*)');
@@ -146,17 +146,45 @@ describe('provider arguments', () => {
     expect(codexArguments(base, 'read-only')[0]).toBe('exec');
   });
 
-  it('maps Codex permissions to its sandbox modes', () => {
+  it('maps Codex permissions to its sandbox modes, in any folder', () => {
     expect(codexArguments(base, 'read-only')).toEqual(['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-']);
     expect(codexArguments({ ...base, model: 'gpt-5' }, 'workspace-write')).toEqual([
       'exec',
       '--json',
       '--sandbox',
       'workspace-write',
+      '--skip-git-repo-check',
       '--model',
       'gpt-5',
       '-',
     ]);
+    // Agent mode: Codex cannot ask first, so it stays in its sandbox, with the network and web search.
+    expect(codexArguments(base, 'agent')).toEqual([
+      '--search',
+      'exec',
+      '--json',
+      '--sandbox',
+      'workspace-write',
+      '--config',
+      'sandbox_workspace_write.network_access=true',
+      '--skip-git-repo-check',
+      '-',
+    ]);
+    expect(codexArguments({ ...base, codexAgentNetwork: false }, 'agent')).not.toContain('sandbox_workspace_write.network_access=true');
+  });
+
+  it('gives Claude its full toolset in Agent mode, asking the permission bridge before anything it does not judge read-only', () => {
+    const bridge = { configFile: '/storage/permission-mcp.json', tool: 'mcp__dualagent__approve' };
+    const args = claudeArguments({ ...base, permissionBridge: bridge, claudeAllowedTools: ['Bash(npm test:*)'] }, 'agent');
+    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,TodoWrite,Edit,Write,NotebookEdit,Bash,WebSearch,WebFetch');
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('default');
+    expect(args[args.indexOf('--permission-prompt-tool') + 1]).toBe('mcp__dualagent__approve');
+    expect(args[args.indexOf('--mcp-config') + 1]).toBe('/storage/permission-mcp.json');
+    // Only the bridge's server may start, and only the user's own settings load.
+    expect(args).toContain('--strict-mcp-config');
+    expect(args[args.indexOf('--setting-sources') + 1]).toBe('user');
+    expect(args[args.indexOf('--allowedTools') + 1]).toBe('Bash(npm test:*)');
+    expect(() => claudeArguments(base, 'agent')).toThrow('permission bridge');
   });
 });
 

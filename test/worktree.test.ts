@@ -10,12 +10,16 @@ import { checkGit } from '../src/core/git.js';
 import { captureGitSnapshot } from '../src/core/gitSnapshot.js';
 import {
   applyWorktree,
+  applyWorktreeFiles,
   checkpointWorktree,
+  createFolderSnapshot,
   createWorktree,
   listWorktreeChanges,
   readBaseFile,
   removeWorktree,
   restoreWorktree,
+  revertWorktreeFiles,
+  snapshotEnvironment,
   worktreeExists,
   WorktreeError,
 } from '../src/core/worktree.js';
@@ -133,6 +137,86 @@ describe('isolated worktrees', () => {
     expect(existsSync(path.join(info.path, 'ignored', 'cache.bin'))).toBe(true);
     expect((await listWorktreeChanges(info)).map((change) => change.path).sort()).toEqual(['first.ts', 'tracked.txt']);
     await expect(restoreWorktree(info, '--orphan')).rejects.toThrow('not a valid Git tree');
+  });
+
+  it('snapshots a folder without Git, reports and undoes the agents\' changes, and never writes into the folder', TIMEOUT, async () => {
+    const root = await temporaryDirectory('folder');
+    const folder = path.join(root, 'notes');
+    const storage = path.join(root, 'storage');
+    await mkdir(path.join(folder, 'node_modules', 'lib'), { recursive: true });
+    await writeFile(path.join(folder, 'a.txt'), 'original a\n');
+    await writeFile(path.join(folder, 'remove-me.txt'), 'obsolete\n');
+    await writeFile(path.join(folder, '.env'), 'TOKEN=secret\n');
+    await writeFile(path.join(folder, 'node_modules', 'lib', 'index.js'), 'module.exports = 1;\n');
+
+    const { info, warnings } = await createFolderSnapshot(folder, path.join(storage, 'direct-1.git'));
+    expect(info).toMatchObject({ path: folder, workingDirectory: folder, gitDir: path.join(storage, 'direct-1.git') });
+    expect(warnings[0]).toContain('edited directly');
+    expect(existsSync(path.join(folder, '.git'))).toBe(false);
+    expect(await worktreeExists(info)).toBe(true);
+
+    // The agents work in the folder itself.
+    await writeFile(path.join(folder, 'a.txt'), 'changed a\n');
+    await writeFile(path.join(folder, 'added.txt'), 'new\n');
+    await rm(path.join(folder, 'remove-me.txt'));
+    await writeFile(path.join(folder, 'node_modules', 'lib', 'index.js'), 'module.exports = 2;\n');
+
+    expect((await listWorktreeChanges(info)).map((change) => `${change.status} ${change.path}`).sort()).toEqual([
+      'added added.txt',
+      'deleted remove-me.txt',
+      'modified a.txt',
+    ]);
+    expect(await readBaseFile(info, 'a.txt')).toBe('original a\n');
+    // Reviewers get the diff since the snapshot, as they would from a repository.
+    const snapshot = await captureGitSnapshot(folder, [], snapshotEnvironment(info));
+    expect(snapshot.available).toBe(true);
+    expect(snapshot.diff).toContain('+changed a');
+    // Keeping the changes needs no Git command and changes nothing.
+    await applyWorktree(info);
+    expect(await readFile(path.join(folder, 'a.txt'), 'utf8')).toBe('changed a\n');
+
+    // Undo puts every snapshotted file back and leaves ignored dependencies and secrets alone.
+    await restoreWorktree(info, info.baseCommit);
+    expect(await readFile(path.join(folder, 'a.txt'), 'utf8')).toBe('original a\n');
+    expect(await readFile(path.join(folder, 'remove-me.txt'), 'utf8')).toBe('obsolete\n');
+    expect(existsSync(path.join(folder, 'added.txt'))).toBe(false);
+    expect(await readFile(path.join(folder, '.env'), 'utf8')).toBe('TOKEN=secret\n');
+    expect(await readFile(path.join(folder, 'node_modules', 'lib', 'index.js'), 'utf8')).toBe('module.exports = 2;\n');
+
+    // Removing it deletes only the snapshot repository, never the folder.
+    await removeWorktree(info, storage);
+    expect(existsSync(info.gitDir ?? '')).toBe(false);
+    expect(existsSync(path.join(folder, 'a.txt'))).toBe(true);
+    await expect(removeWorktree({ ...info, gitDir: folder }, storage)).rejects.toThrow('outside the extension');
+  });
+
+  it('names subfolders that are repositories of their own, which a folder snapshot cannot undo', TIMEOUT, async () => {
+    const { repo } = await repository();
+    const folder = path.dirname(repo);
+    await writeFile(path.join(folder, 'notes.txt'), 'notes\n');
+    const { warnings } = await createFolderSnapshot(folder, path.join(folder, 'storage', 'direct-nested.git'));
+    expect(warnings[1]).toContain('This subfolder is a Git repository of its own');
+    expect(warnings[1]).toContain(': repo.');
+  });
+
+  it('applies or discards one file at a time, leaving the others for later', TIMEOUT, async () => {
+    const { repo, storage } = await repository();
+    const { info } = await createWorktree(repo, path.join(storage, 'run-files'));
+    await writeFile(path.join(info.path, 'tracked.txt'), 'one\ntwo\nthree\nfour\n');
+    await writeFile(path.join(info.path, 'added.ts'), 'export const added = 1;\n');
+    await rm(path.join(info.path, 'remove-me.txt'));
+
+    await applyWorktreeFiles(info, ['tracked.txt']);
+    expect(await readFile(path.join(repo, 'tracked.txt'), 'utf8')).toBe('one\ntwo\nthree\nfour\n');
+    // The applied file leaves the changes, so applying the rest later cannot apply it twice.
+    expect((await listWorktreeChanges(info)).map((change) => change.path).sort()).toEqual(['added.ts', 'remove-me.txt']);
+
+    await revertWorktreeFiles(info, ['added.ts', 'remove-me.txt']);
+    expect(await listWorktreeChanges(info)).toEqual([]);
+    expect(existsSync(path.join(info.path, 'added.ts'))).toBe(false);
+    expect(await readFile(path.join(info.path, 'remove-me.txt'), 'utf8')).toBe('obsolete\n');
+    expect(existsSync(path.join(repo, 'added.ts'))).toBe(false);
+    await expect(revertWorktreeFiles(info, ['../outside.txt'])).rejects.toThrow('not a file in this run');
   });
 
   it('refuses to apply over conflicting workspace edits and leaves the workspace untouched', TIMEOUT, async () => {

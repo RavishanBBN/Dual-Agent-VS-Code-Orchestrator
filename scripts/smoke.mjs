@@ -34,6 +34,7 @@ process.stdin.on('data', (chunk) => (input += chunk));
 process.stdin.on('end', () => {
   const args = process.argv.slice(2);
   if (args.includes('--version')) return console.log('2.1.0 (Fake Claude Code)');
+  if (args[0] === 'auth' && args[1] === 'status') return console.log(JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', subscriptionType: 'pro', email: 'smoke@example.com' }));
   fs.appendFileSync(path.join(__dirname, 'claude-calls.jsonl'), JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
   const stage = (/- ID: (\\S+)/.exec(input) || [])[1] || 'unknown';
   const session = 'smoke-claude-session';
@@ -44,7 +45,9 @@ process.stdin.on('end', () => {
   console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: session, model: 'fake-claude-model' }));
   console.log(JSON.stringify({ type: 'stream_event', session_id: session, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Working on ' + stage } } }));
   console.log(JSON.stringify({ type: 'assistant', session_id: session, message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'README.md' } }] } }));
-  console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, result: 'Claude output for ' + stage, usage: { input_tokens: 10, output_tokens: 5 } }));
+  // Claude takes Codex's stages when Codex leads, and checks with a verdict as Codex does.
+  const verdict = stage.startsWith('codex-') ? '\\n\`\`\`verdict\\n{"verdict": "pass", "findings": []}\\n\`\`\`' : '';
+  console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, result: 'Claude output for ' + stage + verdict, usage: { input_tokens: 10, output_tokens: 5 } }));
 });`;
 
 const codex = `const fs = require('fs');
@@ -52,6 +55,8 @@ const path = require('path');
 const args = process.argv.slice(2);
 if (args.includes('--version')) {
   console.log('codex-cli 0.0.0-fake');
+} else if (args[0] === 'login' && args[1] === 'status') {
+  console.log('Logged in using ChatGPT');
 } else if (args[0] === 'debug' && args[1] === 'models') {
   console.log(JSON.stringify({ models: [{ slug: 'fake-codex-model', display_name: 'Fake Codex', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }] }] }, null, 2));
 } else {

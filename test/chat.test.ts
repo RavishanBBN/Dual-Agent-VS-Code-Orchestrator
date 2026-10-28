@@ -4,7 +4,7 @@ import { newConversation, type ConversationTurn } from '../src/core/conversation
 import type { AgentStreamEvent, RunRecord, StageRecord } from '../src/core/types.js';
 import { fileReference, linkTarget, parseWebviewMessage } from '../src/ui/chat/protocol.js';
 import { applyLiveEvent, transcript, usageOverview, type LiveStage } from '../src/ui/chat/transcript.js';
-import { isFileLink, renderMarkdown, trustedMarkdown } from '../src/webview/markdown.js';
+import { isFileLink, renderMarkdown, rowsToCsv, trustedMarkdown } from '../src/webview/markdown.js';
 
 describe('chat protocol', () => {
   it('accepts well-formed messages from the webview', () => {
@@ -82,6 +82,34 @@ describe('chat Markdown', () => {
     expect(html).toContain('[bad](javascript:alert(1))');
     expect(isFileLink('src/math.js:4')).toBe(true);
     expect(isFileLink('https://example.com')).toBe(false);
+  });
+
+  it('offers Run and Terminal only for a one-line shell command, since a pasted line break would run at once', () => {
+    const one = renderMarkdown('```bash\nnpm install\n```');
+    expect(one).toContain('data-run');
+    expect(one).toContain('data-paste');
+    const several = renderMarkdown('```sh\nnpm install\nnpm test\n```');
+    expect(several).not.toContain('data-run');
+    expect(several).not.toContain('data-paste');
+    expect(several).toContain('data-copy');
+    const code = renderMarkdown('```js\nconsole.log(1)\n```');
+    expect(code).not.toContain('data-run');
+    expect(code).not.toContain('data-paste');
+    expect(code).toContain('data-copy');
+  });
+
+  it('gives tables a CSV button and hides the machine-readable sources block', () => {
+    const html = renderMarkdown('| a | b |\n|---|---|\n| 1 | 2 |\n\nDone.\n\n```sources\n[{"title":"X"}]\n```');
+    expect(html).toContain('data-csv');
+    expect(html).toContain('<table>');
+    expect(html).not.toContain('sources');
+    expect(html).not.toContain('&quot;title&quot;');
+  });
+
+  it('writes CSV that a spreadsheet reads as text, not formulas', () => {
+    expect(rowsToCsv([['Gap', 'Note'], ['a, b', 'say "hi"'], ['=HYPERLINK("x")', '-5'], ['@cmd', '+1.5%']])).toBe(
+      'Gap,Note\r\n"a, b","say ""hi"""\r\n"\'=HYPERLINK(""x"")",-5\r\n\'@cmd,+1.5%',
+    );
   });
 
   it('produces HTML only through its own Trusted Types policy', async () => {
@@ -225,7 +253,7 @@ describe('chat transcript', () => {
     expect(views[0]?.stages).toEqual([expect.objectContaining({ text: 'Old answer', primary: true })]);
     expect(views[0]?.outcome).toEqual({ text: 'Codex agreed', tone: 'neutral' });
     expect(views[1]?.changes).toBeUndefined();
-    expect(views[2]?.changes).toEqual({ runId: 'r2', files: [{ path: 'src/a.js', status: 'M' }], state: 'active' });
+    expect(views[2]?.changes).toEqual({ runId: 'r2', files: [{ path: 'src/a.js', status: 'M' }], state: 'active', direct: false });
   });
 
   it('offers retry only when nothing runs, and shows a message paused at the usage limits', () => {

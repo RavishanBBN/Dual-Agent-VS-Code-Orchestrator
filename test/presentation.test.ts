@@ -123,6 +123,18 @@ describe('consent and apply prompts', () => {
     expect(consentDetail(settings, 'app', true)).not.toContain('You approve the plan');
   });
 
+  it('says that Agent mode works in the folder itself, asks before commands, and can undo file changes only', () => {
+    const detail = consentDetail(settings, 'app', false, 'agent');
+    expect(detail).toContain('works in app itself');
+    expect(detail).toContain('Claude asks you before each command');
+    expect(detail).toContain('can reach the network');
+    expect(detail).toContain('cannot be undone');
+    expect(detail).not.toContain('isolated Git worktree');
+    expect(detail).not.toContain('fix round');
+    expect(consentDetail({ ...settings, codex: { codexAgentNetwork: false } }, 'app', false, 'agent')).toContain('cannot reach the network');
+    expect(consentDetail(settings, 'app', false, 'edit')).toContain('edited directly after a snapshot');
+  });
+
   it('warns that configured commands run repository code outside every sandbox', () => {
     const detail = consentDetail({ ...settings, setupCommands: [['npm', 'ci']], verificationCommands: [['npm', 'test']] }, 'app', false);
     expect(detail).toContain('runs in the worktree: npm ci');
