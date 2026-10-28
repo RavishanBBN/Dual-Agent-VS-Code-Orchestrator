@@ -10,10 +10,12 @@ import { checkGit } from '../src/core/git.js';
 import { captureGitSnapshot } from '../src/core/gitSnapshot.js';
 import {
   applyWorktree,
+  checkpointWorktree,
   createWorktree,
   listWorktreeChanges,
   readBaseFile,
   removeWorktree,
+  restoreWorktree,
   worktreeExists,
   WorktreeError,
 } from '../src/core/worktree.js';
@@ -107,6 +109,30 @@ describe('isolated worktrees', () => {
     expect(existsSync(path.join(repo, 'remove-me.txt'))).toBe(false);
     // Nothing is staged: the user reviews and commits.
     expect(run(repo, 'diff', '--cached', '--name-only')).toBe('');
+  });
+
+  it('puts the worktree back to a checkpoint, undoing later edits, additions, and deletions but not ignored files', TIMEOUT, async () => {
+    const { repo, storage } = await repository();
+    const { info } = await createWorktree(repo, path.join(storage, 'run-checkpoint'));
+    await writeFile(path.join(info.path, 'tracked.txt'), 'first edit\n');
+    await writeFile(path.join(info.path, 'first.ts'), 'first\n');
+    const checkpoint = await checkpointWorktree(info);
+
+    await writeFile(path.join(info.path, 'tracked.txt'), 'second edit\n');
+    await writeFile(path.join(info.path, 'second.ts'), 'second\n');
+    await rm(path.join(info.path, 'remove-me.txt'));
+    await mkdir(path.join(info.path, 'ignored'));
+    await writeFile(path.join(info.path, 'ignored', 'cache.bin'), 'cache');
+
+    await restoreWorktree(info, checkpoint);
+
+    expect(await readFile(path.join(info.path, 'tracked.txt'), 'utf8')).toBe('first edit\n');
+    expect(await readFile(path.join(info.path, 'first.ts'), 'utf8')).toBe('first\n');
+    expect(await readFile(path.join(info.path, 'remove-me.txt'), 'utf8')).toBe('obsolete\n');
+    expect(existsSync(path.join(info.path, 'second.ts'))).toBe(false);
+    expect(existsSync(path.join(info.path, 'ignored', 'cache.bin'))).toBe(true);
+    expect((await listWorktreeChanges(info)).map((change) => change.path).sort()).toEqual(['first.ts', 'tracked.txt']);
+    await expect(restoreWorktree(info, '--orphan')).rejects.toThrow('not a valid Git tree');
   });
 
   it('refuses to apply over conflicting workspace edits and leaves the workspace untouched', TIMEOUT, async () => {

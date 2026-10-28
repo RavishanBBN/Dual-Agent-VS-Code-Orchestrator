@@ -177,6 +177,24 @@ export async function listWorktreeChanges(info: WorktreeInfo): Promise<WorktreeC
   return changes;
 }
 
+/**
+ * Records every file in the worktree (ignored files excepted) as a Git tree, so the worktree can later be put
+ * back to this point. Only the worktree's own index and the repository's object database are written.
+ */
+export async function checkpointWorktree(info: WorktreeInfo): Promise<string> {
+  const executable = resolveGit([info.repositoryRoot, info.path]);
+  await stageWorktree(executable, info);
+  return (await git(executable, info.path, ['write-tree'], 'Recording a checkpoint')).stdout.trim();
+}
+
+/** Puts the worktree's files back to a checkpoint: later changes are reverted and files added since are deleted. */
+export async function restoreWorktree(info: WorktreeInfo, tree: string): Promise<void> {
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(tree)) throw new WorktreeError('That checkpoint is not a valid Git tree.');
+  const executable = resolveGit([info.repositoryRoot, info.path]);
+  await stageWorktree(executable, info);
+  await git(executable, info.path, ['read-tree', '--reset', '-u', tree], 'Restoring the checkpoint');
+}
+
 async function worktreePatch(executable: string, info: WorktreeInfo): Promise<Buffer> {
   await stageWorktree(executable, info);
   const patch = await git(
