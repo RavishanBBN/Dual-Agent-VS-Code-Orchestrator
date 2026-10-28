@@ -22,7 +22,11 @@ export class ApprovalCoordinator implements vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<void>();
   public readonly onDidChange = this.changed.event;
 
-  public constructor(private readonly openPlan: (runId: string) => Promise<void>) {}
+  public constructor(
+    private readonly openPlan: (runId: string) => Promise<void>,
+    /** False while the chat shows the request, so the decision is not asked for twice. */
+    private readonly shouldNotify: () => boolean = () => true,
+  ) {}
 
   public get pendingRunId(): string | undefined {
     return this.pending?.runId;
@@ -45,7 +49,7 @@ export class ApprovalCoordinator implements vscode.Disposable {
       this.pending = pending;
       signal.addEventListener('abort', onAbort, { once: true });
       this.changed.fire();
-      void this.notify(pending);
+      if (this.shouldNotify()) void this.notify(pending);
     });
   }
 
@@ -106,8 +110,9 @@ export class ApprovalCoordinator implements vscode.Disposable {
     if (picked && this.pending === pending) await this.handle(pending, picked.choice);
   }
 
-  public approve(): void {
-    this.pending?.settle({ approved: true });
+  public approve(notes?: string): void {
+    const guidance = notes?.trim().slice(0, NOTES_LIMIT);
+    this.pending?.settle({ approved: true, ...(guidance ? { notes: guidance } : {}) });
   }
 
   public reject(): void {

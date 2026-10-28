@@ -1,7 +1,7 @@
 import { describeCheck } from '../core/context.js';
-import { canResume } from '../core/orchestrator.js';
+import { canResume, editsFiles } from '../core/orchestrator.js';
 import { statusLabel } from '../core/report.js';
-import type { CheckResult, IsolationMode, RunRecord, StageRecord, TokenUsage } from '../core/types.js';
+import type { CheckResult, IsolationMode, RunRecord, StageRecord, TokenUsage, WorkflowKind } from '../core/types.js';
 import { checksPassed } from '../core/types.js';
 import { summarizeVerdict } from '../core/verdict.js';
 import type { WorktreeChange } from '../core/worktree.js';
@@ -92,7 +92,7 @@ function usageText(usage: TokenUsage): string {
 }
 
 function isolationText(run: RunRecord): string {
-  if (run.kind !== 'implementation') return 'read-only';
+  if (!editsFiles(run.kind)) return 'read-only';
   if (!run.worktree) return run.isolation === 'worktree' ? 'isolated worktree (not created yet)' : 'edits the workspace directly';
   if (run.worktree.state === 'active') return 'isolated worktree: changes waiting for review';
   return `isolated worktree: changes ${run.worktree.state}`;
@@ -202,15 +202,18 @@ function commandList(commands: readonly (readonly string[])[]): string {
   return commands.map((command) => command.join(' ')).join(', ');
 }
 
-/** The facts the user consents to before an implementation run edits files. */
-export function consentDetail(settings: ConsentSettings, folder: string, resuming: boolean): string {
+/** The facts the user consents to before a run edits files. */
+export function consentDetail(settings: ConsentSettings, folder: string, resuming: boolean, kind: WorkflowKind = 'implementation'): string {
   const lines = [
     settings.isolation === 'worktree'
       ? `Agents edit an isolated Git worktree of ${folder}. When the run ends you review the diff and choose whether to apply it.`
       : `Agents edit files in ${folder} directly (dualAgent.isolation.mode is "none").`,
   ];
-  if (settings.approvePlan && !resuming) lines.push('You approve the plan and its review before any file is edited.');
-  if (settings.maxFixRounds > 0) lines.push(`If the final verification fails, Claude gets up to ${settings.maxFixRounds} fix round(s).`);
+  if (kind === 'implementation' && settings.approvePlan && !resuming) lines.push('You approve the plan and its review before any file is edited.');
+  if (kind === 'edit') lines.push('Claude makes the change, then Codex reviews the diff.');
+  if (settings.maxFixRounds > 0) {
+    lines.push(`If ${kind === 'edit' ? "Codex's review" : 'the final verification'} fails, Claude gets up to ${settings.maxFixRounds} fix round(s).`);
+  }
   if (settings.setupCommands.length) lines.push(`Before the first stage, the extension runs in the worktree: ${commandList(settings.setupCommands)}.`);
   if (settings.verificationCommands.length) {
     lines.push(`After each editing stage, the extension runs: ${commandList(settings.verificationCommands)}.`);

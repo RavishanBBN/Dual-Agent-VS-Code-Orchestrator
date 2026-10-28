@@ -6,12 +6,14 @@ import * as vscode from 'vscode';
 
 import { runChecks } from './adapters/checkRunner.js';
 import { ClaudeCliAdapter, CodexCliAdapter } from './adapters/cliAdapters.js';
+import { listCodexModels, type CodexModel } from './adapters/models.js';
 import { readConfiguration, type ExtensionConfiguration } from './config.js';
+import { extractPdfTextInWorker } from './core/attachments.js';
 import { checkGit } from './core/git.js';
-import { canResume, WorkflowOrchestrator, type OrchestratorDependencies } from './core/orchestrator.js';
+import { canResume, editsFiles, WorkflowOrchestrator, type OrchestratorDependencies } from './core/orchestrator.js';
 import { renderRunReport } from './core/report.js';
 import { FileRunStore } from './core/store.js';
-import type { AgentStreamEvent, OrchestratorEvent, RunRecord, WorkflowKind } from './core/types.js';
+import type { AgentStreamEvent, OrchestratorEvent, RunRecord, WorkflowKind, WorktreeInfo } from './core/types.js';
 import {
   applyWorktree,
   createWorktree,
@@ -22,6 +24,9 @@ import {
   type WorktreeChange,
 } from './core/worktree.js';
 import { ApprovalCoordinator, RunStatusBar } from './ui/approvals.js';
+import { ChatController, type ChatHost } from './ui/chat/chatController.js';
+import { CHAT_VIEW, ChatViewProvider } from './ui/chat/chatProvider.js';
+import type { ChatState } from './ui/chat/protocol.js';
 import { BASE_SCHEME, baseUri, BaseFileProvider, reportUri, RUN_SCHEME, RunDocumentProvider, stageUri } from './ui/documents.js';
 import {
   applyDetail,
@@ -86,7 +91,24 @@ async function askObjective(kind: WorkflowKind): Promise<string | undefined> {
   return typed?.trim() || undefined;
 }
 
-export async function activate(context: vscode.ExtensionContext): Promise<void> {
+/** What the extension exposes to its own smoke test; not a supported API. */
+export interface DualAgentTestApi {
+  chatReady(): boolean;
+  chatState(): ChatState;
+  chatMessage(message: unknown): Promise<void>;
+}
+
+/** The folder new conversations work in: the active editor's folder first, then the first local folder. */
+function chatFolder(): { path: string; name: string } | { blocked: string } {
+  if (!vscode.workspace.isTrusted) return { blocked: 'Trust this workspace to chat with agents about it.' };
+  const folders = localFolders();
+  if (!folders.length) return { blocked: 'Open a local folder to chat with Claude and Codex about it.' };
+  const activeUri = vscode.window.activeTextEditor?.document.uri;
+  const folder = (activeUri && vscode.workspace.getWorkspaceFolder(activeUri)) || folders[0];
+  return folder ? { path: folder.uri.fsPath, name: folder.name } : { blocked: 'Open a local folder.' };
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<DualAgentTestApi> {
   const storagePath = context.storageUri?.fsPath ?? context.globalStorageUri.fsPath;
   const worktreeRoot = path.join(storagePath, 'worktrees');
   const output = vscode.window.createOutputChannel('Dual Agent', { log: true });
@@ -103,15 +125,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const lookup = (runId: string): RunRecord | undefined => runsView.get(runId);
   const documents = new RunDocumentProvider(lookup);
   const statusBar = new RunStatusBar();
-  const approvals = new ApprovalCoordinator(async (runId) => {
+  async function openPlan(runId: string): Promise<void> {
     const run = lookup(runId);
     if (!run) return;
     // Claude's plan beside Codex's review of it.
     const [plan, review] = run.stages;
     if (plan) await openDocument(stageUri(run, plan), vscode.ViewColumn.One);
     if (review) await openDocument(stageUri(run, review), vscode.ViewColumn.Two);
-  });
+  }
+  // The chat shows its own approval card, so the notification is only needed while the chat is hidden.
+  const approvals = new ApprovalCoordinator(openPlan, () => !chat.hasVisibleView);
   const agentsView = new AgentsView(() => checkTools());
+  let codexModels: Promise<CodexModel[]> | undefined;
 
   function dependencies(): OrchestratorDependencies {
     return {
@@ -122,6 +147,67 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   }
   let orchestrator = createOrchestrator(configuration, store, dependencies());
+
+  async function findRun(runId: string): Promise<RunRecord | undefined> {
+    return lookup(runId) ?? (await store.list()).find((run) => run.id === runId);
+  }
+
+  const chatHost: ChatHost = {
+    storagePath,
+    folder: chatFolder,
+    isBusy: () => busy || orchestrator.activeRun !== undefined,
+    exclusive: (task) => exclusive(task),
+    start: async (kind, objective, folder, allowWrites, options) => {
+      // Settings are read at the last moment so the run uses exactly what the user just confirmed.
+      if (!orchestrator.activeRun) reconfigure();
+      output.info(`Starting ${kind} run in ${folder}.`);
+      return orchestrator.start(kind, objective, folder, allowWrites, options);
+    },
+    resume: async (runId, allowWrites) => {
+      if (!orchestrator.activeRun) reconfigure();
+      output.info(`Resuming run ${runId}.`);
+      return orchestrator.resume(runId, allowWrites);
+    },
+    cancel: () => void orchestrator.cancel(),
+    consentDetails: (folder, kind) => consentDetail(readConfiguration(), folder, false, kind).split('\n\n'),
+    commandsSignature: () => {
+      const current = readConfiguration();
+      return JSON.stringify([current.isolation, current.setupCommands, current.verificationCommands]);
+    },
+    maxContextCharacters: () => configuration.maxContextCharacters,
+    loadRuns: () => store.list(),
+    listChanges: (worktree) => listWorktreeChanges(worktree),
+    worktreeExists,
+    codexModels: () => (codexModels ??= listCodexModels(readConfiguration().codex)),
+    extractPdfText: (data) => extractPdfTextInWorker(path.join(context.extensionPath, 'dist', 'pdfWorker.js'), data),
+    pendingApprovalRunId: () => approvals.pendingRunId,
+    approve: (notes) => approvals.approve(notes),
+    reject: () => approvals.reject(),
+    openPlan,
+    openStage: async (runId, index) => {
+      const run = await findRun(runId);
+      const stage = run?.stages[index];
+      if (run && stage) await openDocument(stageUri(run, stage));
+    },
+    openReport: async (runId) => {
+      const run = await findRun(runId);
+      if (run) await openDocument(reportUri(run));
+    },
+    log: (text) => output.warn(text),
+  };
+  const chat = new ChatController(chatHost, { global: context.globalState, workspace: context.workspaceState });
+  const chatProvider = new ChatViewProvider(context.extensionUri, chat);
+
+  /** Records that a worktree's changes were applied or discarded on every run that shared it. */
+  async function markWorktree(worktree: WorktreeInfo, state: 'applied' | 'discarded'): Promise<void> {
+    for (const run of await store.list()) {
+      if (run.worktree?.path !== worktree.path || run.worktree.state !== 'active') continue;
+      await orchestrator.updateRun(run.id, (record) => {
+        if (record.worktree) record.worktree.state = state;
+      });
+    }
+    await chat.runsChanged();
+  }
 
   function attach(): void {
     detach();
@@ -151,6 +237,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   function handleEvent(event: OrchestratorEvent): void {
+    chat.handleEvent(event);
     switch (event.type) {
       case 'run-updated':
         runsView.upsert(event.run);
@@ -225,11 +312,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return picked?.run;
   }
 
-  async function confirmWrites(folder: string, resuming: boolean): Promise<boolean> {
+  async function confirmWrites(folder: string, resuming: boolean, kind: WorkflowKind = 'implementation'): Promise<boolean> {
     const current = readConfiguration();
     const choice = await vscode.window.showWarningMessage(
-      resuming ? 'Resume this implementation run? Agents will edit files again.' : 'Start an implementation run that lets agents edit files?',
-      { modal: true, detail: consentDetail(current, folder, resuming) },
+      resuming ? 'Resume this run? Agents will edit files again.' : 'Start an implementation run that lets agents edit files?',
+      { modal: true, detail: consentDetail(current, folder, resuming, kind) },
       ALLOW,
     );
     return choice === ALLOW;
@@ -278,8 +365,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const run = await resolveRun(argument, canResume, 'Which run should continue?');
       if (!run) return undefined;
       if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before running agents in it.');
-      const allowWrites = run.kind === 'implementation' && (await confirmWrites(path.basename(run.workspacePath), true));
-      if (run.kind === 'implementation' && !allowWrites) return undefined;
+      const allowWrites = editsFiles(run.kind) && (await confirmWrites(path.basename(run.workspacePath), true, run.kind));
+      if (editsFiles(run.kind) && !allowWrites) return undefined;
       if (!orchestrator.activeRun) reconfigure();
       output.info(`Resuming run ${run.id}.`);
       return orchestrator.resume(run.id, allowWrites);
@@ -293,6 +380,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   async function announce(run: RunRecord): Promise<void> {
+    if (run.conversationId) {
+      // The chat shows the result; a hidden chat gets a single nudge.
+      if (chat.hasVisibleView) return;
+      const choice = await vscode.window.showInformationMessage('Dual Agent: Claude and Codex have answered your message.', 'Show Chat');
+      if (choice) await vscode.commands.executeCommand(`${CHAT_VIEW}.focus`);
+      return;
+    }
     const report = async (): Promise<void> => openDocument(reportUri(run));
     if (run.status === 'failed' || run.status === 'cancelled') {
       const text = `Dual Agent run ${run.status}: ${run.error ?? 'no reason recorded'}`;
@@ -347,7 +441,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.createTreeView('dualAgent.agents', { treeDataProvider: agentsView }),
     vscode.workspace.registerTextDocumentContentProvider(RUN_SCHEME, documents),
     vscode.workspace.registerTextDocumentContentProvider(BASE_SCHEME, new BaseFileProvider(lookup)),
-    approvals.onDidChange(() => updateContext()),
+    chat,
+    chatProvider,
+    vscode.window.registerWebviewViewProvider(CHAT_VIEW, chatProvider, { webviewOptions: { retainContextWhenHidden: true } }),
+    approvals.onDidChange(() => {
+      updateContext();
+      chat.refresh();
+    }),
+
+    command('dualAgent.openChat', async () => {
+      await vscode.commands.executeCommand(`${CHAT_VIEW}.focus`);
+      chat.focusComposer();
+    }),
+    command('dualAgent.newConversation', async () => {
+      await chat.newConversation();
+      await vscode.commands.executeCommand(`${CHAT_VIEW}.focus`);
+      chat.focusComposer();
+    }),
+    command('dualAgent.openChatInEditor', () => chatProvider.openInEditor()),
 
     command('dualAgent.runImplementation', () => startRun('implementation')),
     command('dualAgent.runBrainstorming', () => startRun('brainstorming')),
@@ -438,9 +549,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         else if (next === 'Open Worktree') await vscode.commands.executeCommand('dualAgent.openWorktree', run.id);
         return;
       }
-      await orchestrator.updateRun(run.id, (record) => {
-        if (record.worktree) record.worktree.state = 'applied';
-      });
+      await markWorktree(worktree, 'applied');
       await removeWorktree(worktree, worktreeRoot).catch((error: unknown) => output.warn(`Worktree not removed: ${message(error)}`));
       const next = await vscode.window.showInformationMessage(
         `Dual Agent: applied ${changes.length} file(s). Nothing is staged or committed; review them in Source Control.`,
@@ -458,10 +567,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         'Discard Changes',
       );
       if (choice !== 'Discard Changes') return;
-      await removeWorktree(run.worktree, worktreeRoot);
-      await orchestrator.updateRun(run.id, (record) => {
-        if (record.worktree) record.worktree.state = 'discarded';
-      });
+      const worktree = run.worktree;
+      await removeWorktree(worktree, worktreeRoot);
+      await markWorktree(worktree, 'discarded');
     }),
     command('dualAgent.openWorktree', async (argument) => {
       const run = await resolveRun(argument, hasChanges, 'Whose worktree should be opened?');
@@ -473,7 +581,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!event.affectsConfiguration('dualAgent')) return;
       if (orchestrator.activeRun || busy) reconfigurePending = true;
       else reconfigure();
+      if (event.affectsConfiguration('dualAgent.codex')) codexModels = undefined;
       void agentsView.refresh();
+      chat.refresh();
     }),
     { dispose: () => detach() },
     // Stops any agent still running when the extension shuts down.
@@ -490,6 +600,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   } catch (error) {
     output.error(`Run history could not be read: ${message(error)}`);
   }
+  return { chatReady: () => chat.hasReadyView, chatState: () => chat.snapshot(), chatMessage: (value) => chat.receive(value) };
 }
 
 function reportProblems(configuration: ExtensionConfiguration): void {

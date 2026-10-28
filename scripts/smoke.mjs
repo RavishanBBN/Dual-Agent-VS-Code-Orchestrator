@@ -26,25 +26,44 @@ function vscodeExecutable() {
   return found;
 }
 
-const claude = `let input = '';
+// Each fake records its arguments beside itself, so the suite can check what the extension passed.
+const claude = `const fs = require('fs');
+const path = require('path');
+let input = '';
 process.stdin.on('data', (chunk) => (input += chunk));
 process.stdin.on('end', () => {
-  if (process.argv.includes('--version')) return console.log('2.1.0 (Fake Claude Code)');
+  const args = process.argv.slice(2);
+  if (args.includes('--version')) return console.log('2.1.0 (Fake Claude Code)');
+  fs.appendFileSync(path.join(__dirname, 'claude-calls.jsonl'), JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
   const stage = (/- ID: (\\S+)/.exec(input) || [])[1] || 'unknown';
   const session = 'smoke-claude-session';
-  console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: session }));
+  // An edit stage changes a file in the folder it runs in, which is the isolated worktree.
+  if (args.includes('acceptEdits')) fs.writeFileSync(path.join(process.cwd(), 'chat-edit.txt'), 'edited by fake claude\\n');
+  console.log(JSON.stringify({ type: 'system', subtype: 'init', session_id: session, model: 'fake-claude-model' }));
+  console.log(JSON.stringify({ type: 'stream_event', session_id: session, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Working on ' + stage } } }));
+  console.log(JSON.stringify({ type: 'assistant', session_id: session, message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'README.md' } }] } }));
   console.log(JSON.stringify({ type: 'result', subtype: 'success', session_id: session, result: 'Claude output for ' + stage, usage: { input_tokens: 10, output_tokens: 5 } }));
 });`;
 
-const codex = `let input = '';
-process.stdin.on('data', (chunk) => (input += chunk));
-process.stdin.on('end', () => {
-  if (process.argv.includes('--version')) return console.log('codex-cli 0.0.0-fake');
-  const verdict = '\`\`\`verdict\\n{"verdict": "pass", "findings": []}\\n\`\`\`';
-  console.log(JSON.stringify({ type: 'thread.started', thread_id: 'smoke-codex-thread' }));
-  console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Codex review.\\n' + verdict } }));
-  console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 8, output_tokens: 4 } }));
-});`;
+const codex = `const fs = require('fs');
+const path = require('path');
+const args = process.argv.slice(2);
+if (args.includes('--version')) {
+  console.log('codex-cli 0.0.0-fake');
+} else if (args[0] === 'debug' && args[1] === 'models') {
+  console.log(JSON.stringify({ models: [{ slug: 'fake-codex-model', display_name: 'Fake Codex', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }] }] }, null, 2));
+} else {
+  let input = '';
+  process.stdin.on('data', (chunk) => (input += chunk));
+  process.stdin.on('end', () => {
+    fs.appendFileSync(path.join(__dirname, 'codex-calls.jsonl'), JSON.stringify({ args, cwd: process.cwd() }) + '\\n');
+    const verdict = '\`\`\`verdict\\n{"verdict": "pass", "findings": []}\\n\`\`\`';
+    console.log(JSON.stringify({ type: 'thread.started', thread_id: 'smoke-codex-thread' }));
+    console.log(JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', command: 'cat README.md', aggregated_output: 'original readme', exit_code: 0 } }));
+    console.log(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Codex review.\\n' + verdict } }));
+    console.log(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 8, output_tokens: 4 } }));
+  });
+}`;
 
 async function fakeCli(directory, name, script) {
   const scriptPath = path.join(directory, `${name}.js`);
@@ -98,6 +117,7 @@ try {
     Object.entries(process.env).filter(([name]) => !/^(VSCODE_|ELECTRON_RUN_AS_NODE$)/i.test(name)),
   );
   environment.DUAL_AGENT_SMOKE_USER_DATA = userData;
+  environment.DUAL_AGENT_SMOKE_BIN = bin;
 
   const child = spawn(
     vscodeExecutable(),

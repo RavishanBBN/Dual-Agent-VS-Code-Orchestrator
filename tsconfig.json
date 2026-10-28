@@ -12,9 +12,11 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
     "rootDir": ".",
     "types": ["node", "vscode", "vitest/globals"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "eslint.config.mjs", "vitest.config.mts"],
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "eslint.config.mjs", "vitest.config.mts"],
   "exclude": ["dist", "coverage", "node_modules"]
 }

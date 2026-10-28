@@ -3,7 +3,8 @@ import * as vscode from 'vscode';
 import type { CheckRunnerConfiguration } from './adapters/checkRunner.js';
 import type { AdapterConfiguration } from './adapters/cliAdapters.js';
 import type { BillingMode } from './adapters/environment.js';
-import type { IsolationMode } from './core/types.js';
+import { isEffort, isModelName } from './core/agentOptions.js';
+import type { AgentId, IsolationMode } from './core/types.js';
 
 export interface ExtensionConfiguration {
   codex: AdapterConfiguration;
@@ -22,7 +23,6 @@ export interface ExtensionConfiguration {
   problems: string[];
 }
 
-const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/@[\]-]*$/;
 const MAX_COMMANDS = 10;
 const MAX_ARGUMENTS = 64;
 const MAX_ARGUMENT_LENGTH = 1_000;
@@ -54,11 +54,19 @@ export function readConfiguration(): ExtensionConfiguration {
   const model = (key: string): string => {
     const value = user<unknown>(key, '');
     const trimmed = typeof value === 'string' ? value.trim() : '';
-    if (trimmed && !MODEL_PATTERN.test(trimmed)) {
+    if (trimmed && !isModelName(trimmed)) {
       problems.push(`dualAgent.${key} is not a valid model name and was ignored.`);
       return '';
     }
     return trimmed;
+  };
+
+  const effort = (agent: AgentId): string => {
+    const value = user<unknown>(`${agent}.effort`, '');
+    if (value === '' || value === undefined) return '';
+    if (typeof value === 'string' && isEffort(agent, value)) return value;
+    problems.push(`dualAgent.${agent}.effort is not an effort level ${agent === 'claude' ? 'Claude' : 'Codex'} accepts and was ignored.`);
+    return '';
   };
 
   const list = (key: string, valid: (entry: string) => boolean): string[] => {
@@ -103,6 +111,8 @@ export function readConfiguration(): ExtensionConfiguration {
   const environmentPassthrough = list('environment.passthrough', (entry) => ENVIRONMENT_NAME_PATTERN.test(entry));
   const codexModel = model('codex.model');
   const claudeModel = model('claude.model');
+  const codexEffort = effort('codex');
+  const claudeEffort = effort('claude');
   // Tool rules are passed as separate arguments; one that looks like a flag could change the CLI's behavior.
   const claudeAllowedTools = list(
     'claude.allowedTools',
@@ -116,6 +126,7 @@ export function readConfiguration(): ExtensionConfiguration {
       billingMode,
       environmentPassthrough,
       ...(codexModel ? { model: codexModel } : {}),
+      ...(codexEffort ? { effort: codexEffort } : {}),
     },
     claude: {
       command: command('claude.command', 'claude'),
@@ -125,10 +136,11 @@ export function readConfiguration(): ExtensionConfiguration {
       claudeMaxTurns: Math.round(bounded('claude.maxTurns', 24, 1, 100)),
       claudeAllowedTools,
       ...(claudeModel ? { model: claudeModel } : {}),
+      ...(claudeEffort ? { effort: claudeEffort } : {}),
     },
     maxContextCharacters: Math.round(bounded('context.maxCharacters', 90_000, 10_000, 300_000)),
     fallbackOnQuota: user<unknown>('fallbackOnQuota', true) !== false,
-    maxRuns: Math.round(bounded('history.maxRuns', 50, 5, 500)),
+    maxRuns: Math.round(bounded('history.maxRuns', 100, 5, 500)),
     isolation: user<unknown>('isolation.mode', 'worktree') === 'none' ? 'none' : 'worktree',
     setupCommands: commands('isolation.setupCommands'),
     verificationCommands: commands('verification.commands'),
