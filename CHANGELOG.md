@@ -47,6 +47,10 @@ Ready for the Visual Studio Marketplace and Open VSX. Work continues through usa
 - **Tooling.** All GitHub Actions are pinned to commit SHAs with `persist-credentials: false`. `@vscode/vsce` is 4.0.0 and `cross-spawn` is pinned exactly. `vsce package` runs without bypass flags.
 - **Extension ID.** It is now `NileshRavishan.dual-agent-orchestrator`. Conversations and runs recorded under the earlier local ID `local.dual-agent-orchestrator` stay in that ID's storage and are not shown.
 
+### Fixed
+
+- **Lockfile labels.** The lockfile labelled `isexe` and `shebang-command` as 2.1.0, a version that never existed, while resolving them to the genuine 2.0.0 tarballs. This was a side effect of replacing the 2.1.0 version bump across the file. The installed code was always the real 2.0.0, but `npm audit signatures` failed on a clean install. The labels are corrected, and a test now checks that every label matches its tarball. The published 2.3.0 VSIX is unaffected, because it bundles the same code.
+
 ## [2.2.0] - 2026-10-28
 
 Research support and better answers for fewer tokens.
