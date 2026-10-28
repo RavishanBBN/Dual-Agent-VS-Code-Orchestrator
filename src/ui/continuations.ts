@@ -1,17 +1,20 @@
 /**
- * Continues runs that stopped at the agents' usage limits once the limits reset. Pending continuations are
- * saved, so they survive a restart of VS Code; one that came due while VS Code was closed runs soon after start.
+ * Continues runs that stopped at the agents' usage limits once the limits reset, or that stopped because the
+ * machine went offline once the connection is back. Pending continuations are saved, so they survive a restart
+ * of VS Code; one that came due while VS Code was closed runs soon after start.
  */
 
 export interface Continuation {
   runId: string;
-  /** When to continue: shortly after the first limit resets. */
+  /** When to continue: shortly after the first limit resets, or at the next check of the connection. */
   at: string;
   /**
    * The setup and verification commands when the run stopped. A run that edits files continues on its own
    * only with the same commands it was allowed to run; otherwise it waits for the user.
    */
   commands: string;
+  /** The run waits for the network rather than a limit, so it is tried again more often. */
+  network?: boolean;
 }
 
 /** What firing a continuation did: finished with it, or try again shortly because another run is active. */
@@ -20,6 +23,8 @@ export type ContinuationOutcome = 'done' | 'retry';
 /** Margin after the reset, so the provider has certainly reset the limit. */
 export const CONTINUE_MARGIN_MS = 60_000;
 const RETRY_MS = 60_000;
+/** How often a run waiting for the network checks whether the connection is back. */
+export const NETWORK_RETRY_MS = 15_000;
 /** Due continuations wait this long after start, so VS Code finishes loading first. */
 const STARTUP_DELAY_MS = 5_000;
 /** The longest delay a timer accepts. */
@@ -126,7 +131,7 @@ export class ContinuationScheduler {
     // Cancelled meanwhile, or replaced because the continued run stopped at a limit again.
     if (this.items.get(item.runId) !== fired) return;
     if (outcome === 'retry') {
-      const retry = { ...item, at: new Date(this.clock() + RETRY_MS).toISOString() };
+      const retry = { ...item, at: new Date(this.clock() + (item.network ? NETWORK_RETRY_MS : RETRY_MS)).toISOString() };
       this.items.set(item.runId, retry);
       this.arm(retry);
     } else {

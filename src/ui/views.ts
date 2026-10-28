@@ -217,12 +217,14 @@ export class RunsView implements vscode.TreeDataProvider<RunNode>, vscode.Dispos
 }
 
 export interface ToolRow {
-  id: 'claude' | 'codex' | 'git';
+  id: 'claude' | 'codex' | 'git' | 'gemini';
   label: string;
   /** pass, warning, or error. */
   state: 'ready' | 'warning' | 'unavailable';
   description: string;
   detail: string;
+  /** For an agent: whether its CLI is signed in, which decides the row's Sign In and Sign Out actions. */
+  signedIn?: boolean;
 }
 
 export class AgentsView implements vscode.TreeDataProvider<ToolRow>, vscode.Disposable {
@@ -244,6 +246,7 @@ export class AgentsView implements vscode.TreeDataProvider<ToolRow>, vscode.Disp
     item.id = `tool:${row.id}`;
     item.description = row.description;
     item.tooltip = row.detail;
+    if (row.signedIn !== undefined) item.contextValue = row.signedIn ? 'account-signed-in' : 'account-signed-out';
     item.iconPath = icon(
       row.state === 'ready'
         ? { id: 'pass', color: 'testing.iconPassed' }

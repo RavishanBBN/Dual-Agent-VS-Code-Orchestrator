@@ -1235,3 +1235,306 @@ div.small {
   align-items: center;
   gap: 6px;
 }
+
+/* ---- 2.4: commands in code blocks, tables, agents, permissions, sources, and limits ---- */
+
+.code-header {
+  gap: 4px;
+}
+
+.code-header > span {
+  margin-right: auto;
+}
+
+.table-block {
+  margin: 6px 0;
+  overflow-x: auto;
+}
+
+.table-header {
+  display: flex;
+  justify-content: flex-end;
+  font-size: 0.82em;
+}
+
+.table-header .copy {
+  border: none;
+  background: transparent;
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+}
+
+.starters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0;
+}
+
+.starter {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--vscode-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.starter:hover {
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-list-hoverBackground);
+}
+
+.context-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.context-row .attachments {
+  margin: 0;
+}
+
+.editor-chip {
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: 0.9em;
+  cursor: pointer;
+}
+
+.editor-chip.off {
+  opacity: 0.55;
+  text-decoration: line-through;
+}
+
+.slash code {
+  color: var(--vscode-textPreformat-foreground);
+}
+
+.slash-error {
+  margin: 0 0 4px;
+  font-size: 0.9em;
+  color: var(--warn);
+}
+
+.permission {
+  margin: 6px 8px;
+}
+
+.permission strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.permission-detail {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.9em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.permission-warnings {
+  list-style: none;
+  padding: 0 !important;
+  color: var(--warn);
+}
+
+.permission-warnings li {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.referee {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 3px solid var(--vscode-charts-purple, #a371f7);
+  background: var(--surface);
+  border-radius: 4px;
+}
+
+.referee-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.comparison .diff {
+  max-height: 320px;
+  overflow: auto;
+  margin: 8px 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--vscode-editor-background);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff ins {
+  text-decoration: none;
+  background: var(--vscode-diffEditor-insertedTextBackground, rgba(63, 185, 80, 0.25));
+}
+
+.diff del {
+  background: var(--vscode-diffEditor-removedTextBackground, rgba(248, 81, 73, 0.25));
+}
+
+.sources-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.source-list {
+  margin: 6px 0 0;
+  padding-left: 22px;
+}
+
+.source-list li {
+  margin: 2px 0;
+}
+
+.files li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.file-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 6px;
+  opacity: 0;
+}
+
+.files li:hover .file-actions,
+.files li:focus-within .file-actions {
+  opacity: 1;
+}
+
+/* One grid for all rows, so the bars line up whatever the labels' widths. */
+.quota-meter {
+  display: grid;
+  grid-template-columns: auto minmax(40px, 1fr) auto;
+  align-items: center;
+  gap: 6px 8px;
+  margin-bottom: 10px;
+}
+
+.quota-meter > .usage-period {
+  grid-column: 1 / -1;
+}
+
+.quota-row {
+  display: contents;
+}
+
+.quota-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.quota-row.agent-claude .pill-dot {
+  background: var(--claude);
+}
+
+.quota-row.agent-codex .pill-dot {
+  background: var(--codex);
+}
+
+.quota-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.quota-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--good);
+}
+
+.quota-bar.medium > span {
+  background: var(--warn);
+}
+
+.quota-bar.high > span {
+  background: var(--bad);
+}
+
+.quota-value {
+  white-space: nowrap;
+}
+
+.usage-button.high {
+  color: var(--warn);
+}
+
+.history-tools {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.history-tools input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  font: inherit;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--border));
+  border-radius: 4px;
+}
+
+.help ul {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 0;
+}
+
+.help li {
+  margin: 2px 0;
+}
+
+.notes ul {
+  margin: 4px 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.machine-usage {
+  margin-bottom: 10px;
+}
+
+.machine-usage .usage-period span:first-child {
+  font-weight: 600;
+}
+
+.sign-in-banner {
+  flex-wrap: wrap;
+}
+
+.sign-in-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quota-empty {
+  grid-column: 1 / -1;
+}

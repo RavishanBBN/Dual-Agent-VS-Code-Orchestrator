@@ -2,13 +2,21 @@
  * Messages between the chat webview and the extension. The webview is treated as untrusted input: every
  * message is validated here before the extension acts on it, and anything malformed is dropped.
  */
-import type { ActivityKind, AgentId, AgentOptions, RunStatus, WorkflowKind } from '../../core/types.js';
+import type { Source } from '../../core/citations.js';
+import { AGENT_SELECTIONS, type ActivityKind, type AgentId, type AgentOptions, type AgentSelection, type RunStatus, type WorkflowKind } from '../../core/types.js';
+import type { PermissionView } from './permissions.js';
+
+export type { PermissionView };
 
 export const MESSAGE_LIMIT = 20_000;
 export const GUIDANCE_LIMIT = 4_000;
 /** Base64 for a 25 MB file, plus padding. */
 const DATA_LIMIT = Math.ceil((25 * 1024 * 1024 * 4) / 3) + 4;
-const MODES: readonly WorkflowKind[] = ['chat', 'research', 'edit', 'brainstorming', 'implementation'];
+const MODES: readonly WorkflowKind[] = ['chat', 'research', 'agent', 'edit', 'tdd', 'compare', 'brainstorming', 'implementation'];
+/** A command suggested in agent output, as the page passes it on to run or paste. */
+const COMMAND_LIMIT = 4_000;
+/** A table exported from an answer. */
+const CSV_LIMIT = 2_000_000;
 const ID = /^[A-Za-z0-9-]{1,64}$/;
 
 // ---- Extension → webview ----
@@ -81,6 +89,8 @@ export interface StageView {
   /** How long a finished stage took, such as "12s". */
   duration?: string;
   usage?: UsageNumbers;
+  /** A third model's ruling on this check's findings. */
+  referee?: { name: string; text: string; error?: string };
 }
 
 export interface ChangeView {
@@ -107,8 +117,11 @@ export interface TurnView {
   stages: StageView[];
   outcome?: { text: string; tone: Tone };
   error?: string;
-  /** Changes in the conversation's worktree after this turn, when they are still waiting for review. */
-  changes?: { runId: string; files: ChangeView[]; state: 'active' | 'applied' | 'discarded' };
+  /**
+   * Changes in the conversation's worktree after this turn, when they are still waiting for review. `direct`
+   * means they were made in the folder itself, after a snapshot, so the choice is to keep or undo them.
+   */
+  changes?: { runId: string; files: ChangeView[]; state: 'active' | 'applied' | 'discarded'; direct: boolean };
   checks: CheckView[];
   awaitingApproval: boolean;
   /** Tokens the message used, including failed attempts. */
@@ -117,7 +130,15 @@ export interface TurnView {
   /** Retry or edit is possible: nothing is running and the message has finished or stopped. */
   canRetry: boolean;
   /** The run stopped at the agents' usage limits: when they reset, and when it continues on its own if it will. */
-  paused?: { runId: string; reset: string; continuesAt?: string };
+  paused?: { runId: string; reset: string; continuesAt?: string; offline?: boolean };
+  /** The first answer, the findings, and the revision, when a check made the lead agent revise. */
+  comparison?: { original: string; revised: string; checker: string; reviser: string };
+  /** The works a research answer cites, for export. */
+  sources?: Source[];
+  /** The message failed because this agent's CLI is not signed in. */
+  signIn?: 'claude' | 'codex';
+  /** What the run noted along the way, such as a folder it edited directly. */
+  warnings?: string[];
 }
 
 export interface ModelChoice {
@@ -142,6 +163,34 @@ export interface ComposerView {
   choices: Record<AgentId, AgentChoices>;
   /** The earlier message being edited; sending replaces it and the messages after it. */
   editing?: { turnId: string; preview: string };
+  /** Which agents the next message uses. */
+  agents: AgentSelection;
+  /** The file and selection open in the editor, which the next message includes unless turned off. */
+  editor?: { label: string; included: boolean };
+}
+
+/** One usage window of an account, as the quota meter shows it. */
+export interface QuotaView {
+  agent: AgentId;
+  /** Such as "5-hour" or "weekly". */
+  label: string;
+  usedPercent: number;
+  /** When the window resets, such as "3:05 PM". */
+  resets?: string;
+}
+
+export interface AccountView {
+  provider: 'claude' | 'codex' | 'gemini';
+  name: string;
+  signedIn: boolean | undefined;
+  detail: string;
+}
+
+export interface ConflictView {
+  turnId: string;
+  text: string;
+  /** The waiting changes were made in the folder itself, so the choice is to keep or undo them. */
+  direct: boolean;
 }
 
 /** A message waiting for the current one to finish, or for the agents' limits to reset. */
@@ -173,6 +222,8 @@ export interface ConversationSummary {
   title: string;
   updated: string;
   turns: number;
+  /** The conversation's messages, trimmed, for searching the history. */
+  search: string;
 }
 
 export interface ChatState {
@@ -194,6 +245,20 @@ export interface ChatState {
   queue: QueuedView[];
   /** Agents at their usage limits; while one is, the other works alone. */
   limits: LimitView[];
+  /** The accounts' usage windows, as each CLI last reported them. */
+  quotas: QuotaView[];
+  /** All use of Claude Code and Codex on this machine, from the CLIs' own logs, when reading them is on. */
+  machine?: { periods: UsagePeriod[]; updated: string };
+  /** Whether each CLI is signed in, as it last said; an agent the message needs and that is signed out gets a banner. */
+  accounts: AccountView[];
+  /** The limits are being asked for with one small call to each agent. */
+  refreshingLimits?: boolean;
+  /** A message whose mode cannot continue the changes waiting in its conversation, and asks what to do with them. */
+  conflict?: ConflictView;
+  /** An Agent-mode command or edit waiting for the user's decision. */
+  permission?: PermissionView;
+  /** The user has written a project brief, which every message includes. */
+  brief: boolean;
 }
 
 export type HostMessage =
@@ -202,7 +267,9 @@ export type HostMessage =
   | { type: 'focus' }
   | { type: 'showUsage' }
   /** Puts an earlier message's text in the composer for editing. */
-  | { type: 'fillComposer'; text: string };
+  | { type: 'fillComposer'; text: string }
+  /** A long message finished; the page plays a short sound if that is turned on. */
+  | { type: 'chime' };
 
 // ---- Webview → extension ----
 
@@ -244,6 +311,23 @@ export type WebviewMessage =
   | { type: 'unqueue'; id: string }
   | { type: 'continueAfterLimit'; runId: string }
   | { type: 'cancelContinuation'; runId: string }
+  | { type: 'setAgents'; agents: AgentSelection }
+  | { type: 'setEditorContext'; included: boolean }
+  | { type: 'permission'; id: string; decision: 'once' | 'run' | 'deny' }
+  | { type: 'runCommand'; command: string }
+  | { type: 'pasteCommand'; command: string }
+  | { type: 'saveCsv'; csv: string }
+  | { type: 'exportSources'; turnId: string; format: 'bibtex' | 'ris' }
+  | { type: 'exportConversation' }
+  | { type: 'preferOriginal'; turnId: string }
+  | { type: 'recheck'; turnId: string }
+  | { type: 'editBrief' }
+  | { type: 'pickFolder' }
+  | { type: 'applyFile'; runId: string; path: string }
+  | { type: 'signIn'; provider: 'claude' | 'codex' | 'gemini' }
+  | { type: 'refreshLimits' }
+  | { type: 'resolveConflict'; turnId: string; action: 'apply' | 'discard' | 'cancel' }
+  | { type: 'discardFile'; runId: string; path: string }
   /** A script error or blocked content in the webview, reported so it reaches the output log. */
   | { type: 'pageError'; message: string };
 
@@ -277,7 +361,42 @@ export function parseWebviewMessage(value: unknown): WebviewMessage | undefined 
     case 'reject':
     case 'dismissNotice':
     case 'cancelEdit':
+    case 'exportConversation':
+    case 'editBrief':
+    case 'pickFolder':
+    case 'refreshLimits':
       return { type: message.type };
+    case 'setAgents':
+      return typeof message.agents === 'string' && (AGENT_SELECTIONS as readonly string[]).includes(message.agents)
+        ? { type: 'setAgents', agents: message.agents as AgentSelection }
+        : undefined;
+    case 'signIn':
+      return message.provider === 'claude' || message.provider === 'codex' || message.provider === 'gemini' ? { type: 'signIn', provider: message.provider } : undefined;
+    case 'resolveConflict':
+      return id(message.turnId) && (message.action === 'apply' || message.action === 'discard' || message.action === 'cancel')
+        ? { type: 'resolveConflict', turnId: message.turnId, action: message.action }
+        : undefined;
+    case 'setEditorContext':
+      return typeof message.included === 'boolean' ? { type: 'setEditorContext', included: message.included } : undefined;
+    case 'permission':
+      return id(message.id) && (message.decision === 'once' || message.decision === 'run' || message.decision === 'deny')
+        ? { type: 'permission', id: message.id, decision: message.decision }
+        : undefined;
+    case 'runCommand':
+    case 'pasteCommand':
+      return text(message.command, COMMAND_LIMIT) && message.command.trim() ? { type: message.type, command: message.command } : undefined;
+    case 'saveCsv':
+      return text(message.csv, CSV_LIMIT) && message.csv.trim() ? { type: 'saveCsv', csv: message.csv } : undefined;
+    case 'exportSources':
+      return id(message.turnId) && (message.format === 'bibtex' || message.format === 'ris') ? { type: 'exportSources', turnId: message.turnId, format: message.format } : undefined;
+    case 'preferOriginal':
+    case 'recheck':
+      return id(message.turnId) ? { type: message.type, turnId: message.turnId } : undefined;
+    case 'applyFile':
+    case 'discardFile':
+      return id(message.runId) && text(message.path, 1_000) && message.path.trim() && !message.path.split(/[\\/]/).includes('..')
+        ? { type: message.type, runId: message.runId, path: message.path }
+        : undefined;
     case 'retry':
     case 'editMessage':
       return id(message.turnId) ? { type: message.type, turnId: message.turnId } : undefined;

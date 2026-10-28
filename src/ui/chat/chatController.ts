@@ -13,11 +13,13 @@ import {
   mentionAttachment,
   removeAttachmentFolder,
   storeAttachment,
+  storeFolder,
   type AttachmentSource,
 } from '../../core/attachments.js';
 import {
   continuedSessions,
   conversationHistory,
+  conversationMarkdown,
   FileConversationStore,
   missedTurns,
   newConversation,
@@ -27,10 +29,26 @@ import {
   type ConversationTurn,
 } from '../../core/conversation.js';
 import { isSmallTalk } from '../../core/about.js';
+import { parseSources, toBibtex, toRis } from '../../core/citations.js';
+import { splitCommandLine } from '../../core/commandLine.js';
 import { formatReset, type AgentLimit } from '../../core/limits.js';
-import { editsFiles } from '../../core/orchestrator.js';
-import type { AgentId, AgentOptions, AttachmentRef, OrchestratorEvent, RunRecord, StartOptions, WorkflowKind, WorktreeInfo } from '../../core/types.js';
-import { isFinished } from '../../core/types.js';
+import { editsFiles, worktreeConflict } from '../../core/orchestrator.js';
+import type {
+  AgentId,
+  AgentOptions,
+  AgentSelection,
+  AttachmentRef,
+  EditorContext,
+  OrchestratorEvent,
+  QuotaReading,
+  RunRecord,
+  StartOptions,
+  TokenUsage,
+  WorkflowKind,
+  WorktreeInfo,
+} from '../../core/types.js';
+import { AGENT_SELECTIONS, isFinished } from '../../core/types.js';
+import { describePermission, type PermissionView } from './permissions.js';
 import type { WorktreeChange } from '../../core/worktree.js';
 import {
   fileReference,
@@ -38,13 +56,14 @@ import {
   parseWebviewMessage,
   type AgentChoices,
   type ChatState,
+  type ConflictView,
   type ConsentView,
   type HostMessage,
   type ModelChoice,
   type Tone,
   type WebviewMessage,
 } from './protocol.js';
-import { applyLiveEvent, attachmentView, conversationSummaries, transcript, usageOverview, type LiveStage } from './transcript.js';
+import { applyLiveEvent, attachmentView, conversationSummaries, machineUsage, transcript, usageOverview, type LiveStage } from './transcript.js';
 
 const COMPOSER_KEY = 'dualAgent.chat.composer';
 const CURRENT_KEY = 'dualAgent.chat.current';
@@ -55,7 +74,10 @@ const PUSH_DELAY_MS = 100;
 const PAGE_ERROR_LIMIT = 20;
 /** Share of the context budget given to the conversation's earlier turns. */
 const HISTORY_SHARE = 0.3;
-const MODES: readonly WorkflowKind[] = ['chat', 'research', 'edit', 'brainstorming', 'implementation'];
+const MODES: readonly WorkflowKind[] = ['chat', 'research', 'agent', 'edit', 'tdd', 'compare', 'brainstorming', 'implementation'];
+/** A message that took this long gets a sound when it finishes, if sounds are on. */
+const CHIME_AFTER_MS = 15_000;
+const QUOTA_LABELS: Record<string, string> = { five_hour: '5-hour', weekly: 'weekly', seven_day: 'weekly' };
 const STATUS_LETTERS: Record<string, WorktreeChange['status']> = { A: 'added', M: 'modified', D: 'deleted', T: 'type-changed' };
 
 /** What the chat needs from the extension: its single-run lock, the orchestrator, settings, and commands. */
@@ -98,6 +120,32 @@ export interface ChatHost {
   checkpointWorktree(worktree: WorktreeInfo): Promise<string>;
   /** Puts the worktree back to a checkpoint, or discards it when there is no checkpoint tree. */
   rewindWorktree(worktree: WorktreeInfo, tree: string | undefined): Promise<void>;
+  /** The file, selection, and problems open in the editor, when the file is inside `folder`. */
+  editorContext(folder: string): (EditorContext & { label: string }) | undefined;
+  /** The user's project brief, or an empty string. */
+  readBrief(): Promise<string>;
+  editBrief(): Promise<void>;
+  /** Each account's usage windows, as the CLIs last reported them. */
+  quotas(): QuotaReading[];
+  /** Each CLI's sign-in, as it last said. */
+  accounts(): { provider: 'claude' | 'codex' | 'gemini'; signedIn: boolean | undefined; detail: string }[];
+  signIn(provider: 'claude' | 'codex' | 'gemini'): Promise<void>;
+  /** Asks each agent for its current limits with one small call; resolves when both answered. */
+  refreshLimits(): Promise<void>;
+  /** Tokens per local day from the CLIs' own logs, covering use outside Dual Agent, when reading them is on. */
+  machineUsage(): { days: Record<AgentId, Record<string, TokenUsage>>; scannedAt: string } | undefined;
+  /** Runs a command the user chose from agent output, after confirming it, without a shell. */
+  runCommand(folder: string, argv: string[]): Promise<{ exitCode: number; output: string; durationMs: number } | undefined>;
+  /** Puts a command into a terminal for the user to run themselves; nothing runs until they press Enter. */
+  pasteToTerminal(folder: string, command: string): void;
+  /** Saves text the user exported, with credentials masked when masking is on. */
+  saveFile(defaultName: string, content: string, filters: Record<string, string[]>): Promise<void>;
+  applyFile(runId: string, file: string): Promise<void>;
+  discardFile(runId: string, file: string): Promise<void>;
+  /** Whether finished long messages play a sound. */
+  soundEnabled(): boolean;
+  /** Whether the editor's file and selection are included by default. */
+  includeEditorByDefault(): boolean;
 }
 
 /** A message waiting for the running one to finish, or for the agents' usage limits to reset. */
@@ -111,6 +159,8 @@ interface QueuedMessage {
   web: boolean;
   /** A retried message: its run starts new sessions instead of continuing ones that saw what it replaces. */
   fresh?: boolean;
+  agents?: AgentSelection;
+  editorContext?: EditorContext;
 }
 
 function isQueuedMessage(value: unknown): value is QueuedMessage {
@@ -131,12 +181,26 @@ interface Composer {
   mode: WorkflowKind;
   options: Record<AgentId, AgentOptions>;
   web: boolean;
+  agents: AgentSelection;
+}
+
+interface PendingPermission {
+  view: PermissionView;
+  runId: string | undefined;
+  settle: (decision: { behavior: 'allow' | 'deny'; message?: string }) => void;
 }
 
 interface PendingConsent {
   view: ConsentView;
   settle: (decision: 'once' | 'conversation' | 'deny') => void;
 }
+
+interface PendingConflict {
+  view: ConflictView;
+  settle: (action: 'apply' | 'discard' | 'cancel') => void;
+}
+
+const ACCOUNT_NAMES = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini CLI' } as const;
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -166,6 +230,8 @@ export class ChatController implements vscode.Disposable {
   private composer: Composer;
   private codexModels: CodexModel[] = [];
   private consent: PendingConsent | undefined;
+  private conflict: PendingConflict | undefined;
+  private refreshingLimits = false;
   private notice: { text: string; tone: Tone } | undefined;
   /** The turn whose run is starting; the run's first update links the two. */
   private starting: { conversation: Conversation; turn: ConversationTurn } | undefined;
@@ -185,6 +251,11 @@ export class ChatController implements vscode.Disposable {
   private limitTimer: NodeJS.Timeout | undefined;
   /** The earlier message whose text is in the composer; sending replaces it. */
   private editing: { conversationId: string; turnId: string } | undefined;
+  /** An Agent-mode command or edit waiting for the user, and the tools allowed for the rest of a run. */
+  private permission: PendingPermission | undefined;
+  private readonly allowedForRun = new Map<string, Set<string>>();
+  private includeEditor: boolean | undefined;
+  private hasBrief = false;
 
   public constructor(
     private readonly host: ChatHost,
@@ -222,6 +293,7 @@ export class ChatController implements vscode.Disposable {
       mode,
       options: { claude: sanitizeAgentOptions('claude', stored.options?.claude), codex: sanitizeAgentOptions('codex', stored.options?.codex) },
       web: stored.web === true,
+      agents: stored.agents && AGENT_SELECTIONS.includes(stored.agents) ? stored.agents : 'claude-codex',
     };
   }
 
@@ -357,12 +429,30 @@ export class ChatController implements vscode.Disposable {
         options: this.composer.options,
         pending: pending.map((attachment) => attachmentView(attachment, thumbnail(attachment))),
         choices: this.choices(),
+        agents: this.composer.agents,
+        ...this.editorView(conversation?.workspacePath ?? ('blocked' in folder ? undefined : folder.path)),
       },
       queue: this.queue.map((item) => {
         const owner = item.conversationId === conversation?.id ? undefined : this.conversations.find((entry) => entry.id === item.conversationId);
         return { id: item.id, text: item.text, mode: item.mode, ...(owner ? { conversation: owner.title } : {}) };
       }),
       limits: this.host.limits().map((limit) => ({ agent: limit.agent, until: formatReset(limit.until), estimated: limit.estimated })),
+      quotas: this.host.quotas().flatMap((reading) =>
+        reading.windows.map((window) => {
+          // A window that reset since the reading starts again from nothing.
+          const reset = window.resetsAt !== undefined && Date.parse(window.resetsAt) <= Date.now();
+          return {
+            agent: reading.agent,
+            label: QUOTA_LABELS[window.name] ?? window.name.replace(/_/g, ' '),
+            usedPercent: reset ? 0 : Math.min(100, Math.max(0, window.usedPercent)),
+            ...(window.resetsAt && !reset ? { resets: formatReset(window.resetsAt) } : {}),
+          };
+        }),
+      ),
+      brief: this.hasBrief,
+      accounts: this.host.accounts().map((account) => ({ ...account, name: ACCOUNT_NAMES[account.provider] })),
+      ...this.machineView(),
+      ...(this.permission ? { permission: this.permission.view } : {}),
     };
     const edited = this.editing && conversation?.id === this.editing.conversationId ? conversation.turns.find((turn) => turn.id === this.editing?.turnId) : undefined;
     if (edited) state.composer.editing = { turnId: edited.id, preview: titleFor(edited.message) };
@@ -370,6 +460,8 @@ export class ChatController implements vscode.Disposable {
     else state.folder = conversation ? path.basename(conversation.workspacePath) : folder.name;
     if (conversation) state.conversationId = conversation.id;
     if (this.consent) state.consent = this.consent.view;
+    if (this.conflict) state.conflict = this.conflict.view;
+    if (this.refreshingLimits) state.refreshingLimits = true;
     if (this.notice) state.notice = this.notice;
     return state;
   }
@@ -425,6 +517,85 @@ export class ChatController implements vscode.Disposable {
     recordRun(turn, run);
     await this.store.save(conversation);
     await this.refreshChanges();
+    this.allowedForRun.delete(run.id);
+    const took = Date.parse(run.completedAt ?? '') - Date.parse(run.createdAt);
+    if (took >= CHIME_AFTER_MS && this.host.soundEnabled()) for (const webview of this.ready) this.post(webview, { type: 'chime' });
+    this.schedule();
+  }
+
+  /** The editor chip: which file and lines the next message includes, and whether it will. */
+  private editorView(folder: string | undefined): { editor?: { label: string; included: boolean } } {
+    const context = folder ? this.host.editorContext(folder) : undefined;
+    return context ? { editor: { label: context.label, included: this.includeEditor ?? this.host.includeEditorByDefault() } } : {};
+  }
+
+  /** Called when the active editor or its selection changes, so the chip follows it. */
+  public editorChanged(): void {
+    this.schedule();
+  }
+
+  /**
+   * Asks the user about an Agent-mode command or edit: a card in the chat, or a dialog when the chat is
+   * hidden. A tool allowed "for this message" is not asked about again until the run ends.
+   */
+  public async askPermission(request: { toolName: string; input: Record<string, unknown> }): Promise<{ behavior: 'allow' | 'deny'; message?: string }> {
+    await this.load();
+    const runId = this.activeRunId();
+    if (runId && this.allowedForRun.get(runId)?.has(request.toolName)) return { behavior: 'allow' };
+    const run = runId ? this.runs.get(runId) : undefined;
+    const folder = run?.worktree?.workingDirectory ?? run?.workspacePath ?? process.cwd();
+    const view = describePermission(randomUUID(), request.toolName, request.input, folder);
+    if (this.permission) this.permission.settle({ behavior: 'deny', message: 'Another request replaced this one.' });
+    const decision = new Promise<{ behavior: 'allow' | 'deny'; message?: string }>((resolve) => {
+      this.permission = { view, runId, settle: resolve };
+    });
+    this.schedule();
+    if (!this.visible()) void this.askInDialog(view);
+    const result = await decision;
+    this.permission = undefined;
+    this.schedule();
+    return result;
+  }
+
+  private async askInDialog(view: PermissionView): Promise<void> {
+    const detail = [view.detail, ...view.warnings.map((warning) => `\u26a0 ${warning}`)].filter(Boolean).join('\n\n');
+    const choice = await vscode.window.showWarningMessage(`An agent wants to ${view.summary}.`, { modal: true, detail }, 'Allow', 'Allow for This Message');
+    if (this.permission?.view.id !== view.id) return;
+    this.decidePermission(view.id, choice === 'Allow' ? 'once' : choice === 'Allow for This Message' ? 'run' : 'deny');
+  }
+
+  private decidePermission(id: string, decision: 'once' | 'run' | 'deny'): void {
+    const pending = this.permission;
+    if (!pending || pending.view.id !== id) return;
+    if (decision === 'run' && pending.runId) {
+      const allowed = this.allowedForRun.get(pending.runId) ?? new Set<string>();
+      allowed.add(pending.view.tool);
+      this.allowedForRun.set(pending.runId, allowed);
+    }
+    pending.settle(decision === 'deny' ? { behavior: 'deny', message: 'The user declined this. Ask them or find another way.' } : { behavior: 'allow' });
+  }
+
+  /** Puts text in the composer, optionally in a given mode, for commands such as Fix with Dual Agent. */
+  public async prefill(text: string, mode?: WorkflowKind): Promise<void> {
+    await this.load();
+    if (mode) {
+      this.composer.mode = mode;
+      this.saveComposer();
+    }
+    for (const webview of this.webviews.keys()) this.post(webview, { type: 'fillComposer', text });
+    this.schedule();
+  }
+
+  /** Re-reads whether a project brief exists, for the header button. */
+  private machineView(): Pick<ChatState, 'machine'> {
+    const usage = this.host.machineUsage();
+    if (!usage) return {};
+    const updated = new Date(usage.scannedAt);
+    return { machine: { periods: machineUsage(usage.days, new Date()), updated: updated.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) } };
+  }
+
+  public async refreshBrief(): Promise<void> {
+    this.hasBrief = Boolean((await this.host.readBrief().catch(() => '')).trim());
     this.schedule();
   }
 
@@ -576,6 +747,24 @@ export class ChatController implements vscode.Disposable {
     }
   }
 
+  /** Attaches a whole folder, such as a set of papers, copied within the archive limits. */
+  private async pickFolder(): Promise<void> {
+    const picked = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, openLabel: 'Attach Folder', title: 'Attach a folder to your message' });
+    const source = picked?.[0]?.fsPath;
+    if (!source) return;
+    const conversation = this.ensureConversation();
+    const list = this.pending.get(conversation.id) ?? [];
+    this.pending.set(conversation.id, list);
+    this.show(`Copying ${path.basename(source)}…`, 'neutral');
+    try {
+      list.push(await storeFolder(this.conversationFolder(conversation), source, { extractPdfText: (data) => this.host.extractPdfText(data) }));
+      this.notice = undefined;
+    } catch (error) {
+      this.show(`${path.basename(source)} could not be attached: ${message(error)}`, 'bad');
+    }
+    this.schedule();
+  }
+
   private async pickFiles(): Promise<void> {
     const picked = await vscode.window.showOpenDialog({ canSelectMany: true, openLabel: 'Attach', title: 'Attach files to your message' });
     if (picked?.length) await this.addAttachments(picked.map((uri) => ({ name: path.basename(uri.fsPath), path: uri.fsPath })));
@@ -626,6 +815,26 @@ export class ChatController implements vscode.Disposable {
     return decision !== 'deny';
   }
 
+  /**
+   * Asks what to do with changes the new message's mode cannot continue: apply or discard an isolated copy, or
+   * keep or undo direct edits. The message goes ahead once they are dealt with; true when it can.
+   */
+  private async settleConflict(conversation: Conversation, turn: ConversationTurn, worktree: WorktreeInfo, text: string): Promise<boolean> {
+    const owner = [...conversation.turns].reverse().find((item) => item.runId && this.runs.get(item.runId)?.worktree?.path === worktree.path)?.runId;
+    if (!owner) return false;
+    const action = await new Promise<'apply' | 'discard' | 'cancel'>((resolve) => {
+      this.conflict = { view: { turnId: turn.id, text: `${text.charAt(0).toUpperCase()}${text.slice(1)}`, direct: Boolean(worktree.gitDir) }, settle: resolve };
+      this.schedule();
+      if (!this.visible()) void vscode.commands.executeCommand('dualAgent.chat.focus');
+    });
+    this.conflict = undefined;
+    this.schedule();
+    if (action === 'cancel') return false;
+    // The commands confirm first and mark every run that shared the changes.
+    await vscode.commands.executeCommand(action === 'apply' ? 'dualAgent.applyChanges' : 'dualAgent.discardChanges', owner);
+    return worktreeConflict(turn.mode, await this.conversationWorktree(conversation)) === undefined;
+  }
+
   /** The active worktree a new edit turn of this conversation keeps working in. */
   private async conversationWorktree(conversation: Conversation): Promise<WorktreeInfo | undefined> {
     for (const turn of [...conversation.turns].reverse()) {
@@ -653,7 +862,11 @@ export class ChatController implements vscode.Disposable {
       attachments: this.pending.get(conversation.id) ?? [],
       agentOptions: { claude: { ...this.composer.options.claude }, codex: { ...this.composer.options.codex } },
       web: this.composer.web || mode === 'research',
+      agents: this.composer.agents,
     };
+    const editor = (this.includeEditor ?? this.host.includeEditorByDefault()) ? this.host.editorContext(conversation.workspacePath) : undefined;
+    // The label is only for the chip; the run keeps the file, lines, selection, and problems.
+    if (editor) item.editorContext = { file: editor.file, ...(editor.startLine ? { startLine: editor.startLine, endLine: editor.endLine ?? editor.startLine } : {}), ...(editor.selection ? { selection: editor.selection } : {}), ...(editor.diagnostics ? { diagnostics: editor.diagnostics } : {}) };
     this.pending.delete(conversation.id);
     const waitFor = this.waitReason();
     if (waitFor) {
@@ -757,6 +970,7 @@ export class ChatController implements vscode.Disposable {
       agentOptions: { claude: { ...this.composer.options.claude }, codex: { ...this.composer.options.codex } },
       web: this.composer.web || turn.web === true || (mode ?? turn.mode) === 'research',
       fresh: true,
+      agents: this.composer.agents,
     });
   }
 
@@ -809,6 +1023,16 @@ export class ChatController implements vscode.Disposable {
     await this.save(conversation);
     this.schedule();
 
+    const waiting = editsFiles(mode) ? await this.conversationWorktree(conversation) : undefined;
+    const conflict = worktreeConflict(mode, waiting);
+    if (conflict && waiting && !(await this.settleConflict(conversation, turn, waiting, conflict))) {
+      turn.status = 'cancelled';
+      turn.outcome = `Not started: ${conflict}`;
+      await this.save(conversation);
+      this.schedule();
+      return;
+    }
+
     const allowWrites = editsFiles(mode) && (await this.askConsent(conversation, turn));
     if (editsFiles(mode) && !allowWrites) {
       turn.status = 'cancelled';
@@ -836,7 +1060,11 @@ export class ChatController implements vscode.Disposable {
           ...(Object.keys(catchUp).length ? { catchUp } : {}),
           ...(worktree ? { worktree } : {}),
           ...(turn.web ? { web: true } : {}),
+          ...(item.agents ? { agents: item.agents } : {}),
+          ...(item.editorContext && !smallTalk ? { editorContext: item.editorContext } : {}),
         };
+        const brief = smallTalk ? '' : await this.host.readBrief().catch(() => '');
+        if (brief.trim()) options.brief = brief;
         const finished = await this.host.start(mode, turn.message, conversation.workspacePath, allowWrites, options);
         // The turn shows its answer and changes only once the finished run has been recorded on it.
         await this.finishing.get(finished.id);
@@ -970,7 +1198,105 @@ export class ChatController implements vscode.Disposable {
         break;
       case 'stop':
         this.consent?.settle('deny');
+        this.conflict?.settle('cancel');
+        this.permission?.settle({ behavior: 'deny', message: 'The user stopped the message.' });
         this.host.cancel();
+        return;
+      case 'resolveConflict':
+        if (this.conflict?.view.turnId === incoming.turnId) this.conflict.settle(incoming.action);
+        return;
+      case 'signIn':
+        await this.host.signIn(incoming.provider);
+        return;
+      case 'refreshLimits':
+        if (this.refreshingLimits) return;
+        this.refreshingLimits = true;
+        this.schedule();
+        try {
+          await this.host.refreshLimits();
+        } finally {
+          this.refreshingLimits = false;
+          this.schedule();
+        }
+        return;
+      case 'setAgents':
+        this.composer.agents = incoming.agents;
+        this.saveComposer();
+        break;
+      case 'setEditorContext':
+        this.includeEditor = incoming.included;
+        break;
+      case 'permission':
+        this.decidePermission(incoming.id, incoming.decision);
+        return;
+      case 'runCommand': {
+        const split = splitCommandLine(incoming.command);
+        if ('error' in split) {
+          this.show(split.error, 'warn');
+          return;
+        }
+        const folder = this.current?.workspacePath ?? ('blocked' in this.host.folder() ? undefined : (this.host.folder() as { path: string }).path);
+        if (!folder) return;
+        const result = await this.host.runCommand(folder, split.argv);
+        if (!result) return;
+        const output = `$ ${split.argv.join(' ')}\n(exit code ${result.exitCode}, ${(result.durationMs / 1000).toFixed(1)} s)\n\n${result.output}`;
+        await this.addAttachments([{ name: 'command-output.txt', data: new TextEncoder().encode(output) }]);
+        this.show(`\`${split.argv[0] ?? ''}\` exited with code ${result.exitCode}. Its output is attached to your next message.`, result.exitCode === 0 ? 'good' : 'warn');
+        return;
+      }
+      case 'pasteCommand': {
+        const folder = this.current?.workspacePath ?? ('blocked' in this.host.folder() ? undefined : (this.host.folder() as { path: string }).path);
+        if (folder) this.host.pasteToTerminal(folder, incoming.command);
+        return;
+      }
+      case 'saveCsv':
+        await this.host.saveFile('table.csv', incoming.csv, { 'CSV table': ['csv'] });
+        return;
+      case 'exportSources': {
+        const turn = this.current?.turns.find((item) => item.id === incoming.turnId);
+        const run = turn?.runId ? this.runs.get(turn.runId) : undefined;
+        const final = run ? [...run.stages].reverse().find((stage) => stage.status === 'completed' && !stage.review && stage.result?.text) : undefined;
+        const sources = parseSources(final?.result?.text ?? turn?.answer ?? '');
+        if (!sources.length) {
+          this.show('This answer has no sources to export.');
+          return;
+        }
+        if (incoming.format === 'bibtex') await this.host.saveFile('sources.bib', toBibtex(sources), { BibTeX: ['bib'] });
+        else await this.host.saveFile('sources.ris', toRis(sources), { RIS: ['ris'] });
+        return;
+      }
+      case 'exportConversation':
+        if (!this.current?.turns.length) {
+          this.show('There is nothing to export yet.');
+          return;
+        }
+        await this.host.saveFile(`${titleFor(this.current.title).replace(/[^\w.-]+/g, '-').slice(0, 60) || 'conversation'}.md`, conversationMarkdown(this.current), { Markdown: ['md'] });
+        return;
+      case 'preferOriginal': {
+        const turn = this.current?.turns.find((item) => item.id === incoming.turnId);
+        const run = turn?.runId ? this.runs.get(turn.runId) : undefined;
+        const original = run?.stages.find((stage) => !stage.review && stage.status === 'completed' && stage.result?.text);
+        if (!this.current || !turn || !original?.result) return;
+        turn.answer = original.result.text;
+        turn.outcome = 'You kept the original answer';
+        await this.save(this.current);
+        this.show('Later messages build on the original answer.', 'neutral');
+        break;
+      }
+      case 'recheck':
+        await this.submit('Check the revised answer above again, against the files and sources themselves, and say plainly what still does not hold.', 'chat');
+        return;
+      case 'editBrief':
+        await this.host.editBrief();
+        return;
+      case 'pickFolder':
+        await this.pickFolder();
+        return;
+      case 'applyFile':
+        await this.host.applyFile(incoming.runId, incoming.path);
+        return;
+      case 'discardFile':
+        await this.host.discardFile(incoming.runId, incoming.path);
         return;
       case 'newConversation':
         await this.newConversation();
@@ -1133,6 +1459,7 @@ export class ChatController implements vscode.Disposable {
   public dispose(): void {
     if (this.pushTimer) clearTimeout(this.pushTimer);
     this.consent?.settle('deny');
+    this.permission?.settle({ behavior: 'deny', message: 'VS Code is closing.' });
     this.webviews.clear();
   }
 }

@@ -137,7 +137,7 @@ export function stageIcon(stage: StageRecord): IconSpec {
 export function stageDescription(stage: StageRecord): string {
   const parts = [
     stage.assignedAgent === stage.agent ? stage.assignedAgent : `${stage.assignedAgent} (fallback)`,
-    stage.permission === 'workspace-write' ? 'edits files' : 'read-only',
+    stage.permission === 'agent' ? 'runs commands' : stage.permission === 'workspace-write' ? 'edits files' : 'read-only',
   ];
   if (stage.verdict) parts.push(summarizeVerdict(stage.verdict));
   if (stage.checks?.length) parts.push(checksPassed(stage.checks) ? 'checks passed' : 'checks failed');
@@ -196,23 +196,40 @@ export interface ConsentSettings {
   setupCommands: readonly (readonly string[])[];
   verificationCommands: readonly (readonly string[])[];
   maxFixRounds: number;
+  /** Whether Codex's sandbox may reach the network in Agent mode. */
+  codex?: { codexAgentNetwork?: boolean };
 }
 
 function commandList(commands: readonly (readonly string[])[]): string {
   return commands.map((command) => command.join(' ')).join(', ');
 }
 
+/** What Agent mode may do, which differs from the isolated editing of the other modes. */
+function agentConsent(settings: ConsentSettings, folder: string): string[] {
+  return [
+    `The lead agent works in ${folder} itself, on your machine, as Claude Code or Codex do in a terminal: it can run commands, install packages, and edit files.`,
+    'Claude asks you before each command or edit it does not judge read-only. Codex cannot ask first, so when Codex leads it works inside its own sandbox, which can write only in the folder' +
+      (settings.codex?.codexAgentNetwork === false ? ' and cannot reach the network.' : ' but can reach the network to install packages.'),
+    'Dual Agent takes a snapshot of the folder first, so file changes can be undone from the chat. Installed software and other effects outside the folder cannot be undone.',
+    'When the work is done, the other agent checks the result.',
+  ];
+}
+
 /** The facts the user consents to before a run edits files. */
 export function consentDetail(settings: ConsentSettings, folder: string, resuming: boolean, kind: WorkflowKind = 'implementation'): string {
-  const lines = [
-    settings.isolation === 'worktree'
-      ? `Agents edit an isolated Git worktree of ${folder}. When the run ends you review the diff and choose whether to apply it.`
-      : `Agents edit files in ${folder} directly (dualAgent.isolation.mode is "none").`,
-  ];
+  const lines =
+    kind === 'agent'
+      ? agentConsent(settings, folder)
+      : [
+          settings.isolation === 'worktree'
+            ? `Agents edit an isolated Git worktree of ${folder}. When the run ends you review the diff and choose whether to apply it. A folder without Git is edited directly after a snapshot instead, and you keep or undo the changes.`
+            : `Agents edit files in ${folder} directly (dualAgent.isolation.mode is "none").`,
+        ];
   if (kind === 'implementation' && settings.approvePlan && !resuming) lines.push('You approve the plan and its review before any file is edited.');
   if (kind === 'edit') lines.push('Claude makes the change, then Codex reviews the diff.');
-  if (settings.maxFixRounds > 0) {
-    lines.push(`If ${kind === 'edit' ? "Codex's review" : 'the final verification'} fails, Claude gets up to ${settings.maxFixRounds} fix round(s).`);
+  if (kind === 'tdd') lines.push('Codex writes failing tests for the behavior, Claude makes them pass, then Codex reviews.');
+  if (settings.maxFixRounds > 0 && kind !== 'agent') {
+    lines.push(`If ${kind === 'edit' || kind === 'tdd' ? "Codex's review" : 'the final verification'} fails, Claude gets up to ${settings.maxFixRounds} fix round(s).`);
   }
   if (settings.setupCommands.length) lines.push(`Before the first stage, the extension runs in the worktree: ${commandList(settings.setupCommands)}.`);
   if (settings.verificationCommands.length) {

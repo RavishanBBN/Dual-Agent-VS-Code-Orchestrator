@@ -1,12 +1,14 @@
 /** Builds what the chat shows from conversations, runs, and live agent activity. No VS Code imports. */
+import { parseSources } from '../../core/citations.js';
+import { classifyFailure } from '../../core/errors.js';
 import { formatSize } from '../../core/context.js';
 import type { Conversation, ConversationTurn } from '../../core/conversation.js';
 import { describeOutcome, finalStage } from '../../core/conversation.js';
 import { formatReset } from '../../core/limits.js';
 import { canResume } from '../../core/orchestrator.js';
 import type { AgentActivity, AgentId, AgentStreamEvent, AttachmentRef, RunRecord, StageRecord, TokenUsage } from '../../core/types.js';
-import { checksPassed, isFinished } from '../../core/types.js';
-import { sumByAgent, totalTokens } from '../../core/usage.js';
+import { checksPassed, emptyUsage, isFinished } from '../../core/types.js';
+import { addUsage, localDay, sumByAgent, totalTokens } from '../../core/usage.js';
 import { onlyMinorFindings, summarizeVerdict } from '../../core/verdict.js';
 import type { WorktreeChange } from '../../core/worktree.js';
 import { describeCheck, relativeTime } from '../presentation.js';
@@ -68,6 +70,8 @@ export interface TranscriptInput {
 }
 
 const AGENT_NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
+/** Notes shown under a message; a run rarely has more. */
+const WARNING_LIMIT = 8;
 
 export function usageNumbers(usage: TokenUsage): UsageNumbers {
   return {
@@ -116,6 +120,18 @@ export function usageOverview(conversation: Conversation | undefined, window: Us
     period('Last 7 days', since(window.weekStartMs).map((run) => run.usage)),
     period('All runs', runs.map((run) => run.usage)),
   ];
+}
+
+/**
+ * Every use of Claude Code and Codex on this machine today and in the last seven days, from the CLIs' own logs:
+ * terminals, other editors, and Dual Agent alike. `days` holds tokens per local day.
+ */
+export function machineUsage(days: Record<AgentId, Record<string, TokenUsage>>, now: Date): UsagePeriod[] {
+  const keys = Array.from({ length: 7 }, (_, index) => localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - index)));
+  const sum = (agent: AgentId, chosen: string[]): TokenUsage => chosen.reduce((total, key) => addUsage(total, days[agent][key] ?? emptyUsage()), emptyUsage());
+  const active = (chosen: string[]): number => chosen.filter((key) => days.claude[key] || days.codex[key]).length;
+  const period = (label: string, chosen: string[]): UsagePeriod => ({ label, runs: active(chosen), usage: byAgent({ claude: sum('claude', chosen), codex: sum('codex', chosen) }) });
+  return [period('Today', keys.slice(0, 1)), period('Last 7 days', keys)];
 }
 
 export function attachmentView(attachment: AttachmentRef, thumbnail?: string): AttachmentView {
@@ -177,6 +193,7 @@ function stageViews(run: RunRecord, live: ReadonlyMap<string, LiveStage> | undef
     }
     if (stage.error) view.error = stage.error;
     if (stage.fallbackReason) view.fallback = stage.fallbackReason;
+    if (stage.referee) view.referee = { name: stage.referee.referee, text: stage.referee.text, ...(stage.referee.error ? { error: stage.referee.error } : {}) };
     const took = duration(stage);
     if (took) view.duration = took;
     if (stage.result && totalTokens(stage.result.usage) > 0) view.usage = usageNumbers(stage.result.usage);
@@ -202,9 +219,38 @@ function turnView(turn: ConversationTurn, input: TranscriptInput, latestEditRun:
     canResume: run !== undefined && !active && canResume(run),
     canRetry: Boolean(input.idle) && !active && (run !== undefined ? isFinished(run.status) : turn.status !== undefined),
   };
-  if (run && !active && run.status === 'failed' && run.limitReset) {
+  if (run && !active) {
+    // A check made the lead agent revise: the first answer and the revision, for the side-by-side view.
+    const revision = run.stages.find((stage) => stage.id === 'claude-revise' && stage.status === 'completed' && stage.result?.text);
+    const reviseAt = revision ? run.stages.indexOf(revision) : -1;
+    const check = reviseAt > 0 ? [...run.stages.slice(0, reviseAt)].reverse().find((stage) => stage.review && stage.status === 'completed') : undefined;
+    const original = check ? [...run.stages.slice(0, run.stages.indexOf(check))].reverse().find((stage) => !stage.review && stage.status === 'completed' && stage.result?.text) : undefined;
+    if (revision?.result && check && original?.result) {
+      view.comparison = {
+        original: original.result.text,
+        revised: revision.result.text,
+        checker: AGENT_NAMES[check.assignedAgent],
+        reviser: AGENT_NAMES[revision.assignedAgent],
+      };
+    }
+    const sources = parseSources(finalStage(run)?.result?.text ?? '');
+    if (sources.length) view.sources = sources;
+  }
+  // A CLI that is not signed in fails with the provider's own words; the turn offers to sign in to it.
+  if (run && !active && run.status === 'failed' && run.error && classifyFailure(run.error) === 'authentication') {
+    const failed = run.stages.find((stage) => stage.status === 'failed');
+    if (failed) view.signIn = failed.assignedAgent;
+  }
+  // Such as a folder edited directly, or a subfolder its snapshot cannot undo.
+  if (run?.warnings?.length) view.warnings = run.warnings.slice(0, WARNING_LIMIT);
+  if (run && !active && run.status === 'failed' && (run.limitReset || run.offlineSince)) {
     const continuesAt = input.continuation?.(run.id);
-    view.paused = { runId: run.id, reset: formatReset(run.limitReset), ...(continuesAt ? { continuesAt: formatReset(continuesAt) } : {}) };
+    view.paused = {
+      runId: run.id,
+      reset: run.limitReset ? formatReset(run.limitReset) : '',
+      ...(continuesAt ? { continuesAt: formatReset(continuesAt) } : {}),
+      ...(run.offlineSince && !run.limitReset ? { offline: true } : {}),
+    };
   }
   if (turn.runId) view.runId = turn.runId;
   if (run && !active) view.outcome = { text: describeOutcome(run), tone: toneOf(run) };
@@ -225,7 +271,7 @@ function turnView(turn: ConversationTurn, input: TranscriptInput, latestEditRun:
     // The worktree is shared by the conversation's edit turns, so only the latest one shows its changes.
     if (run.worktree && run.id === latestEditRun && !active) {
       const files = (input.changes.get(run.id) ?? []).map((change) => ({ path: change.path, status: CHANGE_LETTERS[change.status] }));
-      view.changes = { runId: run.id, files, state: run.worktree.state };
+      view.changes = { runId: run.id, files, state: run.worktree.state, direct: Boolean(run.worktree.gitDir) };
     }
   }
   return view;
@@ -245,6 +291,7 @@ export function conversationSummaries(conversations: readonly Conversation[], no
     title: conversation.title,
     updated: relativeTime(conversation.updatedAt, nowMs),
     turns: conversation.turns.length,
+    search: [conversation.title, ...conversation.turns.map((turn) => turn.message)].join('\n').slice(0, 2_000).toLowerCase(),
   }));
 }
 
