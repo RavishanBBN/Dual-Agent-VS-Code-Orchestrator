@@ -6,17 +6,18 @@ This document is the maintained implementation ledger for Dual Agent Orchestrato
 
 | Field | Value |
 |---|---|
-| Release | 2.2.0 (Research mode with web access, lean context, evidence trails, and first-shot edits) |
+| Release | 2.3.0 (Marketplace-ready: solo mode at usage limits, automatic continuation, message queue, retry and edit, secret masking, Trusted Types, signed releases) |
 | Last updated | 2026-10-28 |
 | Product scope | Desktop VS Code extension, trusted local workspaces only |
 | Interface | Chat webview (side bar or editor tab); native Runs and Agents views, commands, status bar, output channel, read-only documents, diff editors |
-| Primary workflow | Chat: Claude answers, Codex checks the answer, Claude revises when the check fails |
+| Primary workflow | Chat: Claude answers, Codex checks the answer, Claude revises when the check fails; one agent carries on alone while the other is at its usage limit |
 | Other workflows | Research (web research, Codex source verification, revision); Edit (worktree edit, Codex review gate, fix rounds); Claude-led implementation with plan approval and a verified final gate; reciprocal brainstorming |
 | Runtime integration | Local Claude Code and Codex CLIs, resolved to absolute paths outside the workspace and worktree |
 | Authentication | Existing CLI sign-ins; credentials are not read by the extension |
 | Agent environment | Allowlisted; billing variables removed in subscription mode |
 | State | Private VS Code workspace storage: conversations, attachments, run history, worktrees |
-| Network service | None; the chat page loads nothing from the network |
+| Network service | None; the chat page loads nothing from the network, and there is no telemetry |
+| Distribution | Visual Studio Marketplace and Open VSX as `NileshRavishan.dual-agent-orchestrator`, published by tag through OpenID Connect trusted publishing (first Marketplace version uploaded by hand until the Marketplace accepts it) |
 
 ## Delivery progress
 
@@ -46,12 +47,33 @@ This document is the maintained implementation ledger for Dual Agent Orchestrato
 | Durable state | Complete | Serialized saves, locked-file retry, unreadable files set aside, unapplied work never pruned |
 | Usage observation | Complete | Per-provider totals including failed attempts, with input counted the same way for both agents; shown per stage, per message, and for the conversation, today, 7 days, and all runs |
 | Bounded provider fallback | Complete | Classified from provider errors and stderr only; fresh snapshot |
+| Usage limits and solo mode | Complete | Reset times parsed from provider messages, estimates with backoff, limited agent skipped until reset, catch-up for continued sessions, answers by role |
+| Automatic continuation | Complete | Paused runs continue after the reset, survive restarts, retry while busy, and edit runs continue only with unchanged commands |
+| Message queue | Complete | Persisted, bounded, removable items; drained when the lock is free and the agents can work |
+| Retry and edit | Complete | Later turns removed, worktree restored from a Git-tree checkpoint or discarded, fresh sessions, confirmation when rewinding past later messages |
+| Secret masking | Complete | Credentials masked in prompts, the output log, and exported reports |
+| Marketplace readiness | Complete | Publisher, icon, screenshots from the real bundle, walkthrough, categories, repository links, clean `vsce package`, Delete All History command |
+| Supply chain and release | Complete | SHA-pinned actions, `npm audit` and `npm audit signatures`, CodeQL, Dependabot with cooldown, tag release with checksums, build provenance, and OIDC publishing |
 | Report export | Complete | Markdown report with verdicts, checks, isolation, approval, attachments, warnings |
-| Unit and integration tests | Complete | Fake-CLI adapter and check tests, real-Git snapshot and worktree tests, attachment tests with real pdf.js, chat protocol, Markdown, and transcript tests |
-| CI and packaging | Complete | Windows/Linux checks and VSIX artifact workflow |
-| Documentation | Complete | README, architecture, workflow, security, operations, development, roadmap, ADRs 0001 to 0007 |
+| Unit and integration tests | Complete | Fake-CLI adapter and check tests, real-Git snapshot, worktree, and checkpoint tests, attachment tests with real pdf.js, chat protocol, Markdown, Trusted Types, and transcript tests, limit parsing, solo mode, continuation, and masking tests |
+| CI and packaging | Complete | Windows/Linux checks, supply-chain job, CodeQL, VSIX artifact, and tag-triggered release workflow |
+| Documentation | Complete | Marketplace README, walkthrough, architecture, workflow, security, operations, development and release, roadmap, ADRs 0001 to 0009, issue and pull-request templates |
 
 ## Verification record
+
+Results of the 2.3.0 verification on Windows 11 with Node.js 22.13.0 and VS Code 1.143.1:
+
+| Check | Result | Notes |
+|---|---|---|
+| Dependency audit | Passed | `npm audit`: 0 vulnerabilities; `npm audit signatures`: 439 packages with verified registry signatures, 73 with verified attestations |
+| TypeScript and ESLint | Passed | Strict `tsc --noEmit`; type-aware ESLint with zero findings |
+| Unit and integration tests | Passed | 240 passed, 1 skipped (POSIX-only symlink test), 20 files, coverage thresholds met |
+| Smoke test in VS Code | Passed | Everything from 2.2.0, plus: the extension activated under its Marketplace ID; a second Edit message was edited and resent, its file was undone from the checkpoint, and Claude started a new session; a message sent during a run waited in the queue and then ran by itself; the chat page reported no script errors or blocked content under Trusted Types; the walkthrough opened |
+| Workflow lint | Passed | The GitHub Actions extension reported no problems in `ci.yml`, `codeql.yml`, or `release.yml`; action SHAs checked against their tags with `git ls-remote` |
+| VSIX package | Passed | `dual-agent-orchestrator-2.3.0.vsix`, 18 files, 753 KB, `vsce package` without bypass flags and with no warnings; docs and screenshots excluded |
+| Screenshots | Rendered | From the built chat bundle in headless Chrome: chat (dark), edit with changes (light), usage panel, and solo mode with the limit banner and queue |
+| Live usage-limit behavior | Not run | Reset parsing is tested against the wording both CLIs have used; a real limit was not reached during verification |
+| Live release | Not run | The release workflow runs when a version tag is pushed, after the trusted publishers are set up on both registries |
 
 Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0, VS Code 1.143.1, Claude Code 2.1.312, and Codex CLI 0.165.0:
 
@@ -101,7 +123,11 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 - [x] VSIX packaging passes.
 - [x] Live chat, follow-up, and edit messages pass with signed-in CLIs.
 - [x] CI passes on Windows and Linux for 2.1.0.
+- [x] Usage limits reroute or pause work and never change permissions; automatic continuation of an edit run needs unchanged commands.
+- [x] Retrying a message never changes files outside the extension's worktree storage.
+- [x] `vsce package` passes without bypass flags, and the VSIX contains no docs, sources, or screenshots.
 - [ ] Signed-in implementation run from the chat with plan approval, verification commands, review, and apply.
+- [ ] First tagged release published to the Marketplace and Open VSX by the release workflow.
 
 ## Known risks
 
@@ -118,6 +144,11 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 11. The webview relies on VS Code's webview isolation, in addition to its own CSP and message validation.
 12. Model output can be wrong even after reciprocal review and passing checks. Human diff review remains mandatory.
 13. Full workflows and fix rounds are intentionally expensive; a chat message costs two or three agent calls.
+14. In solo mode one agent checks its own answer, which is weaker than an independent check. Stages are labelled as standing in, and `dualAgent.fallbackOnQuota` turns it off.
+15. Reset times are parsed from provider wording that can change; unrecognized wording falls back to estimated retries.
+16. An automatic continuation can run an edit and its verification commands without a new prompt, limited to unchanged commands; `dualAgent.limits.autoContinue` turns it off.
+17. Secret masking recognizes known credential formats only.
+18. Retry checkpoints are unreferenced Git objects that `git gc` can remove after its prune period; a retry whose checkpoint is gone stops without changing anything.
 
 ## Next verification action
 
@@ -129,3 +160,6 @@ With signed-in CLIs, install the VSIX and test in a disposable Git repository:
 4. Stop a message while a stage runs, then resume it from the chat.
 5. Apply a second edit over a conflicting change, and confirm that nothing is written.
 6. Check the chat in a light theme and in the right-hand side bar.
+7. Queue a message during a run, and retry an earlier Edit message; confirm the worktree matches the checkpoint.
+8. When a real usage limit is reached, confirm the banner shows the provider's reset time and that the other agent carries on.
+9. Set up trusted publishing on both registries, push the `v2.3.0` tag, and verify the release's attestation with `gh attestation verify`.

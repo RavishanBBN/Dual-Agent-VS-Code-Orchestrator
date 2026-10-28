@@ -1,0 +1,109 @@
+name: Release
+
+# Push a tag such as v2.3.0 that matches package.json. Nothing long-lived is stored in the repository: both
+# registries trust this workflow through OpenID Connect, which gives the publish job a short-lived token. Set up
+# the trusted publisher once on each registry first (docs/DEVELOPMENT.md, "Releasing").
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No dependency cache: a release is built only from the lockfile.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Check that the tag matches the version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${version}."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm audit signatures
+      - run: npm run package
+      - name: Checksums
+        run: sha256sum ./*.vsix > SHA256SUMS.txt
+      - name: Build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: '*.vsix'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            *.vsix
+            SHA256SUMS.txt
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      # Exchanged with each registry for a short-lived publishing token.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # Only the publishing tool is needed here, so no install script runs while the job can mint tokens.
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      # The exact package the build job attested is published; nothing is rebuilt here. Either registry may
+      # not trust this workflow yet (see docs/DEVELOPMENT.md); the release still completes, and the summary
+      # says which VSIX to upload by hand.
+      - name: Publish to the Visual Studio Marketplace
+        id: marketplace
+        continue-on-error: true
+        run: npx vsce publish --oidc --skip-duplicate --packagePath ./*.vsix
+      # Open VSX serves VSCodium, Cursor, Gitpod, and other editors.
+      - name: Publish to Open VSX
+        id: openvsx
+        continue-on-error: true
+        run: npx --yes ovsx@1.2.0 publish --trusted-publishing --skip-duplicate ./*.vsix
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            *.vsix
+            SHA256SUMS.txt
+          generate_release_notes: true
+      - name: Summary
+        env:
+          MARKETPLACE: ${{ steps.marketplace.outcome }}
+          OPENVSX: ${{ steps.openvsx.outcome }}
+        run: |
+          {
+            echo "## Published ${GITHUB_REF_NAME}"
+            echo "- Visual Studio Marketplace: ${MARKETPLACE}"
+            echo "- Open VSX: ${OPENVSX}"
+            echo
+            echo "A registry that shows failure did not get this version. Upload the VSIX from the GitHub release by hand, as docs/DEVELOPMENT.md describes."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MARKETPLACE" != success ]; then echo "::warning::The Marketplace did not accept trusted publishing; upload the VSIX by hand."; fi
+          if [ "$OPENVSX" != success ]; then echo "::warning::Open VSX did not accept trusted publishing; publish the VSIX by hand."; fi

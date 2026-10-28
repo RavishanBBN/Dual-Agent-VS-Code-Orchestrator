@@ -2,6 +2,51 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
+## [2.3.0] - 2026-10-28
+
+Ready for the Visual Studio Marketplace and Open VSX. Work continues through usage limits, messages can be queued, and any earlier message can be retried or edited.
+
+### Added
+
+- **Solo mode at usage limits.**
+  - **Limits are remembered.** When an agent reports a usage limit or exhausted credits, the extension records when the limit resets, reading the provider's message ("resets 3pm", "try again in 2 hours 13 minutes", Unix or ISO times).
+  - **The other agent takes over.** Until the reset, that agent's stages go straight to the other agent, without failing first. The stage is marked as standing in.
+  - **The limited agent rejoins and catches up.** After the reset it is tried again. A continued Claude session is given the turns it missed, which the other agent answered alone.
+  - **Estimated resets.** When the provider gives no reset time, the agent is tried again after 15 minutes, then 30, 60, and 120.
+  - **Persistence.** Limits are kept in global state, because they belong to the account.
+- **Continue after the limits reset.**
+  - **Pausing.** When both agents are at their limits, the message or run stops with the reset time and a **Paused at the usage limits** card.
+  - **Automatic continuation.** By default (`dualAgent.limits.autoContinue`) it continues by itself a minute after the first reset, from where it stopped, and survives a restart of VS Code.
+  - **Manual control.** **Continue now** and **Do not continue** are on the card and in the notification.
+  - **Consent.** A run that edits files continues on its own only if its setup and verification commands are unchanged since you allowed it.
+- **Message queue.**
+  - **Queueing.** Messages sent while another runs, or while both agents are at their limits, wait in a queue above the composer, which you can remove items from. They run in order once the current message finishes.
+  - **Persistence.** The queue is kept across restarts.
+- **Retry and Edit for any message.**
+  - **Retry** runs a message again.
+  - **Edit** puts the message's text in the composer, and sending replaces the message.
+  - **Rewinding.** In both cases the messages after it are removed, and the agents start new sessions, so nothing removed carries over.
+  - **File changes are undone.** Before each Edit-mode message a checkpoint of the isolated worktree is recorded as a Git tree. Retrying from that message or earlier puts the files back, or discards the worktree if that message created it.
+- **Secret masking** (`dualAgent.privacy.redactSecrets`, on by default).
+  - **What is masked:** API keys, tokens, and private keys (AWS, GitHub, OpenAI, Anthropic, Google, Slack, Stripe, npm, Azure, JWTs, PEM keys).
+  - **Where:** in the diffs, files, attachments, history, and check output the extension puts into prompts, and in the output log and exported reports.
+- **Dual Agent: Delete All History.** It deletes every conversation, attachment, and run record for the workspace. It refuses while a run is active or while changes wait to be applied.
+- **Get started walkthrough** in VS Code's Welcome page: setup check, chat, modes, checks, and reviewing changes.
+- **Marketplace listing.** It adds a color icon, screenshots rendered from the real chat bundle (`npm run screenshots`), repository links, and the AI and Chat categories.
+- **Release automation.**
+  - **Trigger:** pushing a `v*` tag.
+  - **Build:** verifies, audits, and packages; records SHA-256 checksums and GitHub build provenance for the VSIX.
+  - **Publish:** to the Visual Studio Marketplace and Open VSX through OpenID Connect trusted publishing (no stored tokens), then to a GitHub release. Until a registry trusts the workflow (the Marketplace did not yet accept it at release time), the VSIX from the GitHub release is uploaded by hand.
+- **Repository hygiene:** CodeQL code scanning, Dependabot with a one-week cooldown, `npm audit` and registry-signature checks in CI, issue and pull-request templates, and a private vulnerability-reporting policy.
+
+### Changed
+
+- **The chat page requires Trusted Types.** Its Content-Security-Policy allows only the Markdown renderer's policy to create HTML, and adds `base-uri 'none'` and `form-action 'none'`. Script errors and blocked content are reported to the output log.
+- **More quota wording is recognized.** "5-hour limit reached", "hit your usage limit", "weekly limit", and "credit balance is too low" now count as quota failures, so they trigger fallback.
+- **A stand-in's stage is titled for the agent that ran it** ("Codex answers"). The answer, and **Copy answer**, come from the stage in Claude's role, whoever ran it.
+- **Tooling.** All GitHub Actions are pinned to commit SHAs with `persist-credentials: false`. `@vscode/vsce` is 4.0.0 and `cross-spawn` is pinned exactly. `vsce package` runs without bypass flags.
+- **Extension ID.** It is now `NileshRavishan.dual-agent-orchestrator`. Conversations and runs recorded under the earlier local ID `local.dual-agent-orchestrator` stay in that ID's storage and are not shown.
+
 ## [2.2.0] - 2026-10-28
 
 Research support and better answers for fewer tokens.

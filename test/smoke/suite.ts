@@ -43,7 +43,7 @@ export async function run(): Promise<void> {
   const userData = process.env.DUAL_AGENT_SMOKE_USER_DATA;
   assert.ok(userData, 'DUAL_AGENT_SMOKE_USER_DATA is set by scripts/smoke.mjs');
 
-  const extension = vscode.extensions.getExtension('local.dual-agent-orchestrator');
+  const extension = vscode.extensions.getExtension('NileshRavishan.dual-agent-orchestrator');
   assert.ok(extension, 'the extension is installed in the development host');
   await extension.activate();
   assert.ok(vscode.workspace.isTrusted, 'the smoke workspace is trusted');
@@ -89,12 +89,19 @@ export async function run(): Promise<void> {
   assert.match(stage.getText(), /Claude output for claude-proposal/);
 
   await reviewWorktreeChanges(userData);
-  await chatConversation(extension.exports as DualAgentTestApi);
+  const api = extension.exports as DualAgentTestApi;
+  await chatConversation(api);
+  // Under the page's Trusted Types policy, Markdown rendering must not trip the CSP or throw.
+  assert.deepEqual(api.chatErrors(), [], 'the chat page reported no script errors or blocked content');
+
+  await vscode.commands.executeCommand('workbench.action.openWalkthrough', 'NileshRavishan.dual-agent-orchestrator#getStarted', false);
 }
 
 interface ChatTurnState {
   id: string;
+  message: string;
   status: string;
+  canRetry: boolean;
   stages: { id: string; label: string; activities: { tool: string; title: string; input?: string; output?: string }[] }[];
   outcome?: { text: string };
   attachments: unknown[];
@@ -104,8 +111,9 @@ interface ChatTurnState {
 
 interface DualAgentTestApi {
   chatReady(): boolean;
-  chatState(): { usage: { label: string; usage: Record<'claude' | 'codex', { input: number; output: number }> }[]; turns: ChatTurnState[]; consent?: { turnId: string }; composer: { pending: unknown[]; choices: { codex: { models: { id: string }[] } } } };
+  chatState(): { usage: { label: string; usage: Record<'claude' | 'codex', { input: number; output: number }> }[]; turns: ChatTurnState[]; queue: { text: string }[]; consent?: { turnId: string }; composer: { pending: unknown[]; editing?: { turnId: string }; choices: { codex: { models: { id: string }[] } } } };
   chatMessage(message: unknown): Promise<void>;
+  chatErrors(): readonly string[];
 }
 
 function recordedCalls(name: string): { args: string[]; cwd: string }[] {
@@ -187,6 +195,38 @@ async function chatConversation(api: DualAgentTestApi): Promise<void> {
   assert.equal(existsSync(path.join(folder, 'chat-edit.txt')), false, 'the workspace is untouched until the change is applied');
   const editCall = recordedCalls('claude').at(-1);
   assert.ok(editCall && path.resolve(editCall.cwd) !== path.resolve(folder), 'Claude edited in the worktree');
+
+  // A second edit keeps working on the same copy.
+  const second = api.chatMessage({ type: 'send', text: 'Add a second file.', mode: 'edit' });
+  const again = await waitFor(() => api.chatState().consent, 'the consent card for the second edit');
+  await api.chatMessage({ type: 'consent', turnId: again.turnId, decision: 'conversation' });
+  await second;
+  const secondEdit = api.chatState().turns.at(-1);
+  assert.deepEqual(secondEdit?.changes?.files.map((file) => file.path).sort(), ['chat-edit.txt', 'second.txt']);
+  assert.ok(secondEdit?.canRetry, 'a finished message can be retried');
+
+  // Editing that message and sending it again undoes its file changes first, and starts Claude afresh.
+  const turnCount = api.chatState().turns.length;
+  await api.chatMessage({ type: 'editMessage', turnId: secondEdit.id });
+  assert.ok(api.chatState().composer.editing, 'the composer shows the message being edited');
+  await api.chatMessage({ type: 'send', text: 'Add nothing more.', mode: 'edit' });
+  const replaced = api.chatState().turns.at(-1);
+  assert.equal(api.chatState().turns.length, turnCount, 'the edited message replaced the original');
+  assert.equal(replaced?.message, 'Add nothing more.');
+  assert.deepEqual(replaced?.changes?.files.map((file) => file.path), ['chat-edit.txt'], "the replaced message's file is gone");
+  assert.equal(recordedCalls('claude').at(-1)?.args.includes('--resume'), false, 'a retried message does not continue the old session');
+
+  // A message sent while another runs waits in the queue, then runs by itself.
+  const before = api.chatState().turns.length;
+  const running = api.chatMessage({ type: 'send', text: 'First question.', mode: 'chat' });
+  await api.chatMessage({ type: 'send', text: 'Queued question.', mode: 'chat' });
+  assert.deepEqual(api.chatState().queue.map((item) => item.text), ['Queued question.'], 'the second message is queued');
+  await running;
+  await waitFor(
+    () => (api.chatState().turns.length === before + 2 && !api.chatState().queue.length && api.chatState().turns.at(-1)?.status === 'completed' ? true : undefined),
+    'the queued message to run',
+  );
+  assert.equal(api.chatState().turns.at(-1)?.message, 'Queued question.');
 
   await vscode.commands.executeCommand('dualAgent.openChatInEditor');
 }

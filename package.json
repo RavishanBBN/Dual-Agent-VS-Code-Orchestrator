@@ -1,25 +1,48 @@
 {
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent Orchestrator",
-  "description": "A Claude Code-style chat where Claude answers and Codex checks the answer: conversations with attachments, model and effort pickers, isolated edits you review and apply, and reciprocal brainstorming and implementation workflows.",
-  "version": "2.2.0",
+  "description": "Claude answers and Codex checks the answer: a chat where two coding agents review each other, with attachments, cited web research, isolated edits you review and apply, and token usage.",
+  "version": "2.3.0",
   "private": true,
-  "publisher": "local",
+  "publisher": "NileshRavishan",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#1b1c2b",
+    "theme": "dark"
+  },
+  "pricing": "Free",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RavishanBBN/Dual-Agent-VS-Code-Orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RavishanBBN/Dual-Agent-VS-Code-Orchestrator/issues"
+  },
+  "homepage": "https://github.com/RavishanBBN/Dual-Agent-VS-Code-Orchestrator#readme",
   "engines": {
     "vscode": "^1.105.0",
     "node": ">=20"
   },
   "categories": [
-    "Machine Learning",
-    "Other"
+    "AI",
+    "Chat",
+    "Machine Learning"
   ],
   "keywords": [
     "claude",
+    "claude code",
     "codex",
+    "ai",
     "agents",
-    "orchestration",
-    "code-review"
+    "multi-agent",
+    "code review",
+    "chat",
+    "research",
+    "llm"
+  ],
+  "extensionKind": [
+    "workspace"
   ],
   "main": "./dist/extension.js",
   "capabilities": {
@@ -198,6 +221,13 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "dualAgent.clearHistory",
+        "title": "Delete All History…",
+        "category": "Dual Agent",
+        "icon": "$(trash)",
+        "enablement": "!dualAgent.running"
+      },
+      {
         "command": "dualAgent.openDocument",
         "title": "Open Run Document",
         "category": "Dual Agent"
@@ -264,6 +294,11 @@
           "command": "dualAgent.exportLatestRun",
           "when": "view == dualAgent.runs",
           "group": "2_output@2"
+        },
+        {
+          "command": "dualAgent.clearHistory",
+          "when": "view == dualAgent.runs",
+          "group": "3_history@1"
         },
         {
           "command": "dualAgent.doctor",
@@ -467,8 +502,14 @@
         "dualAgent.fallbackOnQuota": {
           "type": "boolean",
           "default": true,
-          "description": "Allow the other provider to complete a stage when the assigned provider reports a quota or availability failure.",
+          "description": "When an agent reports a usage limit or is unavailable, let the other agent do its stages until the limit resets. The limited agent rejoins, and catches up on what it missed, once its limit resets.",
           "scope": "machine"
+        },
+        "dualAgent.limits.autoContinue": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "When both agents are at their usage limits, continue the stopped message or run automatically shortly after the first limit resets, and then run any queued messages. A run that edits files continues on its own only if `#dualAgent.isolation.setupCommands#` and `#dualAgent.verification.commands#` are unchanged since you allowed it; otherwise it waits for you."
         },
         "dualAgent.history.maxRuns": {
           "type": "number",
@@ -577,6 +618,12 @@
           "default": "",
           "scope": "machine",
           "description": "Default Claude reasoning effort for new chat messages and workflows. Empty uses the CLI default; the chat can change it per message."
+        },
+        "dualAgent.privacy.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "Mask API keys, tokens, and private keys (AWS, GitHub, OpenAI, Anthropic, Google, Slack, Stripe, npm, Azure, JWTs, PEM keys) in the diffs, files, attachments, history, and check output the extension puts into prompts, and in the output log. Agents can still open files themselves."
         }
       }
     },
@@ -598,6 +645,62 @@
         "key": "ctrl+alt+d",
         "mac": "cmd+alt+d"
       }
+    ],
+    "walkthroughs": [
+      {
+        "id": "getStarted",
+        "title": "Get started with Dual Agent",
+        "description": "Set up both CLIs, then let Claude answer and Codex check the answer.",
+        "steps": [
+          {
+            "id": "setup",
+            "title": "Install and sign in to both CLIs",
+            "description": "Dual Agent drives the Claude Code and Codex CLIs you already use, with their saved sign-in.\n[Check Agent Setup](command:dualAgent.doctor)",
+            "media": {
+              "markdown": "media/walkthrough/setup.md"
+            },
+            "completionEvents": [
+              "onCommand:dualAgent.doctor"
+            ]
+          },
+          {
+            "id": "chat",
+            "title": "Open the chat",
+            "description": "The chat lives in the secondary side bar, like Claude Code. Ask about the open folder; Claude answers and Codex checks the answer.\n[Open Chat](command:dualAgent.openChat)",
+            "media": {
+              "markdown": "media/walkthrough/chat.md"
+            },
+            "completionEvents": [
+              "onCommand:dualAgent.openChat",
+              "onView:dualAgent.chat"
+            ]
+          },
+          {
+            "id": "modes",
+            "title": "Pick a mode",
+            "description": "Chat, Research, Edit, Brainstorm, or Implement. Choose models and effort per agent from the pills under the message box.\n[Open Chat](command:dualAgent.openChat)",
+            "media": {
+              "markdown": "media/walkthrough/modes.md"
+            }
+          },
+          {
+            "id": "checks",
+            "title": "Run your checks after every edit",
+            "description": "Give the extension your test command, so every edit is verified and the result is evidence for the reviewer.\n[Configure Checks](command:workbench.action.openSettings?%5B%22dualAgent.verification.commands%22%5D)",
+            "media": {
+              "markdown": "media/walkthrough/checks.md"
+            }
+          },
+          {
+            "id": "review",
+            "title": "Review and apply",
+            "description": "Edits happen in an isolated copy. Nothing reaches your files until you review the diff and apply it.\n[Show Token Usage](command:dualAgent.showUsage)",
+            "media": {
+              "markdown": "media/walkthrough/review.md"
+            }
+          }
+        ]
+      }
     ]
   },
   "scripts": {
@@ -609,10 +712,11 @@
     "test:watch": "vitest",
     "smoke": "npm run build && node ./scripts/smoke.mjs",
     "check": "npm run lint && npm run typecheck && npm test && npm run build",
-    "package": "npm run check && vsce package --no-dependencies --allow-missing-repository --no-rewrite-relative-links"
+    "package": "npm run check && vsce package --no-dependencies",
+    "screenshots": "npm run build && node ./scripts/screenshots.mjs"
   },
   "dependencies": {
-    "cross-spawn": "^7.0.6",
+    "cross-spawn": "7.0.6",
     "fflate": "0.8.3",
     "markdown-it": "15.0.3",
     "preact": "10.29.8",
@@ -627,7 +731,7 @@
     "@types/node": "^22.18.0",
     "@types/vscode": "^1.105.0",
     "@vitest/coverage-v8": "^5.0.5",
-    "@vscode/vsce": "3.9.2",
+    "@vscode/vsce": "4.0.0",
     "esbuild": "^0.28.2",
     "eslint": "^9.38.0",
     "typescript": "^5.9.3",

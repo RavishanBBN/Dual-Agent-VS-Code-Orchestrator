@@ -65,6 +65,7 @@ Residual risk: models can still follow adversarial content. Sandbox boundaries, 
 The chat is the only webview. Its page is built into the extension package and receives agent output, repository text, and attachment names, so it is treated as an untrusted surface in both directions:
 
 - **Content-Security-Policy.** `default-src 'none'`; scripts only with a per-load nonce, which only the bundled `chat.js` carries; styles and fonts only from the extension; images only from the webview's resource roots (the bundle and the attachment folder) or `data:` and `blob:` URIs. Nothing is fetched from the network.
+- **Trusted Types.** The policy also requires Trusted Types (`require-trusted-types-for 'script'`) and allows only one policy, `dual-agent-markdown`, which only the Markdown renderer can use. Any other code that tried to assign HTML or create a script would be blocked even if an injection bug existed elsewhere. `base-uri 'none'` and `form-action 'none'` close the remaining navigation paths. Script errors and CSP violations are reported to the output log, and the smoke test asserts there are none.
 - **No HTML from agents.** Agent Markdown is rendered with `html: false`, so raw HTML is escaped, and images are disabled, so a reply cannot load a tracking pixel. Links get `href="#"` with the target in a data attribute. Clicking one sends the target to the extension, which opens only `http`, `https`, and `mailto` links after a confirmation, and only files inside the conversation's folder or worktree. Every other target, such as `command:`, `vscode:`, `file:`, or `javascript:`, is refused. Command URIs are disabled for the webview.
 - **Validated messages.** Every message from the page is checked for its type, field types, lengths, ID formats, and base64 before the extension acts on it, and anything malformed is dropped.
 - **Same authority as the commands.** A message from the page can only ask for what the commands already do. Editing still needs the consent card, the single-run lock still applies, and apply and discard still use their modal confirmations.
@@ -155,9 +156,54 @@ Subscription mode removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPI
 
 Residual risk: provider-specific credential configuration outside these variables, such as a Claude `apiKeyHelper` in user settings, can affect billing. Confirm account status in each official CLI.
 
+### Credentials in what prompts quote
+
+Diffs, untracked files, attachments, conversation history, and check output can contain keys that a developer pasted or a test printed. With `dualAgent.privacy.redactSecrets` on (the default), everything the extension quotes into a prompt is scanned before fencing. Recognizable credentials are replaced with `[redacted <kind>]`:
+
+- AWS access keys;
+- GitHub, Anthropic, OpenAI, Google, Slack, Stripe live, and npm tokens;
+- Azure storage keys;
+- JSON Web Tokens;
+- PEM private keys.
+
+The output log and exported reports are masked the same way.
+
+Residual risk: masking matches known formats only, so a password or an unusual token passes through. Agents can still open files with their own tools, and what they read goes to their provider. Keep secrets out of the repository and the attachments.
+
+### Usage limits and automatic continuation
+
+When an agent reports a usage limit, the extension records the reset time read from that provider error. Until then, the agent's stages go to the other agent, as a fallback already could. The record only reroutes or pauses stages; it never grants permissions. Only provider errors and stderr are read, never agent output, so a repository cannot fake a limit to steer work away from the independent reviewer. A stand-in reviewing its own work is labelled on the timeline. Turn off `dualAgent.fallbackOnQuota` to never let one agent review its own work.
+
+When both agents are out, the run stops and, with `dualAgent.limits.autoContinue` on, continues by itself after the reset. Resuming a run normally asks for edit consent again. The automatic continuation does not, so it is bounded:
+
+- It continues the same run, with its recorded objective and `allowWrites` decision.
+- It continues only in a trusted workspace.
+- For a run that edits files, it continues only while the isolation mode, setup commands, and verification commands match the ones in force when the run stopped. Those are what the consent covered. If they changed, the user must resume by hand and sees the consent card again.
+
+Queued messages that edit files still show their consent card, unless the user allowed edits for that conversation.
+
+### Retrying and undoing edits
+
+Retrying or editing an earlier message removes the later messages and undoes their file changes in the isolated worktree:
+
+- **Checkpoints.** Before each Edit-mode message, `git write-tree` records the worktree's files from the worktree's own index.
+- **Restoring.** `git read-tree --reset -u <tree>` puts the files back. The tree ID is checked to be a hexadecimal object ID first. Both commands run through `runGit`, with hooks disabled, and only inside the extension's worktree storage.
+- **No new worktree.** A worktree created by a message being replaced is discarded through the same path as **Discard Changes**.
+- **Your workspace is never touched.** Changes already applied stay applied, and the confirmation says so.
+- **Fresh sessions.** Retried runs start new agent sessions, so instructions from removed messages cannot persist in a continued session.
+
+### Supply chain and releases
+
+- **Dependencies.** Runtime dependencies are pinned to exact versions and bundled into the VSIX, which ships no `node_modules`.
+- **CI checks.** CI runs `npm audit` and `npm audit signatures`, which verifies the registry signatures of installed packages. CodeQL scans the TypeScript and the workflows weekly and on every change.
+- **Updates.** Dependabot proposes updates after a seven-day cooldown, so a compromised release is usually withdrawn before it is proposed.
+- **Workflow hardening.** Every GitHub Action is pinned to a commit SHA, checkouts do not keep credentials, and workflows default to read-only permissions.
+- **Releases.** Releases are built from the tag without a dependency cache, checked against the version, and given a SHA-256 checksum and a GitHub build-provenance attestation. The exact attested file is published.
+- **No stored publishing tokens.** Publishing uses OpenID Connect trusted publishing, so no repository secret exists that could publish a malicious version. Until a registry accepts it, the release VSIX is uploaded by hand with a token that never enters the repository. The publish job installs only the publishing tools, with install scripts disabled.
+
 ### Data leakage
 
-There is no extension-owned server, and the chat webview loads nothing from the network (see Chat webview). Conversations, attachments, run records, and worktrees remain in private VS Code storage. Outside the chat, agent output is shown only as tree-item text, as tooltips built from untrusted `MarkdownString`s with the text Markdown-escaped (so links, including `command:` links, never activate and no HTML renders), and in read-only text documents served by the extension. Untracked files whose names suggest secrets are never copied into a worktree, which would otherwise write them into the repository's object database through the base commit. Export requires an explicit save action and defaults to the home folder rather than the repository, so a report containing prompts and agent output is not committed by accident.
+There is no extension-owned server, and the chat webview loads nothing from the network (see Chat webview). Conversations, attachments, run records, and worktrees remain in private VS Code storage. Outside the chat, agent output is shown only as tree-item text, as tooltips built from untrusted `MarkdownString`s with the text Markdown-escaped (so links, including `command:` links, never activate and no HTML renders), and in read-only text documents served by the extension. Untracked files whose names suggest secrets are never copied into a worktree, which would otherwise write them into the repository's object database through the base commit. Export requires an explicit save action and defaults to the home folder rather than the repository, so a report containing prompts and agent output is not committed by accident; credentials in it are masked. The extension sends no telemetry. **Dual Agent: Delete All History** removes the workspace's conversations, attachments, queued messages, and run records.
 
 Residual risk: each provider receives the context sent to its CLI according to that provider's account and data policies. Do not use repositories or accounts that are not authorized for the data involved.
 
@@ -181,6 +227,9 @@ Stages have timeouts; Claude has a maximum turn count; workflows have finite sta
 - [ ] Run warnings in the Runs view or report have been read.
 - [ ] Exported reports are stored in an approved location.
 - [ ] Attachments contain nothing that should not go to both providers.
+- [ ] `dualAgent.privacy.redactSecrets` is on, and secrets are not in the repository in the first place.
+- [ ] Answers marked "standing in" were read knowing one agent checked its own work.
+- [ ] Automatic continuation (`dualAgent.limits.autoContinue`) is acceptable for this repository's edit runs.
 
 ## Reporting vulnerabilities
 

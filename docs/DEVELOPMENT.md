@@ -44,7 +44,10 @@ Process-level behavior is tested with fake CLIs: `test/helpers.ts` writes a smal
 - through the extension's test API, sets models and efforts, attaches a file, and sends a Chat message; it checks the stages, Codex's verdict, the attachment, the reported model, and the arguments each fake CLI received (model, effort, attachment folder, streaming, read-only tools, and Codex's model, effort, and Git check);
 - sends a follow-up and checks that Claude's session continued;
 - sends an Edit message, answers the consent card, and checks that the change appears in the changes card, was made in the worktree, and left the workspace untouched;
-- opens the chat in an editor tab.
+- sends a second Edit message that adds another file, then edits and resends it, and checks that the message was replaced, its file was undone from the checkpoint, and Claude started a new session;
+- sends a message while another runs, and checks that it waits in the queue and then runs by itself;
+- checks that the chat page reported no script errors or content blocked by its Content-Security-Policy and Trusted Types;
+- opens the chat in an editor tab and the **Get started** walkthrough.
 
 Apply and discard ask for confirmation in a modal dialog, which a test cannot answer, so their Git behavior is covered by `worktree.test.ts`. The page's Preact components are not unit-tested; their logic lives in the tested protocol, transcript, and Markdown modules.
 
@@ -68,7 +71,12 @@ Several tests reproduce specific vulnerabilities and must keep passing:
 - archives cannot write outside their folder, decompression bombs and oversized entries are skipped, and entry counts are capped (`attachments.test.ts`);
 - a PDF that hangs is stopped by the worker timeout (`attachments.test.ts`);
 - malformed webview messages are dropped, agent HTML is escaped, images never load, and only web, mail, and file links open (`chat.test.ts`);
-- agent text in tooltips is Markdown-escaped, so `command:` links cannot be injected (`presentation.test.ts`).
+- agent text in tooltips is Markdown-escaped, so `command:` links cannot be injected (`presentation.test.ts`);
+- credentials in diffs and history are masked in prompts, and samples are assembled at run time so no credential-shaped literal is committed (`redact.test.ts`);
+- the chat's HTML is created only through its Trusted Types policy (`chat.test.ts`);
+- an agent at its usage limit is skipped until the reset, a run with both agents out stops with the reset time and continues on resume, and a continued session gets the turns it missed (`limits.test.ts`);
+- a continuation the run rescheduled while it was continuing is kept, and overdue continuations run after a restart (`limits.test.ts`);
+- a checkpoint restore reverts edits, re-creates deleted files, removes added ones, leaves ignored files alone, and refuses anything that is not a tree ID (`worktree.test.ts`).
 
 Some tests run only on Windows or only on POSIX; CI covers both. Coverage is measured for every module that does not import `vscode`: `src/core`, `src/adapters`, and `src/ui/presentation.ts`. The view classes, `extension.ts`, and `config.ts` are covered by the smoke test instead.
 
@@ -108,16 +116,45 @@ Implement `AgentAdapter`, normalize output into `StageResult`, classify operatio
 - The chat panel is the only webview. Its page loads nothing from the network, keeps its Content-Security-Policy, renders agent Markdown only through `src/webview/markdown.ts`, and every message from it goes through `parseWebviewMessage`. Everything else uses native VS Code components, and agent text reaches tooltips only through `escapeMarkdown`.
 - Dependencies are pinned to exact versions, and `npm audit` must report no vulnerabilities.
 
+## Screenshots and icon
+
+`npm run screenshots` builds the extension and renders `media/icon.png` and `media/screenshots/*.png` in headless Chrome or Edge (set `CHROME_PATH` to choose one). The screenshots load the real `dist/webview` bundle with VS Code's Dark Modern and Light Modern colors and sample conversations about a made-up project, defined in `scripts/screenshots.mjs`. Re-render them after visible chat changes. Screenshots are excluded from the VSIX; the Marketplace shows them from the repository, because `vsce` rewrites the README's relative links to the GitHub repository.
+
 ## Release procedure
 
-1. Update version and `CHANGELOG.md`.
+### Before the first release
+
+1. **Marketplace publisher.** Create the publisher `NileshRavishan` at [marketplace.visualstudio.com/manage](https://marketplace.visualstudio.com/manage), signed in with the Microsoft account that will own it. The ID must equal `publisher` in `package.json`; changing it changes the extension's ID.
+2. **First Marketplace version: upload by hand.** On the publisher page choose **New extension → Visual Studio Code** and upload the VSIX built by `npm run package` (or attached to the GitHub release).
+3. **Marketplace trusted publishing, once it is available.** At the end of October 2026 the Marketplace backend did not yet accept `vsce publish --oidc` (vscode-vsce issue #1275), and Microsoft said it would be announced shortly. When the publisher page offers trusted publishers, add one for the repository `RavishanBBN/Dual-Agent-VS-Code-Orchestrator` and the workflow `release.yml`. Until then the release workflow's Marketplace step fails with a warning, the GitHub release is still created, and you upload that release's VSIX by hand.
+4. **Open VSX (optional, for VSCodium, Cursor, and other editors).**
+   1. Create an Eclipse account with your GitHub user name, log in to [open-vsx.org](https://open-vsx.org) with GitHub, then link the Eclipse account and sign the Publisher Agreement in **Settings**.
+   2. Generate a token under **Settings → Access Tokens**. Then run `npx ovsx create-namespace NileshRavishan -p <token>` and `npx ovsx publish dual-agent-orchestrator-<version>.vsix -p <token>`. The first version must be published with a token.
+   3. Claim ownership of the namespace by opening an issue at [EclipseFdn/open-vsx.org](https://github.com/EclipseFdn/open-vsx.org/issues/new/choose); trusted publishing needs a verified namespace you own.
+   4. Under **Settings → Trusted Publishers**, choose the namespace and GitHub Actions, and enter `RavishanBBN`, `Dual-Agent-VS-Code-Orchestrator`, and `release.yml`, with no environment.
+   5. Delete the token.
+5. **Repository security settings.** On GitHub, enable private vulnerability reporting and Dependabot alerts, and leave CodeQL's *default setup* off, because `codeql.yml` is the advanced setup. Add rulesets so only you can push `main` and `v*` tags.
+
+Never store a publishing token in the repository. For a manual publish from your machine, set `VSCE_PAT` or pass `-p` for that one command only.
+
+### Every release
+
+1. Update the version in `package.json` and `CHANGELOG.md`, then `npm install --package-lock-only`.
 2. Update `PROJECT_STATUS.md` verification results.
-3. Run `npm.cmd audit` and review transitive build-only vulnerabilities.
-4. Run `npm.cmd run check`.
-5. Run `npm.cmd run smoke`.
-6. Run `npm.cmd run package`.
-7. Install the VSIX in an isolated profile.
-8. With signed-in CLIs, test doctor, a Chat message with attachments and a follow-up, an Edit message with apply, a brainstorming run, cancellation, resume, export, and an implementation run in a disposable repository: approve the plan, review the diff, and apply it.
-9. Tag the verified commit.
+3. Run `npm.cmd run check`, `npm.cmd run smoke`, `npm.cmd audit`, and `npm.cmd run package`.
+4. Install the VSIX in an isolated profile.
+5. With signed-in CLIs, test doctor, a Chat message with attachments and a follow-up, an Edit message with apply, retry of an Edit message, a brainstorming run, cancellation, resume, export, and an implementation run in a disposable repository: approve the plan, review the diff, and apply it.
+6. Commit, push `main`, and wait for CI and CodeQL to pass.
+7. Tag the verified commit with the version and push the tag: `git tag v2.3.0 && git push origin v2.3.0`.
+
+The **Release** workflow then:
+
+1. checks that the tag matches `package.json`;
+2. installs from the lockfile without a cache, then runs `npm audit`, `npm audit signatures`, and `npm run package`;
+3. records SHA-256 checksums and a GitHub build-provenance attestation for the VSIX;
+4. publishes that same file to the Marketplace and Open VSX, where each registry trusts the workflow;
+5. creates a GitHub release with the VSIX and `SHA256SUMS.txt`, and lists in the run summary which registries accepted the version.
+
+Anyone can verify a downloaded VSIX with `gh attestation verify dual-agent-orchestrator-<version>.vsix --repo RavishanBBN/Dual-Agent-VS-Code-Orchestrator`.
 
 The package currently overrides `@azure/msal-node` to `7.1.0` because the VSIX packager's permitted dependency range otherwise resolves to a version covered by GHSA-xcx6-jx8p-x3h5. Re-evaluate and remove the override when `@vscode/vsce` declares a fixed compatible dependency directly.
