@@ -46,6 +46,20 @@ describe('FileRunStore', () => {
     expect(await store.latest()).toMatchObject({ id: 'two', objective: 'Updated.' });
     expect(JSON.parse(await readFile(path.join(directory, 'runs.json'), 'utf8'))).toMatchObject({ schemaVersion: 1 });
   });
+
+  it('deletes the whole history, including copies set aside, and leaves other files alone', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'dual-agent-store-'));
+    temporaryDirectories.push(directory);
+    const store = new FileRunStore(directory, 5);
+    await store.save(run('one'));
+    await writeFile(path.join(directory, 'runs.json.unreadable-1'), '{');
+    await writeFile(path.join(directory, 'other.json'), '{}');
+    await store.clear();
+    expect(await store.list()).toEqual([]);
+    expect(await readdir(directory)).toEqual(['other.json']);
+    await store.save(run('two'));
+    expect((await store.list()).map((item) => item.id)).toEqual(['two']);
+  });
 });
 
 describe('run report', () => {
