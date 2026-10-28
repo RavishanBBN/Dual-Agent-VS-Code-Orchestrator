@@ -5,8 +5,9 @@ import { isSmallTalk } from './about.js';
 import { sanitizeAgentOptions } from './agentOptions.js';
 import { attachmentText } from './attachments.js';
 import { buildStagePrompt, describeCheck } from './context.js';
-import { AgentExecutionError, canFallback, isQuotaError, LimitReachedError } from './errors.js';
+import { AgentExecutionError, canFallback, ConnectionLostError, isQuotaError, LimitReachedError } from './errors.js';
 import { captureGitSnapshot } from './gitSnapshot.js';
+import { snapshotEnvironment } from './worktree.js';
 import { type AgentLimits, formatReset } from './limits.js';
 import type {
   AgentAdapter,
@@ -20,11 +21,13 @@ import type {
   GitSnapshot,
   OrchestratorEvent,
   OrchestratorOptions,
+  QuotaReading,
   RunRecord,
   RunStore,
   StageRecord,
   StageResult,
   StartOptions,
+  TokenUsage,
   WorkflowKind,
   WorkflowStageDefinition,
   WorktreeInfo,
@@ -32,7 +35,7 @@ import type {
 import { checksPassed, isFinished } from './types.js';
 import { addUsage, totalUsageByAgent } from './usage.js';
 import { onlyMinorFindings, parseVerdict, summarizeVerdict } from './verdict.js';
-import { fixRoundStages, getWorkflow, introWorkflow, repairStage, reviseStage } from './workflows.js';
+import { arrangeStage, fixRoundStages, getWorkflow, introWorkflow, repairStage, reviseStage } from './workflows.js';
 
 export interface PreparedWorktree {
   info: WorktreeInfo;
@@ -48,9 +51,9 @@ export interface CheckRequest {
 }
 
 export interface OrchestratorDependencies {
-  captureSnapshot?: (cwd: string, untrustedDirectories: readonly string[]) => Promise<GitSnapshot>;
+  captureSnapshot?: (cwd: string, untrustedDirectories: readonly string[], environment?: NodeJS.ProcessEnv) => Promise<GitSnapshot>;
   /** Creates the isolated worktree for an implementation run. Required when isolation is "worktree". */
-  prepareWorktree?: (workspacePath: string, runId: string, signal: AbortSignal) => Promise<PreparedWorktree>;
+  prepareWorktree?: (workspacePath: string, runId: string, signal: AbortSignal, direct: boolean) => Promise<PreparedWorktree>;
   /** Confirms a recorded worktree still exists before a run is resumed in it. */
   worktreeExists?: (worktree: WorktreeInfo) => Promise<boolean>;
   /** Runs setup and verification commands. Required when either is configured. */
@@ -61,6 +64,21 @@ export interface OrchestratorDependencies {
   readAttachmentText?: (attachments: readonly AttachmentRef[], agent: AgentId) => Promise<Record<string, string>>;
   /** Usage limits agents reported, shared by every run so a limited agent is skipped until it resets. */
   limits?: AgentLimits;
+  /** Receives each report of an account's usage limits, for the quota meter. */
+  onQuota?: (reading: QuotaReading) => void;
+  /**
+   * Whether the machine can reach the providers. Asked after a connection error: offline, the run pauses
+   * until the connection is back; online, the error is one provider's outage and the other agent can cover.
+   */
+  online?: () => Promise<boolean>;
+  /**
+   * A third model that rules on the findings of a failed check before Claude revises, such as Gemini CLI.
+   * Its ruling is evidence for the revision; it never decides on its own.
+   */
+  referee?: {
+    readonly name: string;
+    rule(request: { prompt: string; cwd: string; signal: AbortSignal; untrustedDirectories?: readonly string[] }): Promise<{ text: string; usage?: TokenUsage; model?: string }>;
+  };
 }
 
 /** Ends a run as cancelled because the user decided to stop it. */
@@ -78,6 +96,8 @@ function messageOf(error: unknown): string {
 const now = (): string => new Date().toISOString();
 
 const AGENT_NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
+/** Characters of the user's project brief kept on a run. */
+export const BRIEF_LIMIT = 4_000;
 
 /** Failed and cancelled runs continue from their first unfinished stage, if their worktree is still there. */
 export function canResume(run: RunRecord): boolean {
@@ -91,7 +111,27 @@ export function workingDirectory(run: RunRecord): string {
 
 /** Workflows whose stages edit files, so they need consent, Git, and (by default) a worktree. */
 export function editsFiles(kind: WorkflowKind): boolean {
-  return kind === 'implementation' || kind === 'edit';
+  return kind === 'implementation' || kind === 'edit' || kind === 'tdd' || kind === 'agent';
+}
+
+/** Agent mode works on the real environment, so it edits the folder itself, after a snapshot. */
+export function editsDirectly(kind: WorkflowKind): boolean {
+  return kind === 'agent';
+}
+
+/**
+ * Why a message cannot build on the changes waiting in its conversation: Agent mode works in the folder
+ * itself, and the other editing modes in an isolated copy, so one cannot continue the other's changes.
+ */
+export function worktreeConflict(kind: WorkflowKind, worktree: WorktreeInfo | undefined): string | undefined {
+  if (!worktree || worktree.state !== 'active') return undefined;
+  if (editsDirectly(kind) && !worktree.gitDir) {
+    return 'changes from an earlier message are waiting in an isolated copy. Apply or discard them first, because Agent mode works in the folder itself.';
+  }
+  if (!editsDirectly(kind) && worktree.snapshotFor === 'agent') {
+    return 'Agent mode changed the folder directly, and those changes are waiting. Keep or undo them first, because this mode edits an isolated copy.';
+  }
+  return undefined;
 }
 
 function untrustedDirectories(run: RunRecord): string[] {
@@ -112,7 +152,9 @@ function attachmentAccess(run: RunRecord): { images: string[]; folders: string[]
 
 /** A chat greeting or question about the assistant gets one quick reply; everything else its full workflow. */
 function workflowFor(kind: WorkflowKind, objective: string, options: StartOptions): WorkflowStageDefinition[] {
-  return kind === 'chat' && !options.attachments?.length && isSmallTalk(objective) ? introWorkflow() : getWorkflow(kind);
+  const agents = options.agents ?? 'claude-codex';
+  if (kind === 'chat' && !options.attachments?.length && isSmallTalk(objective)) return introWorkflow().map((stage) => arrangeStage(stage, agents));
+  return getWorkflow(kind, agents);
 }
 
 function stageRecord(definition: WorkflowStageDefinition, allowWrites: boolean): StageRecord {
@@ -152,7 +194,7 @@ function recordActivity(stage: StageRecord, event: AgentStreamEvent): void {
 export class WorkflowOrchestrator {
   private active: { controller: AbortController; run: RunRecord } | undefined;
   private readonly listeners = new Set<(event: OrchestratorEvent) => void>();
-  private readonly captureSnapshot: (cwd: string, untrustedDirectories: readonly string[]) => Promise<GitSnapshot>;
+  private readonly captureSnapshot: (cwd: string, untrustedDirectories: readonly string[], environment?: NodeJS.ProcessEnv) => Promise<GitSnapshot>;
 
   public constructor(
     private readonly adapters: Record<AgentId, AgentAdapter>,
@@ -172,9 +214,10 @@ export class WorkflowOrchestrator {
     return this.active?.run;
   }
 
-  public cancel(): boolean {
+  /** Stops the active run; `reason` is recorded on it, so the history says who or what stopped it. */
+  public cancel(reason = 'Stopped by you.'): boolean {
     if (!this.active) return false;
-    this.active.controller.abort();
+    this.active.controller.abort(new StoppedByUser(reason));
     return true;
   }
 
@@ -214,6 +257,9 @@ export class WorkflowOrchestrator {
       ...(options.continueSessions ? { continueSessions: options.continueSessions } : {}),
       ...(options.web ? { web: true } : {}),
       ...(options.catchUp && Object.keys(options.catchUp).length ? { catchUp: options.catchUp } : {}),
+      ...(options.agents && options.agents !== 'claude-codex' ? { agents: options.agents } : {}),
+      ...(options.brief?.trim() ? { brief: options.brief.trim().slice(0, BRIEF_LIMIT) } : {}),
+      ...(options.editorContext ? { editorContext: options.editorContext } : {}),
     };
     // A conversation keeps editing the same worktree until its changes are applied or discarded.
     const reused = options.worktree;
@@ -250,6 +296,7 @@ export class WorkflowOrchestrator {
     delete run.error;
     delete run.completedAt;
     delete run.limitReset;
+    delete run.offlineSince;
     run.resumeCount = (run.resumeCount ?? 0) + 1;
     return this.execute(run);
   }
@@ -289,7 +336,7 @@ export class WorkflowOrchestrator {
 
     try {
       await this.update(run);
-      if (editsFiles(run.kind) && run.isolation === 'worktree') await this.ensureWorktree(run, signal);
+      if (editsFiles(run.kind) && (run.isolation === 'worktree' || editsDirectly(run.kind))) await this.ensureWorktree(run, signal);
       for (const adapter of Object.values(this.adapters)) {
         for (const warning of (await adapter.preflightWarnings?.(workingDirectory(run))) ?? []) this.warn(run, warning);
       }
@@ -314,12 +361,15 @@ export class WorkflowOrchestrator {
         }
         await this.executeStage(run, stage, signal, snapshot);
         snapshot = undefined;
-        if (stage.permission === 'workspace-write') {
+        if (stage.permission !== 'read-only') {
           await this.verify(run, stage, signal);
           this.repair(run, index, stage);
         }
         if (stage.gate) this.gate(run, index, stage);
-        if (stage.onFail === 'revise') this.revise(run, index, stage);
+        if (stage.onFail === 'revise') {
+          this.revise(run, index, stage);
+          await this.consultReferee(run, index, stage, signal);
+        }
       }
       run.status = run.unresolved ? 'completed-with-findings' : 'completed';
       run.completedAt = now();
@@ -327,9 +377,10 @@ export class WorkflowOrchestrator {
     } catch (error) {
       const cancelled = signal.aborted || error instanceof StoppedByUser;
       run.status = cancelled ? 'cancelled' : 'failed';
-      run.error = messageOf(error);
+      run.error = signal.aborted && signal.reason instanceof StoppedByUser ? signal.reason.message : messageOf(error);
       run.completedAt = now();
       if (error instanceof LimitReachedError) run.limitReset = error.resetAt;
+      if (error instanceof ConnectionLostError) run.offlineSince = run.completedAt;
       const running = run.stages.find((stage) => stage.status === 'running');
       if (running) {
         running.status = cancelled ? 'cancelled' : 'failed';
@@ -356,7 +407,7 @@ export class WorkflowOrchestrator {
     if (!run.worktree) {
       if (!this.dependencies.prepareWorktree) throw new Error('Worktree isolation is enabled, but worktrees are unavailable.');
       this.log(run, 'Creating an isolated Git worktree for this run.');
-      const prepared = await this.dependencies.prepareWorktree(run.workspacePath, run.id, signal);
+      const prepared = await this.dependencies.prepareWorktree(run.workspacePath, run.id, signal, editsDirectly(run.kind));
       run.worktree = prepared.info;
       for (const warning of prepared.warnings) this.warn(run, warning);
       await this.update(run);
@@ -408,8 +459,10 @@ export class WorkflowOrchestrator {
     // An agent known to be at its usage limit is not tried again until the limit resets: the other agent
     // works alone meanwhile, or the run stops until the first limit resets.
     const known = limits?.active(stage.agent);
+    // The user chose one agent alone, so the other never stands in; at its limit the run pauses instead.
+    const fallback = this.options.fallbackOnQuota && run.agents !== 'claude' && run.agents !== 'codex';
     if (known) {
-      if (!this.options.fallbackOnQuota || limits?.active(other)) throw this.limitReached(stage);
+      if (!fallback || limits?.active(other)) throw this.limitReached(stage);
       stage.assignedAgent = other;
       stage.fallbackReason = `${AGENT_NAMES[stage.agent]} is at its usage limit until ${formatReset(known.until)}${known.estimated ? ' (estimated)' : ''}.`;
       await this.update(run);
@@ -421,8 +474,9 @@ export class WorkflowOrchestrator {
       stage.result = await this.attempt(run, stage, agent, prompts, signal);
     } catch (error) {
       if (signal.aborted) throw error;
+      await this.throwIfOffline(error);
       this.noteLimit(stage.assignedAgent, error);
-      const switchable = stage.assignedAgent === stage.agent && this.options.fallbackOnQuota && canFallback(error) && !limits?.active(other);
+      const switchable = stage.assignedAgent === stage.agent && fallback && canFallback(error) && !limits?.active(other);
       if (!switchable) throw limits && isQuotaError(error) ? this.limitReached(stage) : error;
       stage.assignedAgent = other;
       stage.fallbackReason = messageOf(error);
@@ -435,12 +489,14 @@ export class WorkflowOrchestrator {
         stage.result = await this.attempt(run, stage, other, this.prompts(run, stage, other, fresh, true, await inline(other)), signal);
       } catch (second) {
         if (signal.aborted) throw second;
+        await this.throwIfOffline(second);
         this.noteLimit(other, second);
         throw limits && isQuotaError(second) ? this.limitReached(stage) : second;
       }
     }
-    // A completed call shows the agent's limit, if it had one, has reset.
-    limits?.clear(stage.assignedAgent);
+    // A completed call shows the agent's earlier limit has reset, unless the call itself just reported the
+    // limit reached or nearly so, in which case the new limit stands.
+    if (!limits?.active(stage.assignedAgent)) limits?.clear(stage.assignedAgent);
 
     if (stage.review) stage.verdict = parseVerdict(stage.result.text);
     stage.status = 'completed';
@@ -448,6 +504,56 @@ export class WorkflowOrchestrator {
     run.usage[stage.assignedAgent] = addUsage(run.usage[stage.assignedAgent], stage.result.usage);
     await this.update(run);
     this.log(run, `Stage completed: ${stage.title}${stage.verdict ? ` (verdict: ${summarizeVerdict(stage.verdict)})` : ''}.`);
+  }
+
+  /**
+   * Passes on what a provider reported about its account's limits. A limit already reached, or a window all
+   * but used up, is recorded with its exact reset time, so the next stage goes to the other agent without
+   * failing first.
+   */
+  private noteQuota(reading: QuotaReading): void {
+    this.dependencies.onQuota?.(reading);
+    this.dependencies.limits?.observe(reading);
+  }
+
+  /** A connection error while the machine is offline pauses the run, since no agent could take the stage. */
+  private async throwIfOffline(error: unknown): Promise<void> {
+    if (!(error instanceof AgentExecutionError) || error.kind !== 'network' || !this.dependencies.online) return;
+    if (await this.dependencies.online().catch(() => true)) return;
+    throw new ConnectionLostError(`The network connection was lost (${error.message.split('\n')[0] ?? ''}). The message continues where it stopped when the connection is back.`);
+  }
+
+  /**
+   * Asks the referee to rule on each finding of a check that failed, before the revision that follows it.
+   * A referee that cannot rule is noted, and the revision goes ahead without it.
+   */
+  private async consultReferee(run: RunRecord, index: number, check: StageRecord, signal: AbortSignal): Promise<void> {
+    const referee = this.dependencies.referee;
+    if (!referee || !check.result || run.stages[index + 1]?.id !== 'claude-revise') return;
+    const ruling: StageRecord = {
+      id: 'referee',
+      context: 'lean',
+      title: `${referee.name} rules on the findings`,
+      agent: check.agent,
+      assignedAgent: check.agent,
+      permission: 'read-only',
+      purpose: 'Independent ruling on disputed findings',
+      instructions:
+        'You are an independent referee between two agents. The first answered the user\'s latest message; the second checked that answer and reported findings, both shown above. For each finding, rule upheld, partly upheld, or rejected, with one or two sentences of evidence from the files or sources, which you may read. Then say in one line which parts of the answer stand. Do not modify files.',
+      status: 'running',
+    };
+    try {
+      const snapshot = await this.snapshot(run);
+      const prompt = buildStagePrompt(run, ruling, snapshot, this.options.maxContextCharacters, { redact: this.options.redactSecrets !== false });
+      const result = await referee.rule({ prompt, cwd: workingDirectory(run), signal, untrustedDirectories: untrustedDirectories(run) });
+      check.referee = { referee: referee.name, text: result.text, ...(result.usage ? { usage: result.usage } : {}), ...(result.model ? { model: result.model } : {}) };
+      this.log(run, `${referee.name} ruled on the findings of "${check.title}".`);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      check.referee = { referee: referee.name, text: '', error: messageOf(error) };
+      this.warn(run, `${referee.name} could not rule on the check: ${messageOf(error)}`);
+    }
+    await this.update(run);
   }
 
   /** Records a usage limit the agent reported, so later stages skip it until the limit resets. */
@@ -518,6 +624,7 @@ export class WorkflowOrchestrator {
       signal,
       onEvent: (agentEvent) => {
         recordActivity(stage, agentEvent);
+        if (agentEvent.quota) this.noteQuota(agentEvent.quota);
         this.emit({ type: 'agent-event', run, agentEvent, stageId: stage.id });
       },
       ...(prompts.resume ? { resume: prompts.resume } : {}),
@@ -529,7 +636,9 @@ export class WorkflowOrchestrator {
       ...(stage.permission === 'workspace-write' && this.options.verificationCommands?.length ? { allowedCommands: this.options.verificationCommands } : {}),
     };
     try {
-      return await this.adapters[agent].run(request);
+      const result = await this.adapters[agent].run(request);
+      if (result.quota) this.noteQuota(result.quota);
+      return result;
     } catch (error) {
       // Quota spent by a failed attempt is still spent.
       if (error instanceof AgentExecutionError && error.usage) run.usage[agent] = addUsage(run.usage[agent], error.usage);
@@ -550,9 +659,9 @@ export class WorkflowOrchestrator {
    * reviewer sees working code. It is added at most once per run; later failures go to the gate.
    */
   private repair(run: RunRecord, index: number, stage: StageRecord): void {
-    if (!stage.checks?.length || checksPassed(stage.checks) || !run.allowWrites) return;
+    if (!stage.checks?.length || checksPassed(stage.checks) || !run.allowWrites || stage.expectFailingChecks) return;
     if (stage.id === 'claude-repair' || stage.round !== undefined || run.stages.some((item) => item.id === 'claude-repair')) return;
-    run.stages.splice(index + 1, 0, stageRecord(repairStage(stage.title), run.allowWrites));
+    run.stages.splice(index + 1, 0, stageRecord(arrangeStage(repairStage(stage.title), run.agents), run.allowWrites));
     this.log(run, `Checks failed after "${stage.title}"; Claude repairs them before the review.`);
   }
 
@@ -600,9 +709,9 @@ export class WorkflowOrchestrator {
     }
     const reason = reasons.join('; ');
     run.unresolved = reason;
-    const rounds = run.stages.filter((item) => item.round !== undefined && item.permission === 'workspace-write').length;
+    const rounds = run.stages.filter((item) => item.round !== undefined && item.permission !== 'read-only').length;
     if (!run.allowWrites || rounds >= (this.options.maxFixRounds ?? 0)) return;
-    run.stages.splice(index + 1, 0, ...fixRoundStages(rounds + 1, reason).map((item) => stageRecord(item, run.allowWrites)));
+    run.stages.splice(index + 1, 0, ...fixRoundStages(rounds + 1, reason).map((item) => stageRecord(arrangeStage(item, run.agents), run.allowWrites)));
     this.log(run, `The final gate did not pass (${reason}); starting fix round ${rounds + 1}.`);
   }
 
@@ -622,14 +731,16 @@ export class WorkflowOrchestrator {
       !stage.verdict || stage.verdict.outcome === 'missing'
         ? 'the check gave no machine-readable verdict'
         : `the check reported ${summarizeVerdict(stage.verdict)}`;
-    run.stages.splice(index + 1, 0, stageRecord(reviseStage(reason, run.kind), run.allowWrites));
+    run.stages.splice(index + 1, 0, stageRecord(arrangeStage(reviseStage(reason, run.kind), run.agents), run.allowWrites));
     this.log(run, `Codex's check did not pass (${reason}); Claude revises the answer.`);
   }
 
   private async snapshot(run: RunRecord): Promise<GitSnapshot> {
     let snapshot: GitSnapshot;
     try {
-      snapshot = await this.captureSnapshot(workingDirectory(run), untrustedDirectories(run));
+      // A folder edited directly reports its changes since the snapshot taken before the run.
+      const environment = run.worktree?.state === 'active' ? snapshotEnvironment(run.worktree) : {};
+      snapshot = await this.captureSnapshot(workingDirectory(run), untrustedDirectories(run), environment);
     } catch (error) {
       snapshot = { available: false, status: '', diff: '', diffStat: '', untracked: [], warnings: [`Git snapshot failed: ${messageOf(error)}`] };
     }

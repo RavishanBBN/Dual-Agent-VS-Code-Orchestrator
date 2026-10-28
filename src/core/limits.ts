@@ -2,7 +2,7 @@
  * Remembers which agent reported a usage limit and when it can be tried again, so later stages go straight
  * to the other agent instead of failing first, and a stopped run knows when to continue.
  */
-import type { AgentId } from './types.js';
+import type { AgentId, QuotaReading } from './types.js';
 
 export interface AgentLimit {
   agent: AgentId;
@@ -22,8 +22,11 @@ const HOUR = 60 * MINUTE;
 const RETRY_MS = [15 * MINUTE, 30 * MINUTE, HOUR, 2 * HOUR];
 /** Weekly limits are the longest providers have; a reset further out than this is not trusted. */
 const LONGEST_WAIT_MS = 8 * 24 * HOUR;
+/** A usage window this full is treated as reached, so the other agent takes over before a call fails. */
+export const NEARLY_EXHAUSTED = 98;
 
 const UNITS: Record<string, number> = { d: 24 * HOUR, h: HOUR, m: MINUTE, s: 1_000 };
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 
 /** Sums a duration such as "2 hours 13 minutes", "4h 12m", or "1 day, 3 hours and 5 minutes". */
 function duration(text: string): number | undefined {
@@ -60,6 +63,20 @@ export function parseLimitReset(message: string, now: Date): Date | undefined {
   const relative = /\b(?:in|after)\s+((?:\d+(?:\.\d+)?\s*(?:d|days?|h|hrs?|hours?|m|mins?|minutes?|s|secs?|seconds?)\b[\s,]*(?:and\s+)?)+)/i.exec(message)?.[1];
   const wait = relative ? duration(relative) : undefined;
   if (wait) return plausible(new Date(now.getTime() + wait));
+
+  // Weekly limits name a date: "try again at Oct 30th, 2026 5:51 PM", "resets Nov 3, 9am".
+  const dated =
+    /\b(?:resets?|reset at|try again at|available at|until)\s+(?:at\s+|on\s+)?(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?(?:\s+(\d{4}))?,?(?:\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?)?/i.exec(
+      message,
+    );
+  if (dated) {
+    const month = MONTHS.indexOf((dated[1] ?? '').toLowerCase());
+    const hour = dated[4] ? (Number(dated[4]) % 12) + ((dated[6] ?? '').toLowerCase() === 'p' ? 12 : 0) : 0;
+    const at = new Date(Number(dated[3] ?? now.getFullYear()), month, Number(dated[2]), hour, Number(dated[5] ?? 0), 0, 0);
+    // Without a year, a date already past this year means next year.
+    if (!dated[3] && at.getTime() <= now.getTime()) at.setFullYear(at.getFullYear() + 1);
+    return plausible(at);
+  }
 
   const twelve = /\b(?:resets?|reset at|try again at|available at|until)\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?\b/i.exec(message);
   if (twelve) {
@@ -124,6 +141,22 @@ export class AgentLimits {
     this.limits.set(agent, limit);
     this.changed();
     return limit;
+  }
+
+  /**
+   * Records a limit from what a provider reported about its account: a limit already reached, or a window
+   * all but used up, until that window resets. A reading taken outside Dual Agent counts the same way.
+   */
+  public observe(reading: QuotaReading): AgentLimit | undefined {
+    if (this.active(reading.agent)) return undefined;
+    const exhausted = reading.windows
+      .filter((window) => window.usedPercent >= NEARLY_EXHAUSTED && window.resetsAt)
+      .map((window) => window.resetsAt as string)
+      .sort()
+      .at(-1);
+    const until = reading.limited ? (reading.resetsAt ?? exhausted) : exhausted;
+    if (!until || Date.parse(until) <= this.clock()) return undefined;
+    return this.record(reading.agent, `Usage limit ${reading.limited ? 'reached' : 'nearly reached'}; it resets at ${until}.`);
   }
 
   /** The agent completed a call, so whatever limit it had has reset. */

@@ -16,6 +16,12 @@ export function totalUsageByAgent(): Record<AgentId, TokenUsage> {
   return { claude: emptyUsage(), codex: emptyUsage() };
 }
 
+/** The local calendar day of a time, such as "2026-10-28", which daily usage is filed under. */
+export function localDay(time: number | Date): string {
+  const date = new Date(time);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
 /** Input plus output; cached input and reasoning are already parts of those. */
 export function totalTokens(usage: TokenUsage): number {
   return usage.inputTokens + usage.outputTokens;

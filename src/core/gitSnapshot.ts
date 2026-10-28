@@ -53,7 +53,15 @@ async function readUntracked(cwd: string, listing: string): Promise<{ files: Unt
   return { files, warnings };
 }
 
-export async function captureGitSnapshot(cwd: string, untrustedDirectories: readonly string[] = []): Promise<GitSnapshot> {
+/**
+ * The workspace's status, diff, and untracked files. `environment` points Git at the hidden snapshot repository
+ * of a folder edited directly, so its changes since the snapshot are reported the same way.
+ */
+export async function captureGitSnapshot(
+  cwd: string,
+  untrustedDirectories: readonly string[] = [],
+  environment: NodeJS.ProcessEnv = {},
+): Promise<GitSnapshot> {
   let git: string;
   try {
     // Never let the workspace supply git: on Windows a planted git.exe there would otherwise run first.
@@ -62,10 +70,10 @@ export async function captureGitSnapshot(cwd: string, untrustedDirectories: read
     return unavailable(`Git is unavailable, so agents receive no diff: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const probe = await runGit(git, cwd, ['rev-parse', '--is-inside-work-tree']);
+  const probe = await runGit(git, cwd, ['rev-parse', '--is-inside-work-tree'], { environment });
   if (!probe.ok || probe.stdout.trim() !== 'true') return unavailable(describeGitFailure(probe.stderr, cwd));
 
-  const hasHead = (await runGit(git, cwd, ['rev-parse', '--verify', '--quiet', 'HEAD'])).ok;
+  const hasHead = (await runGit(git, cwd, ['rev-parse', '--verify', '--quiet', 'HEAD'], { environment })).ok;
   // Compare against HEAD so staged changes are reviewed too; a repository without commits has no HEAD.
   const diffs = (extra: string[]): string[][] =>
     hasHead
@@ -76,10 +84,10 @@ export async function captureGitSnapshot(cwd: string, untrustedDirectories: read
         ];
 
   const [status, diffParts, statParts, untrackedListing] = await Promise.all([
-    runGit(git, cwd, ['status', '--short']),
-    Promise.all(diffs(['--unified=3']).map((args) => runGit(git, cwd, args))),
-    Promise.all(diffs(['--stat']).map((args) => runGit(git, cwd, args))),
-    runGit(git, cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
+    runGit(git, cwd, ['status', '--short'], { environment }),
+    Promise.all(diffs(['--unified=3']).map((args) => runGit(git, cwd, args, { environment }))),
+    Promise.all(diffs(['--stat']).map((args) => runGit(git, cwd, args, { environment }))),
+    runGit(git, cwd, ['ls-files', '--others', '--exclude-standard', '-z'], { environment }),
   ]);
 
   const warnings: string[] = [];

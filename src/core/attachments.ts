@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { lstat, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Worker } from 'node:worker_threads';
 
@@ -374,6 +374,72 @@ export async function storeAttachment(folder: string, source: AttachmentSource, 
   }
   if (notes.length) reference.notes = notes;
   return reference;
+}
+
+/** Folders a folder attachment never copies: dependencies, version control, and caches. */
+const SKIPPED_FOLDERS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__', '.cache', '.idea', '.vscode']);
+
+/**
+ * Copies a folder the user attached, such as a literature folder of PDFs, into private storage. Only regular
+ * files are copied, within the archive limits, skipping links, dependency folders, and files whose names
+ * suggest secrets. Each PDF and Office file gets a text version beside it, so Codex can read it too.
+ */
+export async function storeFolder(folder: string, source: string, options: StoreOptions = {}): Promise<AttachmentRef> {
+  const id = randomBytes(6).toString('hex');
+  const name = safeFileName(path.basename(source)) || 'folder';
+  const target = path.join(folder, `${id}-${name}.folder`);
+  await mkdir(target, { recursive: true });
+  const listing: string[] = [];
+  const skipped: string[] = [];
+  let total = 0;
+  let count = 0;
+  const walk = async (relative: string): Promise<void> => {
+    const entries = await readdir(path.join(source, relative), { withFileTypes: true });
+    for (const entry of entries) {
+      const child = relative ? `${relative}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) skipped.push(`${child} (link)`);
+      else if (entry.isDirectory()) {
+        if (SKIPPED_FOLDERS.has(entry.name)) skipped.push(`${child}/ (dependencies or tooling)`);
+        else await walk(child);
+      } else if (entry.isFile()) {
+        if (looksSensitive(entry.name)) {
+          skipped.push(`${child} (name suggests a secret)`);
+          continue;
+        }
+        const info = await lstat(path.join(source, child));
+        if (info.size > ATTACHMENT_LIMITS.fileBytes) {
+          skipped.push(`${child} (over ${ATTACHMENT_LIMITS.fileBytes / 1024 / 1024} MB)`);
+          continue;
+        }
+        if (count >= ATTACHMENT_LIMITS.archiveEntries || total + info.size > ATTACHMENT_LIMITS.archiveBytes) {
+          skipped.push(`${child} (the folder is over the attachment limit)`);
+          continue;
+        }
+        const destination = path.join(target, ...child.split('/'));
+        if (!isInsideDirectory(destination, target)) continue;
+        await mkdir(path.dirname(destination), { recursive: true });
+        await copyFile(path.join(source, child), destination);
+        count += 1;
+        total += info.size;
+        listing.push(`${child} (${info.size} bytes)`);
+        const extension = path.extname(entry.name).toLowerCase();
+        if (extension === '.pdf' && options.extractPdfText) {
+          try {
+            await writeFile(`${destination}.txt`, limitText(await options.extractPdfText(await readFile(destination))) || '(no text found)');
+          } catch {
+            skipped.push(`${child} (text could not be extracted; Claude can still read it)`);
+          }
+        } else if (OFFICE.has(extension)) {
+          await writeFile(`${destination}.txt`, limitText(officeText(entry.name, await readFile(destination)).text) || '(no text found)');
+        }
+      }
+    }
+  };
+  await walk('');
+  const textPath = `${target}.listing.txt`;
+  await writeFile(textPath, listing.join('\n') || '(the folder has no files that could be attached)');
+  const notes = skippedNote(skipped);
+  return { id, name: `${path.basename(source)}/`, kind: 'archive', path: target, extractedPath: target, textPath, size: total, ...(notes.length ? { notes } : {}) };
 }
 
 /** References a workspace file the user mentioned with `@`; it is read in place, not copied. */

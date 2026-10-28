@@ -1,6 +1,6 @@
 import type { TokenUsage } from './types.js';
 
-export type FailureKind = 'quota' | 'authentication' | 'unavailable' | 'cancelled' | 'timeout' | 'invalid' | 'unknown';
+export type FailureKind = 'quota' | 'authentication' | 'network' | 'unavailable' | 'cancelled' | 'timeout' | 'invalid' | 'unknown';
 
 /** Error details are persisted and shown to the user, so they are capped. */
 export const ERROR_DETAIL_LIMIT = 2_000;
@@ -29,6 +29,14 @@ export class LimitReachedError extends AgentExecutionError {
   }
 }
 
+/** The machine is offline, so no agent can run; the run continues when the connection is back. */
+export class ConnectionLostError extends AgentExecutionError {
+  public constructor(message: string) {
+    super(message, 'network');
+    this.name = 'ConnectionLostError';
+  }
+}
+
 export function isQuotaError(error: unknown): error is AgentExecutionError {
   return error instanceof AgentExecutionError && error.kind === 'quota';
 }
@@ -45,6 +53,14 @@ export function limitDetail(message: string, limit = ERROR_DETAIL_LIMIT): string
 export function classifyFailure(message: string): FailureKind {
   const value = message.toLowerCase();
   if (/\b(?:cancelled|canceled|aborted)\b/.test(value)) return 'cancelled';
+  // What Claude Code, Codex, and Node report when the connection fails, checked before any generic timeout.
+  if (
+    /\b(?:enotfound|econnrefused|econnreset|econnaborted|enetunreach|enetdown|ehostunreach|eai_again|etimedout)\b|getaddrinfo|connection (?:error|refused|reset|closed|failed|timed out)|network (?:error|is unreachable|is down|unavailable)|fetch failed|socket hang up|error sending request|stream disconnected|failed to connect|unable to connect|could not resolve host|dns error|failed to lookup address|tcp connect error|no internet|(?:you are|appear to be) offline/.test(
+      value,
+    )
+  ) {
+    return 'network';
+  }
   if (/\btimed? out\b|\btimeout\b/.test(value)) return 'timeout';
   if (
     /usage limit|rate[ _-]limit|\bquota\b|too many requests|\b429\b|\blimit reached\b|hit your (?:usage )?limit|(?:5-hour|weekly|daily|session) limit|credit balance is too low|out of (?:credits|tokens)|insufficient (?:credits|balance)/.test(
@@ -62,5 +78,6 @@ export function classifyFailure(message: string): FailureKind {
 }
 
 export function canFallback(error: unknown): boolean {
-  return error instanceof AgentExecutionError && ['quota', 'unavailable', 'timeout'].includes(error.kind);
+  // A connection error while the machine is online is one provider's outage, which the other agent can cover.
+  return error instanceof AgentExecutionError && ['quota', 'network', 'unavailable', 'timeout'].includes(error.kind);
 }

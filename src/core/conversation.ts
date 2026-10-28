@@ -71,12 +71,14 @@ function isConversation(value: unknown): value is Conversation {
 }
 
 /**
- * The stage whose text the user should read as the run's answer: the last completed stage in Claude's role,
- * whoever ran it, so an answer Codex gave alone while Claude was at its limit still counts.
+ * The stage whose text the user should read as the run's answer: the last completed stage that does the work
+ * rather than check it, whoever ran it. That holds when Codex leads, works alone, or stood in for Claude.
  */
 export function finalStage(run: RunRecord): RunRecord['stages'][number] | undefined {
-  return [...run.stages].reverse().find((stage) => stage.status === 'completed' && stage.agent === 'claude' && stage.result?.text);
+  return [...run.stages].reverse().find((stage) => stage.status === 'completed' && !stage.review && stage.result?.text);
 }
+
+const NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
 
 /** "1 high issue" or "3 issues (1 high, 2 low)", for the outcome line. */
 export function issueSummary(verdict: ReviewVerdict): string {
@@ -91,22 +93,35 @@ export function issueSummary(verdict: ReviewVerdict): string {
 
 /** How the two agents ended up on this run, for the transcript and for the turn record. */
 export function describeOutcome(run: RunRecord): string {
+  if (run.status === 'failed' && run.offlineSince) return 'Waiting for the network';
   if (run.status === 'failed') return `Failed: ${run.error ?? 'no reason recorded'}`;
   if (run.status === 'cancelled') return 'Stopped';
   if (run.status === 'completed' && run.stages.every((stage) => stage.id === 'claude-intro')) return 'Quick reply, nothing to check';
   const reviews = run.stages.filter((stage) => stage.review && stage.status === 'completed' && stage.verdict);
   const last = reviews.at(-1);
-  if (!last?.verdict) return run.status === 'completed' ? 'Completed' : run.status;
-  const revised = run.stages.some((stage) => stage.id === 'claude-revise' && stage.status === 'completed');
+  if (!last?.verdict) {
+    const worker = finalStage(run)?.assignedAgent;
+    if (run.status === 'completed' && run.stages.some((stage) => stage.id === 'claude-merge' && stage.status === 'completed')) {
+      return `${worker ? NAMES[worker] : 'Claude'} merged two independent answers`;
+    }
+    if (run.status === 'completed' && (run.agents === 'claude' || run.agents === 'codex')) return `${NAMES[run.agents]} alone, without a check`;
+    return run.status === 'completed' ? 'Completed' : run.status;
+  }
+  // The agents that actually ran, which differ from the usual roles when Codex leads or one stood in.
+  const checker = NAMES[last.assignedAgent];
+  const reviser = run.stages.find((stage) => stage.id === 'claude-revise' && stage.status === 'completed');
   const first = reviews[0]?.verdict ?? last.verdict;
-  if (revised) return `Claude revised the answer after Codex found ${issueSummary(first)}`;
-  if (run.status === 'completed-with-findings') return `Codex still reports ${issueSummary(last.verdict)}`;
-  if (last.verdict.outcome === 'pass') return reviews.length > 1 && first.outcome !== 'pass' ? `Codex agreed after Claude fixed ${issueSummary(first)}` : 'Codex agreed';
+  if (reviser) return `${NAMES[reviser.assignedAgent]} revised the answer after ${NAMES[reviews[0]?.assignedAgent ?? last.assignedAgent]} found ${issueSummary(first)}`;
+  if (run.status === 'completed-with-findings') return `${checker} still reports ${issueSummary(last.verdict)}`;
+  if (last.verdict.outcome === 'pass') {
+    const fixer = finalStage(run)?.assignedAgent;
+    return reviews.length > 1 && first.outcome !== 'pass' ? `${checker} agreed after ${fixer ? NAMES[fixer] : 'Claude'} fixed ${issueSummary(first)}` : `${checker} agreed`;
+  }
   if (run.kind === 'chat' && onlyMinorFindings(last.verdict)) {
     const count = last.verdict.findings.length;
-    return `Codex agreed, with ${count} minor note${count === 1 ? '' : 's'}`;
+    return `${checker} agreed, with ${count} minor note${count === 1 ? '' : 's'}`;
   }
-  return `Codex found ${issueSummary(last.verdict)}`;
+  return `${checker} found ${issueSummary(last.verdict)}`;
 }
 
 /** Records a finished run on its turn: the answer, the outcome, and the sessions the next turn continues. */
@@ -178,6 +193,18 @@ export function conversationHistory(conversation: Conversation, budget: number):
     used += entry.length;
   }
   return entries.join('\n\n');
+}
+
+/** The conversation as Markdown, for export: each message with its mode and attachments, the answer, and how the agents agreed. */
+export function conversationMarkdown(conversation: Conversation): string {
+  const parts = [`# ${conversation.title}`, '', `Exported from Dual Agent on ${new Date().toISOString().slice(0, 10)}.`];
+  for (const turn of conversation.turns) {
+    const when = turn.createdAt.slice(0, 16).replace('T', ' ');
+    const files = turn.attachments.length ? `\n\nAttached: ${turn.attachments.map((item) => item.name).join(', ')}` : '';
+    parts.push('', '---', '', `## You (${turn.mode}, ${when})`, '', turn.message + files);
+    parts.push('', `## Answer${turn.outcome ? ` (${turn.outcome})` : ''}`, '', turn.answer ?? (turn.error ? `_No answer: ${turn.error}_` : '_No answer._'));
+  }
+  return `${parts.join('\n')}\n`;
 }
 
 /** Stores each conversation in its own file, so a save rewrites only that conversation. */

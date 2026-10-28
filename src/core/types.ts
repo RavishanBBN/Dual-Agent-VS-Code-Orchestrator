@@ -1,7 +1,21 @@
 export type AgentId = 'claude' | 'codex';
-/** `chat`, `edit`, and `research` handle one message of a conversation; the others can also run standalone. */
-export type WorkflowKind = 'implementation' | 'brainstorming' | 'chat' | 'edit' | 'research';
-export type PermissionMode = 'read-only' | 'workspace-write';
+/**
+ * `chat`, `edit`, `research`, `compare`, and `tdd` handle one message of a conversation; the others can also
+ * run standalone. `compare` has both agents answer independently before one merges; `tdd` writes failing
+ * tests first and then the code that passes them.
+ */
+export type WorkflowKind = 'implementation' | 'brainstorming' | 'chat' | 'edit' | 'research' | 'compare' | 'tdd' | 'agent';
+/**
+ * Which agents a message uses: both, with the first named leading and the second checking, or one alone,
+ * without an independent check.
+ */
+export type AgentSelection = 'claude-codex' | 'codex-claude' | 'claude' | 'codex';
+export const AGENT_SELECTIONS: readonly AgentSelection[] = ['claude-codex', 'codex-claude', 'claude', 'codex'];
+/**
+ * `agent` is the full toolset of the CLI in the folder itself (commands, installs, edits, the web), with the
+ * user approving each command or edit the agent does not judge read-only, as in an interactive session.
+ */
+export type PermissionMode = 'read-only' | 'workspace-write' | 'agent';
 export type RunStatus =
   | 'queued'
   | 'running'
@@ -52,6 +66,10 @@ export interface WorkflowStageDefinition {
   requiresApproval?: boolean;
   /** Fix round that added this stage; absent for template stages. */
   round?: number;
+  /** The stage answers on its own, without seeing earlier stages' output, so two answers stay independent. */
+  blind?: boolean;
+  /** The checks after this stage are expected to fail, as freshly written tests do, so no repair follows. */
+  expectFailingChecks?: boolean;
 }
 
 export type VerdictOutcome = 'pass' | 'fail' | 'missing';
@@ -91,6 +109,50 @@ export interface StageResult {
   resumedSession?: boolean;
   /** Model the provider reported using, when it reports one. */
   model?: string;
+  /** The account's usage limits as the provider last reported them. */
+  quota?: QuotaReading;
+}
+
+/** One usage window of an account, such as the five-hour or the weekly limit. */
+export interface QuotaWindow {
+  /** As the provider names it, such as `five_hour` or `weekly`. */
+  name: string;
+  /** How much of the window is used, 0 to 100. */
+  usedPercent: number;
+  resetsAt?: string;
+}
+
+/** What a provider reported about the account's usage limits after a call. */
+export interface QuotaReading {
+  agent: AgentId;
+  windows: QuotaWindow[];
+  /** The provider refuses calls until `resetsAt`. */
+  limited: boolean;
+  resetsAt?: string;
+  plan?: string;
+  observedAt: string;
+}
+
+/** A third model's ruling on a disputed check, when a referee is configured. */
+export interface RefereeRuling {
+  referee: string;
+  text: string;
+  usage?: TokenUsage;
+  model?: string;
+  /** Why the referee could not rule; the revision then proceeds without it. */
+  error?: string;
+}
+
+/** What the user had open in the editor when sending, so the agents start from it. */
+export interface EditorContext {
+  /** Path relative to the workspace folder. */
+  file: string;
+  startLine?: number;
+  endLine?: number;
+  /** The selected text, trimmed. */
+  selection?: string;
+  /** Errors and warnings VS Code reports for the file, one line each. */
+  diagnostics?: string[];
 }
 
 /** Model and reasoning effort chosen for one agent; absent values use the CLI's own default. */
@@ -135,6 +197,8 @@ export interface StageRecord extends WorkflowStageDefinition {
   checks?: CheckResult[];
   /** The steps the agent took, bounded so run history stays small. */
   activities?: AgentActivity[];
+  /** A third model's ruling, when this check failed and a referee is configured. */
+  referee?: RefereeRuling;
 }
 
 export interface WorktreeInfo {
@@ -149,6 +213,17 @@ export interface WorktreeInfo {
   state: 'active' | 'applied' | 'discarded';
   /** True once the configured setup commands have succeeded in this worktree. */
   setupCompleted?: boolean;
+  /**
+   * Set when the agents edit the folder itself rather than an isolated copy, for a folder without a Git
+   * repository or for Agent mode: the hidden repository in private storage that holds the snapshot taken
+   * first. `path`, `workingDirectory`, and `repositoryRoot` are then the folder, and `baseCommit` the snapshot.
+   */
+  gitDir?: string;
+  /**
+   * Why the folder is edited directly: Agent mode works on the real folder by design, while `folder` means it is
+   * not a Git repository, so no isolated copy is possible for any mode.
+   */
+  snapshotFor?: 'agent' | 'folder';
 }
 
 export interface ApprovalRecord {
@@ -200,6 +275,14 @@ export interface RunRecord {
    * first of those limits resets, after which the run can continue.
    */
   limitReset?: string;
+  /** The run stopped because the machine went offline; it continues when the connection is back. */
+  offlineSince?: string;
+  /** Which agents the run uses; absent means both, with Claude leading. */
+  agents?: AgentSelection;
+  /** The user's project brief, given to every stage as their guidance. */
+  brief?: string;
+  /** The file and selection the user had open when sending. */
+  editorContext?: EditorContext;
 }
 
 /** Everything about a new run beyond its kind, objective, folder, and consent. */
@@ -213,6 +296,9 @@ export interface StartOptions {
   worktree?: WorktreeInfo;
   web?: boolean;
   catchUp?: Partial<Record<AgentId, string>>;
+  agents?: AgentSelection;
+  brief?: string;
+  editorContext?: EditorContext;
 }
 
 export interface AgentRunRequest {
@@ -244,7 +330,7 @@ export interface AgentRunRequest {
   allowedCommands?: readonly (readonly string[])[];
 }
 
-export type ActivityKind = 'read' | 'search' | 'edit' | 'command' | 'web' | 'reasoning' | 'tool';
+export type ActivityKind = 'read' | 'search' | 'edit' | 'command' | 'web' | 'reasoning' | 'todo' | 'tool';
 
 /** One step an agent took, such as reading a file or running a command. */
 export interface AgentActivity {
@@ -278,6 +364,8 @@ export interface AgentStreamEvent {
   delta?: string;
   activity?: AgentActivity;
   activityResult?: ActivityResult;
+  /** The account's usage limits, when the provider reports them during the call. */
+  quota?: QuotaReading;
 }
 
 export interface AgentHealth {
