@@ -2,7 +2,7 @@
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent Orchestrator",
   "description": "Claude answers and Codex checks the answer: a chat where two coding agents review each other, with attachments, cited web research, isolated edits you review and apply, and token usage.",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "private": true,
   "publisher": "NileshRavishan",
   "license": "MIT",

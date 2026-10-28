@@ -2,7 +2,19 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
-## [Unreleased]
+## [2.3.1] - 2026-10-28
+
+The assistant introduces itself, and the chat runs on Preact 11.
+
+### Added
+
+- **Quick replies about the assistant.**
+  - **What counts:** a greeting, a thank-you, or a question such as "hi, what are your skills?" or "who are you?".
+  - **The reply:** one answer from the pair, built from a description of Dual Agent's modes, features, and limits.
+  - **What it skips:** the workspace and Codex's check, so it costs one call instead of two or three.
+  - **Any mode:** it applies in every mode, so a greeting in Edit mode no longer asks to edit files.
+  - **What still gets the full workflow:** a message that names a task, a file, or code, or that has an attachment.
+  - **Other wordings:** every Chat and Research prompt now says the agents speak for Dual Agent, so the assistant describes itself accurately however it is asked.
 
 ### Changed
 

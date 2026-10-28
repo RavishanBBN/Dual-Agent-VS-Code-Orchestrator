@@ -6,7 +6,7 @@ This document is the maintained implementation ledger for Dual Agent Orchestrato
 
 | Field | Value |
 |---|---|
-| Release | 2.3.0 (Marketplace-ready: solo mode at usage limits, automatic continuation, message queue, retry and edit, secret masking, Trusted Types, signed releases) |
+| Release | 2.3.1 (quick replies about the assistant; Preact 11, eslint 10, unpdf 1.9.1), after 2.3.0 (Marketplace-ready: solo mode at usage limits, automatic continuation, message queue, retry and edit, secret masking, Trusted Types, signed releases) |
 | Last updated | 2026-10-28 |
 | Product scope | Desktop VS Code extension, trusted local workspaces only |
 | Interface | Chat webview (side bar or editor tab); native Runs and Agents views, commands, status bar, output channel, read-only documents, diff editors |
@@ -67,7 +67,7 @@ Results of the 2.3.0 verification on Windows 11 with Node.js 22.13.0 and VS Code
 |---|---|---|
 | Dependency audit | Passed | `npm audit`: 0 vulnerabilities; `npm audit signatures` on a clean `npm ci`: 282 packages with verified registry signatures, 62 with verified attestations |
 | TypeScript and ESLint | Passed | Strict `tsc --noEmit`; type-aware ESLint with zero findings |
-| Unit and integration tests | Passed | 241 passed, 1 skipped (POSIX-only symlink test), 21 files, coverage thresholds met |
+| Unit and integration tests | Passed | 245 passed, 1 skipped (POSIX-only symlink test), 22 files, coverage thresholds met (2.3.1) |
 | Smoke test in VS Code | Passed | Everything from 2.2.0, plus: the extension activated under its Marketplace ID; a second Edit message was edited and resent, its file was undone from the checkpoint, and Claude started a new session; a message sent during a run waited in the queue and then ran by itself; the chat page reported no script errors or blocked content under Trusted Types; the walkthrough opened |
 | Workflow lint | Passed | The GitHub Actions extension reported no problems in `ci.yml`, `codeql.yml`, or `release.yml`; action SHAs checked against their tags with `git ls-remote` |
 | VSIX package | Passed | `dual-agent-orchestrator-2.3.0.vsix`, 18 files, 753 KB, `vsce package` without bypass flags and with no warnings; docs and screenshots excluded |
