@@ -40,11 +40,25 @@ const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
  */
 const CLAUDE_READ_TOOLS = ['Read', 'Grep', 'Glob'];
 const CLAUDE_EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
+const CLAUDE_WEB_TOOLS = ['WebSearch', 'WebFetch'];
+/** Arguments simple enough to put in an exact Bash rule without quoting. */
+const RULE_ARGUMENT = /^[\w@%+=:,./-]+$/;
+
+/**
+ * Prefix rules for the verification commands, so Claude can run them, with extra arguments such as a single
+ * test file, and nothing else. Claude Code checks each part of a compound command against the rule.
+ */
+export function commandRules(commands: readonly (readonly string[])[] | undefined): string[] {
+  return (commands ?? [])
+    .filter((command) => command.length > 0 && command.every((part) => RULE_ARGUMENT.test(part)))
+    .map((command) => `Bash(${command.join(' ')}:*)`);
+}
 /** The tool a permission rule names, such as `Bash` for `Bash(npm test:*)`. */
 const RULE_TOOL = /^([A-Za-z][A-Za-z0-9]*)(?:\(|$)/;
 
-function claudeTools(writes: boolean, rules: readonly string[]): string {
+function claudeTools(writes: boolean, rules: readonly string[], web: boolean): string {
   const tools = new Set(writes ? [...CLAUDE_READ_TOOLS, ...CLAUDE_EDIT_TOOLS] : CLAUDE_READ_TOOLS);
+  if (web) for (const tool of CLAUDE_WEB_TOOLS) tools.add(tool);
   for (const rule of rules) {
     const tool = RULE_TOOL.exec(rule)?.[1];
     if (tool) tools.add(tool);
@@ -63,6 +77,8 @@ export interface RunArguments {
   options?: AgentOptions;
   images?: readonly string[];
   readableDirectories?: readonly string[];
+  web?: boolean;
+  allowedCommands?: readonly (readonly string[])[];
 }
 
 /** The run's model and effort, else the configured defaults; invalid values are skipped, never passed on. */
@@ -79,8 +95,12 @@ export function claudeArguments(
   run: RunArguments = {},
 ): string[] {
   const writes = permission === 'workspace-write';
-  // Tool rules extend write stages only; a read-only stage can read and search, nothing else.
-  const rules = writes ? (configuration.claudeAllowedTools ?? []) : [];
+  // Tool rules extend write stages only; a read-only stage can read and search (and use the web when allowed).
+  const web = run.web === true;
+  const rules = [
+    ...(writes ? [...(configuration.claudeAllowedTools ?? []), ...commandRules(run.allowedCommands)] : []),
+    ...(web ? CLAUDE_WEB_TOOLS : []),
+  ];
   const args = [
     '-p',
     '--input-format',
@@ -100,7 +120,7 @@ export function claudeArguments(
     '--permission-mode',
     writes ? 'acceptEdits' : 'plan',
     '--tools',
-    claudeTools(writes, rules),
+    claudeTools(writes, rules, web),
   ];
   if (rules.length) args.push('--allowedTools', ...rules);
   // Attachment folders are readable through the same Read, Grep, and Glob tools; nothing else is granted.
@@ -118,7 +138,8 @@ function isMissingSession(error: unknown): boolean {
 
 export function codexArguments(configuration: AdapterConfiguration, permission: PermissionMode, run: RunArguments = {}): string[] {
   const writes = permission === 'workspace-write';
-  const args = ['exec', '--json'];
+  // `--search` is a top-level option, so it comes before the subcommand.
+  const args = [...(run.web ? ['--search'] : []), 'exec', '--json'];
   // `--image` takes several values, so a fixed-arity flag always follows it before the stdin marker.
   for (const image of run.images ?? []) args.push('--image', image);
   args.push('--sandbox', writes ? 'workspace-write' : 'read-only');
@@ -224,6 +245,8 @@ abstract class CliAdapter implements AgentAdapter {
           ...(request.options ? { options: request.options } : {}),
           ...(request.images ? { images: request.images } : {}),
           ...(request.readableDirectories ? { readableDirectories: request.readableDirectories } : {}),
+          ...(request.web ? { web: true } : {}),
+          ...(request.allowedCommands ? { allowedCommands: request.allowedCommands } : {}),
         }),
         cwd: request.cwd,
         input: prompt,

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   claudeArguments,
+  commandRules,
   ClaudeCliAdapter,
   codexArguments,
   CodexCliAdapter,
@@ -122,6 +123,27 @@ describe('provider arguments', () => {
       '-',
     ]);
     expect(codexArguments({ ...base, effort: 'not-a-level' }, 'read-only')).not.toContain('--config');
+  });
+
+  it('adds web tools only when allowed, and exact rules only for simple verification commands', () => {
+    const plain = claudeArguments(base, 'read-only');
+    expect(plain[plain.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
+    const web = claudeArguments(base, 'read-only', undefined, { web: true });
+    expect(web[web.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,WebSearch,WebFetch');
+    expect(web.slice(web.indexOf('--allowedTools'), web.indexOf('--allowedTools') + 3)).toEqual(['--allowedTools', 'WebSearch', 'WebFetch']);
+
+    const edit = claudeArguments(base, 'workspace-write', undefined, { allowedCommands: [['node', '--test'], ['npm', 'run', 'lint']] });
+    expect(edit[edit.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,Edit,Write,NotebookEdit,Bash');
+    expect(edit).toEqual(expect.arrayContaining(['Bash(node --test:*)', 'Bash(npm run lint:*)']));
+    // Read-only stages never get commands, and anything needing quoting is left out rather than widened.
+    expect(claudeArguments(base, 'read-only', undefined, { allowedCommands: [['node', '--test']] })).not.toContain('Bash(node --test:*)');
+    expect(commandRules([['node', '-e', 'require("fs")'], ['echo', 'a b'], ['npm', 'test;rm']])).toEqual([]);
+    expect(commandRules([['npx', 'vitest', 'run', '--reporter=dot']])).toEqual(['Bash(npx vitest run --reporter=dot:*)']);
+  });
+
+  it('turns on Codex web search with its top-level flag', () => {
+    expect(codexArguments(base, 'read-only', { web: true }).slice(0, 3)).toEqual(['--search', 'exec', '--json']);
+    expect(codexArguments(base, 'read-only')[0]).toBe('exec');
   });
 
   it('maps Codex permissions to its sandbox modes', () => {

@@ -2,7 +2,7 @@
   "name": "dual-agent-orchestrator",
   "displayName": "Dual Agent Orchestrator",
   "description": "A Claude Code-style chat where Claude answers and Codex checks the answer: conversations with attachments, model and effort pickers, isolated edits you review and apply, and reciprocal brainstorming and implementation workflows.",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
   "publisher": "local",
   "license": "MIT",

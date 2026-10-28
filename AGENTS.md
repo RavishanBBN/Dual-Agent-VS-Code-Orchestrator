@@ -22,6 +22,8 @@ Read `README.md`, `PROJECT_STATUS.md`, and the relevant document under `docs/` b
 - The chat panel is the only webview: keep its Content-Security-Policy and resource roots, load nothing from the network, validate every message with `parseWebviewMessage`, render agent Markdown only through `src/webview/markdown.ts`, and route its actions through the same commands, consent, and run lock. Use native VS Code UI for everything else, and pass agent or repository text to tooltips only through `escapeMarkdown`.
 - Store attachments only in private storage through `src/core/attachments.ts`, keep its size, path, and archive limits, and parse PDFs only in the worker.
 - Validate models and efforts with `src/core/agentOptions.ts` wherever they enter: settings, the chat, and stored runs.
+- Give agents web access only through a stage's `web` flag (Research) or the user's per-message Web toggle, never by default in other modes.
+- Let an editing stage run only the user's configured verification commands, as prefix rules built by `commandRules` from arguments that need no quoting.
 - Keep provider-specific schemas inside `src/adapters/`.
 - Update tests, `CHANGELOG.md`, and `PROJECT_STATUS.md` with behavior changes.
 - Run `npm.cmd run check` before declaring completion, and `npm.cmd run smoke` after UI, manifest, or activation changes.
