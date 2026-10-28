@@ -1,10 +1,12 @@
 import * as esbuild from 'esbuild';
 
 const watch = process.argv.includes('--watch');
-const options = {
-  entryPoints: ['src/extension.ts'],
+
+/** The extension host bundle, and the PDF reader that runs in a worker thread only when a PDF is attached. */
+const host = {
+  entryPoints: { extension: 'src/extension.ts', pdfWorker: 'src/core/pdfWorker.ts' },
   bundle: true,
-  outfile: 'dist/extension.js',
+  outdir: 'dist',
   external: ['vscode'],
   format: 'cjs',
   platform: 'node',
@@ -14,9 +16,24 @@ const options = {
   logLevel: 'info',
 };
 
+/** The chat panel, which runs in the webview with no Node.js access. */
+const webview = {
+  entryPoints: { chat: 'src/webview/main.tsx' },
+  bundle: true,
+  outdir: 'dist/webview',
+  format: 'iife',
+  platform: 'browser',
+  target: 'es2022',
+  jsx: 'automatic',
+  jsxImportSource: 'preact',
+  loader: { '.css': 'css' },
+  sourcemap: true,
+  minify: !watch,
+  logLevel: 'info',
+};
+
 if (watch) {
-  const context = await esbuild.context(options);
-  await context.watch();
+  for (const options of [host, webview]) await (await esbuild.context(options)).watch();
 } else {
-  await esbuild.build(options);
+  await Promise.all([esbuild.build(host), esbuild.build(webview)]);
 }

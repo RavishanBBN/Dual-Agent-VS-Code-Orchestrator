@@ -5,10 +5,12 @@ import type {
   AgentAdapter,
   AgentHealth,
   AgentId,
+  AgentOptions,
   AgentRunRequest,
   PermissionMode,
   StageResult,
 } from '../core/types.js';
+import { isEffort, isModelName } from '../core/agentOptions.js';
 import { AgentExecutionError, classifyFailure, limitDetail } from '../core/errors.js';
 import { resolveExecutable } from '../core/executables.js';
 import { buildChildEnvironment, type BillingMode } from './environment.js';
@@ -20,6 +22,8 @@ export interface AdapterConfiguration {
   timeoutMs: number;
   billingMode: BillingMode;
   model?: string;
+  /** Default reasoning effort; a run's own choice takes precedence. */
+  effort?: string;
   claudeMaxTurns?: number;
   /** Claude permission rules (for example `Bash(npm test:*)`) granted to workspace-write stages only. */
   claudeAllowedTools?: readonly string[];
@@ -30,18 +34,53 @@ export interface AdapterConfiguration {
 /** Session IDs are passed as arguments, so anything that could read as a flag is rejected. */
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
+/**
+ * Claude's built-in tools are allowlisted. Plan mode alone still offers Bash, PowerShell, WebFetch, and
+ * publishing tools, and in print mode Claude Code runs commands it judges read-only without asking.
+ */
+const CLAUDE_READ_TOOLS = ['Read', 'Grep', 'Glob'];
+const CLAUDE_EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
+/** The tool a permission rule names, such as `Bash` for `Bash(npm test:*)`. */
+const RULE_TOOL = /^([A-Za-z][A-Za-z0-9]*)(?:\(|$)/;
+
+function claudeTools(writes: boolean, rules: readonly string[]): string {
+  const tools = new Set(writes ? [...CLAUDE_READ_TOOLS, ...CLAUDE_EDIT_TOOLS] : CLAUDE_READ_TOOLS);
+  for (const rule of rules) {
+    const tool = RULE_TOOL.exec(rule)?.[1];
+    if (tool) tools.add(tool);
+  }
+  return [...tools].join(',');
+}
+
 /** Repository files that can configure a provider, relative to the workspace root. */
 const PROJECT_CONFIGURATION: Record<AgentId, readonly string[]> = {
   claude: [],
   codex: ['.codex'],
 };
 
+/** What a single run adds to an adapter's configuration. */
+export interface RunArguments {
+  options?: AgentOptions;
+  images?: readonly string[];
+  readableDirectories?: readonly string[];
+}
+
+/** The run's model and effort, else the configured defaults; invalid values are skipped, never passed on. */
+function chosen(agent: AgentId, configuration: AdapterConfiguration, run: RunArguments): AgentOptions {
+  const model = [run.options?.model, configuration.model].find((value) => value !== undefined && isModelName(value));
+  const effort = [run.options?.effort, configuration.effort].find((value) => value !== undefined && isEffort(agent, value));
+  return { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+}
+
 export function claudeArguments(
   configuration: AdapterConfiguration,
   permission: PermissionMode,
   resumeSessionId?: string,
+  run: RunArguments = {},
 ): string[] {
   const writes = permission === 'workspace-write';
+  // Tool rules extend write stages only; a read-only stage can read and search, nothing else.
+  const rules = writes ? (configuration.claudeAllowedTools ?? []) : [];
   const args = [
     '-p',
     '--input-format',
@@ -49,6 +88,8 @@ export function claudeArguments(
     '--output-format',
     'stream-json',
     '--verbose',
+    // Text arrives as it is written, so the chat can show it before the turn ends.
+    '--include-partial-messages',
     '--max-turns',
     String(configuration.claudeMaxTurns ?? 24),
     // Print mode skips Claude Code's folder-trust prompt, so repository settings (hooks, permission rules,
@@ -58,10 +99,16 @@ export function claudeArguments(
     '--strict-mcp-config',
     '--permission-mode',
     writes ? 'acceptEdits' : 'plan',
+    '--tools',
+    claudeTools(writes, rules),
   ];
-  if (writes && configuration.claudeAllowedTools?.length) args.push('--allowedTools', ...configuration.claudeAllowedTools);
+  if (rules.length) args.push('--allowedTools', ...rules);
+  // Attachment folders are readable through the same Read, Grep, and Glob tools; nothing else is granted.
+  for (const directory of run.readableDirectories ?? []) args.push('--add-dir', directory);
   if (resumeSessionId) args.push('--resume', resumeSessionId);
-  if (configuration.model) args.push('--model', configuration.model);
+  const { model, effort } = chosen('claude', configuration, run);
+  if (model) args.push('--model', model);
+  if (effort) args.push('--effort', effort);
   return args;
 }
 
@@ -69,9 +116,17 @@ function isMissingSession(error: unknown): boolean {
   return error instanceof AgentExecutionError && /no conversation found/i.test(error.message);
 }
 
-export function codexArguments(configuration: AdapterConfiguration, permission: PermissionMode): string[] {
-  const args = ['exec', '--json', '--sandbox', permission === 'workspace-write' ? 'workspace-write' : 'read-only'];
-  if (configuration.model) args.push('--model', configuration.model);
+export function codexArguments(configuration: AdapterConfiguration, permission: PermissionMode, run: RunArguments = {}): string[] {
+  const writes = permission === 'workspace-write';
+  const args = ['exec', '--json'];
+  // `--image` takes several values, so a fixed-arity flag always follows it before the stdin marker.
+  for (const image of run.images ?? []) args.push('--image', image);
+  args.push('--sandbox', writes ? 'workspace-write' : 'read-only');
+  // Codex refuses folders outside Git by default; a read-only stage cannot change one, so chat works anywhere.
+  if (!writes) args.push('--skip-git-repo-check');
+  const { model, effort } = chosen('codex', configuration, run);
+  if (model) args.push('--model', model);
+  if (effort) args.push('--config', `model_reasoning_effort=${effort}`);
   args.push('-');
   return args;
 }
@@ -81,7 +136,7 @@ abstract class CliAdapter implements AgentAdapter {
 
   public constructor(protected readonly configuration: AdapterConfiguration) {}
 
-  protected abstract buildArguments(permission: PermissionMode, resumeSessionId?: string): string[];
+  protected abstract buildArguments(permission: PermissionMode, resumeSessionId: string | undefined, run: RunArguments): string[];
   protected abstract parse(line: string): ParsedLine | undefined;
   /** Whether this provider's CLI can continue a session non-interactively with the same flags. */
   protected readonly supportsResume: boolean = false;
@@ -165,7 +220,11 @@ abstract class CliAdapter implements AgentAdapter {
     try {
       await runProcess({
         command: executable,
-        args: this.buildArguments(request.permission, resumeSessionId),
+        args: this.buildArguments(request.permission, resumeSessionId, {
+          ...(request.options ? { options: request.options } : {}),
+          ...(request.images ? { images: request.images } : {}),
+          ...(request.readableDirectories ? { readableDirectories: request.readableDirectories } : {}),
+        }),
         cwd: request.cwd,
         input: prompt,
         timeoutMs: this.configuration.timeoutMs,
@@ -180,6 +239,7 @@ abstract class CliAdapter implements AgentAdapter {
           const parsed = this.parse(line);
           accumulator.add(parsed);
           if (parsed?.event) request.onEvent(parsed.event);
+          for (const event of parsed?.extraEvents ?? []) request.onEvent(event);
         },
       });
     } catch (error) {
@@ -215,8 +275,8 @@ abstract class CliAdapter implements AgentAdapter {
 export class CodexCliAdapter extends CliAdapter {
   public readonly id = 'codex' as const;
 
-  protected buildArguments(permission: PermissionMode): string[] {
-    return codexArguments(this.configuration, permission);
+  protected buildArguments(permission: PermissionMode, _resumeSessionId: string | undefined, run: RunArguments): string[] {
+    return codexArguments(this.configuration, permission, run);
   }
 
   protected parse(line: string): ParsedLine | undefined {
@@ -228,8 +288,8 @@ export class ClaudeCliAdapter extends CliAdapter {
   public readonly id = 'claude' as const;
   protected override readonly supportsResume = true;
 
-  protected buildArguments(permission: PermissionMode, resumeSessionId?: string): string[] {
-    return claudeArguments(this.configuration, permission, resumeSessionId);
+  protected buildArguments(permission: PermissionMode, resumeSessionId: string | undefined, run: RunArguments): string[] {
+    return claudeArguments(this.configuration, permission, resumeSessionId, run);
   }
 
   protected parse(line: string): ParsedLine | undefined {

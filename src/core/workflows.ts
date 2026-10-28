@@ -122,9 +122,75 @@ const BRAINSTORMING: readonly WorkflowStageDefinition[] = [
   },
 ];
 
+/** One chat message: Claude answers, and Codex checks the answer before the user relies on it. */
+const CHAT: readonly WorkflowStageDefinition[] = [
+  {
+    id: 'claude-answer',
+    title: 'Claude answers',
+    agent: 'claude',
+    permission: 'read-only',
+    purpose: 'Primary answer',
+    instructions:
+      'Answer the user\'s latest message directly and completely, in the context of the conversation. Read the files and attachments you need instead of guessing, cite paths and symbols, and say plainly what you could not verify. Do not modify files.',
+  },
+  {
+    id: 'codex-check',
+    title: 'Codex checks the answer',
+    agent: 'codex',
+    permission: 'read-only',
+    purpose: 'Independent answer check',
+    instructions:
+      'Check Claude\'s answer to the user\'s latest message against the repository, the attachments, and the conversation. Verify its factual claims, code references, and reasoning yourself rather than trusting them. Pass it when it is correct and complete enough to act on. Fail it only for material errors, omissions, or risks, each with evidence and a concrete correction. Do not restate a correct answer. Do not modify files.',
+    review: true,
+    onFail: 'revise',
+  },
+];
+
+/** One requested change: Claude edits, Codex reviews the diff, and fix rounds follow a failed review. */
+const EDIT: readonly WorkflowStageDefinition[] = [
+  {
+    id: 'claude-edit',
+    title: 'Claude makes the change',
+    agent: 'claude',
+    permission: 'workspace-write',
+    purpose: 'Primary implementation',
+    instructions:
+      'Make the change the user asked for in their latest message. Inspect the relevant code first, keep the change scoped to the request, and preserve unrelated work. End with a short summary of what you changed and why, and of any check you could not run.',
+  },
+  {
+    id: 'codex-change-review',
+    title: 'Codex reviews the change',
+    agent: 'codex',
+    permission: 'read-only',
+    purpose: 'Independent change review',
+    instructions:
+      'Review the current diff against the user\'s latest message and the conversation. Look for incorrect behavior, regressions, security problems, and missing pieces, and use the orchestrator-run checks as evidence. Pass only if the change does what was asked with no material problem. Otherwise list actionable findings with severity, location, evidence, and a concrete fix. Do not modify files.',
+    review: true,
+    gate: true,
+  },
+];
+
+const WORKFLOWS: Record<WorkflowKind, readonly WorkflowStageDefinition[]> = {
+  implementation: IMPLEMENTATION,
+  brainstorming: BRAINSTORMING,
+  chat: CHAT,
+  edit: EDIT,
+};
+
 export function getWorkflow(kind: WorkflowKind): WorkflowStageDefinition[] {
-  const source = kind === 'implementation' ? IMPLEMENTATION : BRAINSTORMING;
-  return source.map((stage) => ({ ...stage }));
+  return WORKFLOWS[kind].map((stage) => ({ ...stage }));
+}
+
+/** The single stage a failed chat check adds: Claude weighs Codex's findings and gives the final answer. */
+export function reviseStage(reason: string): WorkflowStageDefinition {
+  return {
+    id: 'claude-revise',
+    title: 'Claude revises the answer',
+    agent: 'claude',
+    permission: 'read-only',
+    purpose: 'Answer revision',
+    instructions: `Codex's check did not pass (${reason}). Weigh each of its findings against the evidence, reading files again where needed. Then give the user your complete, corrected answer to their latest message: rely on findings that hold, and say briefly why you set aside any that do not. Mention the check in at most one short line. Do not modify files.`,
+  };
 }
 
 /** The two stages a failed final gate adds: a Claude fix, then a fresh Codex verification of the result. */

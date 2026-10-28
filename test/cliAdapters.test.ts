@@ -66,22 +66,66 @@ const claudeSuccess = [
 ];
 
 describe('provider arguments', () => {
-  it('keeps Claude review stages in plan mode without repository settings, MCP servers, or tool grants', () => {
+  // Regression: plan mode alone let Claude run shell commands and write a plan file during read-only stages.
+  it('limits Claude review stages to reading tools, without repository settings, MCP servers, or tool grants', () => {
     const args = claudeArguments({ ...base, claudeAllowedTools: ['Bash(npm test:*)'] }, 'read-only');
     expect(args).toEqual(expect.arrayContaining(['--setting-sources', 'user', '--strict-mcp-config']));
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('plan');
+    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob');
     expect(args).not.toContain('--allowedTools');
   });
 
-  it('grants configured tool rules only to Claude write stages', () => {
-    const args = claudeArguments({ ...base, claudeAllowedTools: ['Bash(npm test:*)'], model: 'opus' }, 'workspace-write');
-    expect(args[args.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
-    expect(args.slice(args.indexOf('--allowedTools'), args.indexOf('--allowedTools') + 2)).toEqual(['--allowedTools', 'Bash(npm test:*)']);
+  it('gives Claude write stages editing tools, and commands only through configured rules', () => {
+    const plain = claudeArguments(base, 'workspace-write');
+    expect(plain[plain.indexOf('--permission-mode') + 1]).toBe('acceptEdits');
+    expect(plain[plain.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,Edit,Write,NotebookEdit');
+    expect(plain).not.toContain('--allowedTools');
+
+    const args = claudeArguments({ ...base, claudeAllowedTools: ['Bash(npm test:*)', 'Edit'], model: 'opus' }, 'workspace-write');
+    expect(args[args.indexOf('--tools') + 1]).toBe('Read,Grep,Glob,Edit,Write,NotebookEdit,Bash');
+    expect(args.slice(args.indexOf('--allowedTools'), args.indexOf('--allowedTools') + 3)).toEqual(['--allowedTools', 'Bash(npm test:*)', 'Edit']);
     expect(args.slice(-2)).toEqual(['--model', 'opus']);
   });
 
+  it('passes a run\'s model, effort, and attachment folders to Claude, dropping invalid values', () => {
+    const args = claudeArguments({ ...base, model: 'sonnet', effort: 'low' }, 'read-only', undefined, {
+      options: { model: 'opus', effort: 'max' },
+      readableDirectories: ['/storage/attachments/conversation'],
+    });
+    expect(args).toContain('--include-partial-messages');
+    expect(args.slice(args.indexOf('--add-dir'), args.indexOf('--add-dir') + 2)).toEqual(['--add-dir', '/storage/attachments/conversation']);
+    expect(args.slice(-4)).toEqual(['--model', 'opus', '--effort', 'max']);
+
+    // Stored runs are revalidated: a flag-like model or a Codex-only effort never reaches Claude.
+    const unsafe = claudeArguments({ ...base, model: 'sonnet' }, 'read-only', undefined, { options: { model: '--dangerous', effort: 'ultra' } });
+    expect(unsafe).not.toContain('--dangerous');
+    expect(unsafe).not.toContain('--effort');
+    expect(unsafe.slice(-2)).toEqual(['--model', 'sonnet']);
+  });
+
+  it('gives Codex images, a model, and a reasoning effort, keeping the stdin marker out of --image', () => {
+    const args = codexArguments(base, 'read-only', { images: ['/a/one.png', '/a/two.jpg'], options: { model: 'gpt-6-sol', effort: 'ultra' } });
+    expect(args).toEqual([
+      'exec',
+      '--json',
+      '--image',
+      '/a/one.png',
+      '--image',
+      '/a/two.jpg',
+      '--sandbox',
+      'read-only',
+      '--skip-git-repo-check',
+      '--model',
+      'gpt-6-sol',
+      '--config',
+      'model_reasoning_effort=ultra',
+      '-',
+    ]);
+    expect(codexArguments({ ...base, effort: 'not-a-level' }, 'read-only')).not.toContain('--config');
+  });
+
   it('maps Codex permissions to its sandbox modes', () => {
-    expect(codexArguments(base, 'read-only')).toEqual(['exec', '--json', '--sandbox', 'read-only', '-']);
+    expect(codexArguments(base, 'read-only')).toEqual(['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-']);
     expect(codexArguments({ ...base, model: 'gpt-5' }, 'workspace-write')).toEqual([
       'exec',
       '--json',
@@ -146,7 +190,7 @@ describe('CLI adapters with fake providers', () => {
     const command = await writeFakeCli(bin, 'fakecodex', fakeCli(success));
     const result = await new CodexCliAdapter({ ...base, command }).run(request(workspace));
     expect(result).toMatchObject({ text: 'review complete', providerSessionId: 'thr_1' });
-    expect((await recordedCall(bin)).args).toEqual(['exec', '--json', '--sandbox', 'read-only', '-']);
+    expect((await recordedCall(bin)).args).toEqual(['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-']);
 
     const failing = await writeFakeCli(bin, 'failingcodex', fakeCli([{ type: 'turn.failed', error: { message: "You've hit your usage limit." } }], 1));
     const error = await rejection(new CodexCliAdapter({ ...base, command: failing }).run(request(workspace)));
@@ -233,7 +277,7 @@ ${fakeCli(claudeSuccess)}
     await new CodexCliAdapter({ ...base, command }).run({ ...request(workspace), resume: { sessionId: 'thr_1', prompt: 'short' } });
     const call = await recordedCall(bin);
     expect(call.input).toBe('stage prompt');
-    expect(call.args).toEqual(['exec', '--json', '--sandbox', 'read-only', '-']);
+    expect(call.args).toEqual(['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-']);
   });
 
   it('refuses an executable inside any untrusted directory, such as the primary workspace of a worktree run', { timeout: 20_000 }, async () => {
