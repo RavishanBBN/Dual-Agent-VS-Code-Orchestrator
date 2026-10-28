@@ -44,7 +44,17 @@ One message in **Chat** mode, the default. Every stage is read-only and runs in 
 2. **Codex checks the answer** (with a verdict). Codex verifies Claude's claims, code references, and reasoning against the repository and attachments itself. It passes an answer that is correct and complete enough to act on, and fails it only for material errors, omissions, or risks.
 3. **Claude revises the answer**, only when the check did not pass. Claude weighs each finding against the evidence and gives the complete, corrected answer. This stage is not checked again, so a message costs at most three agent calls.
 
-A missing or unparseable verdict counts as a failed check, so Claude revises. The run is **completed** either way; the chat shows whether Codex agreed or Claude revised. The answer shown to the user is the last completed Claude stage.
+A missing or unparseable verdict counts as a failed check, so Claude revises. The run is **completed** either way; the chat shows whether Codex agreed or Claude revised. The answer shown to the user is the last completed stage in Claude's role.
+
+### Quick replies
+
+A message that is only a greeting, a thank-you, or a question about the assistant ("hi", "thanks", "who are you?", "what are your skills?") gets one read-only stage, in any mode, as long as nothing is attached:
+
+- **One reply from the pair.** Claude answers as the pair, from a fixed description of Dual Agent's modes, features, and limits (`src/core/about.ts`).
+- **No workspace.** The prompt includes neither the diff nor the workspace status.
+- **No check.** Codex does not check the reply, because nothing in it depends on the code.
+
+The detector is deliberately narrow: anything that names a task, a file, or code ("hi, can you fix the failing test?") runs the full workflow of the selected mode. Every Chat and Research prompt also says the agents speak for Dual Agent, so a question about the assistant phrased another way still gets an accurate answer.
 
 ## Edit workflow
 

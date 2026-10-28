@@ -35,6 +35,8 @@ Choose a mode in the composer for each message.
 
 Follow-up messages continue the conversation. Claude resumes its own session, so it is sent only what is new. Codex starts fresh on every message with a summary, so its checks stay independent.
 
+Say "hi" or ask "what can you do?" and the pair introduces itself in one quick reply, in any mode. It costs one call, and the reply doesn't need a check.
+
 ## Features
 
 - **A chat like Claude Code's.** Streamed answers, a timeline of every tool call with its input and output, Codex's verdict as a badge, Markdown with code blocks you can copy, and file references that open at the right line.

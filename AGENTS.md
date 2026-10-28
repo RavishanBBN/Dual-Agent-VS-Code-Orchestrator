@@ -29,6 +29,7 @@ Read `README.md`, `PROJECT_STATUS.md`, and the relevant document under `docs/` b
 - Record usage limits only through `AgentLimits` (`src/core/limits.ts`), from quota errors classified by `classifyFailure`; a limit only reroutes or pauses stages, never changes permissions.
 - Continue a paused run automatically only through `ContinuationScheduler`, and for a run that edits files only when its setup and verification commands are unchanged since the user allowed it.
 - Undo a retried message's file changes only by restoring its checkpoint with `restoreWorktree`, or by discarding the worktree the message created, both inside the extension's worktree storage; never touch the user's working tree.
+- Update `ABOUT_DUAL_AGENT` in `src/core/about.ts` whenever a mode, feature, or limit changes, so agents never describe abilities the extension lacks. Keep `isSmallTalk` narrow: a message that names a task, file, or code must run its full workflow.
 - Keep provider-specific schemas inside `src/adapters/`.
 - Update tests, `CHANGELOG.md`, and `PROJECT_STATUS.md` with behavior changes.
 - Run `npm.cmd run check` before declaring completion, and `npm.cmd run smoke` after UI, manifest, or activation changes.
