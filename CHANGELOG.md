@@ -2,6 +2,51 @@
 
 All notable changes are documented here. This project follows semantic versioning.
 
+## [2.1.0] - 2026-10-28
+
+A Claude Code–style chat becomes the main interface. Claude answers and Codex checks the answer, conversations take attachments, and each agent's model and effort can be chosen per message. The Runs and Agents views, Command Palette workflows, and every safety boundary from 2.0 remain.
+
+### Added
+
+- **Chat panel.** A **Chat** view in the Dual Agent side bar, also available as an editor tab (**Dual Agent: Open Chat in Editor**; `Ctrl+Alt+D` focuses it).
+  - Claude's text streams in as it is written.
+  - A timeline shows each agent's stage (Claude orange, Codex blue) and every tool call with the tool's name, its IN (command, path, pattern, or edit) and OUT, as in Claude Code. Steps are saved with the run, so they stay after the message finishes. Codex's verdict appears as a badge.
+  - An editor title-bar button opens the chat as a tab named after the conversation.
+  - Agent Markdown is rendered with tables and code blocks with a Copy button, and file references open at the cited line.
+  - Each message shows its usage, and past conversations are listed in a history.
+- **Chat mode** (the default): Claude answers, Codex checks the answer against the code and attachments, and Claude revises only when the check fails. It is read-only, with two or three agent calls per message.
+- **Edit mode:** Claude edits an isolated worktree, verification commands run, and Codex reviews the diff as a gate, followed by fix rounds. A card lists the changed files with **Review all**, **Apply…**, and **Discard…**. Later Edit messages in the conversation keep working on the same worktree.
+- **Brainstorm and Implement from the chat,** with the plan approval card (approve, approve with guidance, review plan, reject) and the edit consent card (allow once or for the conversation, with the commands that will run).
+- **Conversations.** Follow-up messages continue Claude's session; Codex starts fresh with a budgeted history of the conversation. Conversations are saved one file each and survive run-history pruning.
+- **Attachments.**
+  - **Ways to attach:** paste, drop, or pick files, or type `@` to mention a workspace file.
+  - **Images** (PNG, JPEG, GIF, WebP) go to Claude's Read tool and to Codex with `--image`.
+  - **PDFs** are read by Claude directly; Codex gets the text, extracted with pdf.js in a worker thread.
+  - **Word, Excel, and PowerPoint** files have their text extracted for both agents.
+  - **ZIP archives** are unpacked safely.
+  - **Jupyter notebooks and any text or code file** are supported too.
+- **Models and effort.**
+  - Composer pickers for each agent's model and reasoning effort, or the CLI default.
+  - Codex's models and their supported efforts come from `codex debug models`.
+  - New settings `dualAgent.claude.effort` and `dualAgent.codex.effort` set the defaults.
+- The model Claude reports is recorded on each stage and shown in the chat.
+
+### Changed
+
+- The chat is the first view of the Dual Agent container; Runs and Agents start collapsed.
+- Read-only Codex stages pass `--skip-git-repo-check`, so Chat and Brainstorm work in folders without Git.
+- `dualAgent.history.maxRuns` defaults to 100, since every chat message is a run.
+- The plan approval notification is shown only while the chat is hidden, since the chat has its own card.
+- Applying or discarding a worktree updates every run that shared it.
+
+### Security
+
+- Claude stages pass an explicit `--tools` list. Plan mode alone let read-only stages run shell commands that Claude Code judged read-only, such as `node -e` scripts, and write a plan file outside the workspace; it also offered Bash, PowerShell, WebFetch, and publishing tools. Read-only stages now get Read, Grep, and Glob only. Write stages add Edit, Write, and NotebookEdit, plus the tools named by `dualAgent.claude.allowedTools` rules, so user-level Claude rules can no longer add a shell. A Claude Code version without `--tools` fails the stage instead of running unrestricted.
+- The chat page runs under a nonce Content-Security-Policy with no network access and command URIs disabled. Agent HTML is escaped, images in agent Markdown never load, links open only after a check and a confirmation, files open only inside the conversation's folder or worktree, and every message from the page is validated.
+- Attachments are stored privately and classified by content. Archives are unpacked as regular files only, with path, count, size, and compression-ratio limits. PDFs are parsed in a worker thread with a timeout. Files with secret-looking names need confirmation.
+- Models and efforts are validated wherever they enter: settings, the composer, and stored runs. A value that could read as a flag never reaches a CLI.
+- Dependencies are pinned: preact 10.29.8, markdown-it 15.0.3 (the release that fixes two quadratic-time parsing advisories), fflate 0.8.3, and unpdf 1.8.1.
+
 ## [2.0.0] - 2026-10-28
 
 A native VS Code interface replaces the webview dashboard, and the improvement proposals from the 1.0 review are implemented. Implementation runs now edit an isolated Git worktree by default, and plan approval is on by default; set `dualAgent.isolation.mode` to `none` and `dualAgent.workflow.approvePlan` to `false` for 1.x behavior.

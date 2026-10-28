@@ -1,22 +1,31 @@
 # Dual Agent Orchestrator for VS Code
 
-> Claude-led implementation, Codex-led review, reciprocal verification, and deterministic quality gates, built into the VS Code sidebar.
+> A Claude Code–style chat in which Claude answers and Codex checks the answer, plus reciprocal brainstorming and implementation workflows with isolated edits, verification gates, and subscription-safe execution.
 
 ## Project status
 
-- **Release:** 2.0.0 (native VS Code interface, isolated worktrees, verification gate; see [CHANGELOG.md](CHANGELOG.md))
+- **Release:** 2.1.0 (chat with attachments, model and effort pickers, and quick edits; see [CHANGELOG.md](CHANGELOG.md))
 - **Lifecycle:** production-oriented local release
 - **Last updated:** 2026-10-28
 - **Implementation:** complete
-- **Verification:** lint, type checking, unit and integration tests, and an automated smoke test inside a real VS Code; see [PROJECT_STATUS.md](PROJECT_STATUS.md) for the verified results and known limitations.
+- **Verification:** lint, type checking, unit and integration tests, an automated smoke test inside a real VS Code, and a live check with the real CLIs; see [PROJECT_STATUS.md](PROJECT_STATUS.md) for the verified results and known limitations.
 
-This project is a desktop VS Code extension that coordinates the locally installed Claude Code and Codex CLIs. It is designed for developers who have subscriptions for both products and want them to work as a disciplined pair without copying credentials, merging private reasoning, or letting two agents overwrite the same files.
+This project is a desktop VS Code extension that coordinates the locally installed Claude Code and Codex CLIs. It is designed for developers who have subscriptions for both products and want them to work as a disciplined pair, so that the result is better than either agent alone, without copying credentials or letting two agents overwrite the same files.
 
-It is a regular extension: an activity-bar icon with tree views, commands in the Command Palette, a status bar item, an output channel, and the built-in diff editor. There is no web page or embedded web view.
+You talk to it in a chat panel like Claude Code's. Behind each message, Claude does the work and Codex independently checks it; when Codex finds a real problem, Claude corrects the answer before you rely on it. Larger tasks use fixed multi-stage workflows with plan approval and a final gate. Edits always happen in an isolated copy of the repository that you review in VS Code's diff editor and apply deliberately.
 
 The extension does not merge subscription quotas. It observes the usage events each CLI reports, keeps a local ledger, routes bounded fallback work when a provider is unavailable, and keeps an auditable record of every stage.
 
 ## The complete idea in one minute
+
+Every chat message runs in one of four modes, chosen in the composer:
+
+| Mode | What happens | Agent calls | Files |
+|---|---|---|---|
+| **Chat** (default) | Claude answers → Codex checks the answer → Claude revises only if the check fails | 2–3 | read-only |
+| **Edit** | Claude edits an isolated copy → your checks run → Codex reviews the diff → bounded fix rounds | 2–4 | isolated copy, applied by you |
+| **Brainstorm** | Claude proposal → Codex challenge → Claude synthesis → Codex final challenge → Claude recommendation | 5 | read-only |
+| **Implement** | the full implementation workflow below, with your approval of the plan | 7+ | isolated copy, applied by you |
 
 For implementation work, Claude leads and Codex reviews:
 
@@ -33,21 +42,9 @@ Claude plan
     -> you review the diff, then apply or discard it
 ```
 
-Implementation runs edit an isolated Git worktree in the extension's private storage, never your working tree. When the run ends you open the changes in VS Code's diff editor and apply them with one command, or discard them.
+Follow-up messages continue the conversation. Claude continues its own session, so it is sent only what is new; Codex starts fresh on every message, with a summary of the conversation, so its checks stay independent. Edit messages in one conversation keep working on the same isolated copy until you apply or discard it.
 
-For brainstorming, the same reciprocal pattern stays read-only:
-
-```text
-Claude proposal
-    -> Codex challenge
-    -> Claude synthesis
-    -> Codex final challenge
-    -> Claude final recommendation
-```
-
-Each stage receives the objective, the current Git status and diff, the contents of small new untracked files, the latest check results, and bounded outputs from completed stages. Agent output and repository content are fenced in blocks marked with a random per-prompt boundary and treated as untrusted evidence, not instruction. Only implementation and fix stages can write, and only with the run's explicit consent. Codex review stages stay read-only.
-
-Reviewers end with a machine-readable verdict. The final gate passes only with a "pass" verdict and passing verification commands; otherwise Claude gets a bounded number of fix rounds, and a run that still fails ends as **completed with unresolved findings** rather than as a success.
+Each stage receives the message or objective, the conversation so far, the attachments, the current Git status and diff, the latest check results, and bounded outputs from earlier stages. Agent output, attachments, and repository content are fenced in blocks marked with a random per-prompt boundary and treated as untrusted evidence, not instruction. Only editing stages can write, and only with your explicit consent. Reviewers end with a machine-readable verdict, shown in the chat as a badge.
 
 ## Why this exists
 
@@ -62,35 +59,36 @@ Running two coding agents independently creates avoidable problems:
 - chat history becomes the only state store;
 - there is no durable record of what happened.
 
-Dual Agent Orchestrator turns that ad-hoc interaction into a fixed, inspectable workflow with explicit roles, permissions, checkpoints, gates, usage observations, fallback rules, and exportable reports.
+Dual Agent Orchestrator turns that ad-hoc interaction into a conversation backed by fixed, inspectable workflows with explicit roles, permissions, checkpoints, gates, usage observations, fallback rules, and exportable reports.
 
 ## Design principles
 
-1. **Roles before model preference.** Claude is the default implementation lead; Codex is the independent reviewer.
-2. **One writer at a time, in isolation.** A stage is read-only or workspace-write, stages run one after another, and implementation edits an isolated worktree that you apply deliberately.
-3. **Reciprocal review.** Codex reviews Claude's plan and code. Claude must accept, reject with a reason, or escalate each finding.
+1. **Roles before model preference.** Claude is the default lead; Codex is the independent checker and reviewer.
+2. **One writer at a time, in isolation.** A stage is read-only or workspace-write, stages run one after another, and edits happen in an isolated worktree that you apply deliberately.
+3. **Reciprocal review.** Codex checks Claude's answers, plans, and code. Claude must weigh each finding, accepting it or saying why not.
 4. **Deterministic evidence over narrative.** Commands the extension runs itself (tests, builds) are reported to reviewers with reliable exit codes, and a failing command blocks the gate.
-5. **A gate that means something.** The run's final status comes from the final verdict and checks, not from the last stage merely finishing.
-6. **Checkpoint synchronization.** Agents share compact stage artifacts, not hidden reasoning or a mirrored transcript. Claude continues its own session within a run, so it is not sent its own earlier output again.
+5. **A gate that means something.** A run's final status comes from the final verdict and checks, not from the last stage merely finishing.
+6. **Checkpoint synchronization.** Agents share compact stage artifacts, not hidden reasoning or a mirrored transcript.
 7. **Subscription-safe defaults.** Agents receive an allowlisted environment. API-key, auth-token, alternate-endpoint, and Bedrock/Vertex routing variables are removed unless you explicitly choose environment billing.
-8. **Bounded autonomy.** Timeouts, cancellation of the whole process tree, finite stages and fix rounds, minimal permissions, plan approval, and explicit consent are enforced outside prompts.
-9. **Private local state.** Run records and worktrees stay in VS Code's private workspace storage unless you export a report or apply changes.
+8. **Bounded autonomy.** Timeouts, cancellation of the whole process tree, finite stages and fix rounds, explicit tool allowlists, plan approval, and explicit consent are enforced outside prompts.
+9. **Private local state.** Conversations, attachments, run records, and worktrees stay in VS Code's private workspace storage unless you export a report or apply changes.
 
 ## Architecture
 
 ```text
-VS Code: activity bar ─ Runs view · Agents view · status bar · output channel · diff editor
+VS Code: Dual Agent side bar ─ Chat (webview) · Runs view · Agents view · status bar · diff editor
           |
           v
-extension.ts (commands, prompts, consent, apply/discard)
+extension.ts ── chat controller (conversations, attachments, consent, models)
           |
           v
-Workflow orchestrator ──── private run history / exported report
-  |    |    |    |
-  |    |    |    +── isolated Git worktree (create, list, apply, remove)
-  |    |    +─────── check runner (your setup and verification commands)
-  |    +──────────── Git snapshot and bounded context builder
-  +───────────────── gate, fix rounds, approval, fallback, resume
+Workflow orchestrator ──── private run history / conversations / exported report
+  |    |    |    |    |
+  |    |    |    |    +── attachments (stored privately, archives unpacked, PDF and Office text extracted)
+  |    |    |    +─────── isolated Git worktree (create, list, apply, remove)
+  |    |    +──────────── check runner (your setup and verification commands)
+  |    +───────────────── Git snapshot and bounded context builder
+  +────────────────────── chat check, gate, fix rounds, approval, fallback, resume
           |
      +----+----+
      |         |
@@ -103,22 +101,23 @@ The extension host is the coordinator. No background service, shared API key, or
 
 ## Capabilities
 
-- **Native VS Code interface:** Runs and Agents tree views in the activity bar, a welcome view, status bar progress, an output channel, Command Palette commands, and read-only documents for every stage output, check log, and report.
-- Claude-led seven-stage implementation workflow and five-stage brainstorming workflow.
-- Independent Codex plan, code, and final reviews with a parsed verdict and findings by severity.
+- **Chat panel like Claude Code's:** streamed answers, a timeline of each agent's steps (Read, Grep, Bash, Edit, Shell) with IN/OUT boxes that stay after the message finishes, Codex's verdict as a badge, Markdown with tables and code blocks with a Copy button, file references that open at the right line, usage per message, and conversation history.
+- **Attachments:** paste, drop, or pick images (PNG, JPEG, GIF, WebP), PDFs, ZIP archives, Word, Excel, and PowerPoint files, Jupyter notebooks, and any text or code file; type `@` to mention a workspace file.
+- **Models and effort:** choose each agent's model and reasoning effort in the composer, or leave either on the CLI default. The Codex list comes from your installed Codex CLI.
+- **Quick edits:** Edit mode changes an isolated copy, checks it, has Codex review the diff, and shows a card to review, apply, or discard the changes.
+- Claude-led seven-stage implementation workflow and five-stage brainstorming workflow, from the chat or the Command Palette.
+- Independent Codex checks and reviews with a parsed verdict and findings by severity.
 - Final gate with bounded fix rounds and a "completed with unresolved findings" outcome.
 - Setup and verification commands run by the extension itself, with results given to reviewers.
-- Isolated Git worktree per implementation run, reviewed in VS Code's multi-file diff editor and applied with a conflict check.
-- Optional plan approval, with guidance you can add for the rest of the run.
-- Claude session continuity within a run, with automatic fallback to a new session.
-- Resume a failed, cancelled, or interrupted run from its first unfinished stage.
-- Multi-root workspaces: choose which folder the agents work in.
+- Isolated Git worktree, reviewed in VS Code's multi-file diff editor and applied with a conflict check.
+- Optional plan approval, from a card in the chat, with guidance you can add for the rest of the run.
+- Claude session continuity across stages and messages, with automatic fallback to a new session.
+- Resume a failed, cancelled, or interrupted message or run from its first unfinished stage.
+- Native Runs and Agents views, status bar progress, an output channel, and read-only documents for every stage output, check log, and report.
 - Quota, timeout, and provider-unavailable fallback, classified from provider-reported errors.
 - Cancellation and per-stage timeouts that terminate the agent's whole process tree.
 - Cross-agent prompt-injection boundary with random per-prompt block boundaries.
-- Visible run warnings when Git or repository configuration weakens a run.
-- Private, capped, durable run history; runs with unapplied changes are never pruned.
-- Markdown run-report export.
+- Private, capped, durable history; conversations and runs with unapplied changes are never pruned.
 - Executables (agent CLIs, Git, and your commands) resolved to absolute paths, never from the workspace or worktree.
 - Git runs with hooks, filesystem monitors, external diff, and textconv drivers disabled.
 - Allowlisted child-process environment; subscription mode removes billing variables.
@@ -128,9 +127,9 @@ The extension host is the coordinator. No background service, shared API key, or
 
 - Desktop VS Code 1.105 or newer.
 - Node.js 20 or newer for development.
-- A local Git repository with at least one commit (for implementation runs).
 - Codex CLI installed and signed in.
-- Claude Code CLI installed and signed in.
+- Claude Code CLI installed and signed in, recent enough to support `--tools`, `--effort`, and `--include-partial-messages` (verified with 2.1.312; an older version fails at the first Claude stage instead of running unrestricted).
+- A local Git repository with at least one commit for Edit and Implement. Chat and Brainstorm also work in a folder without Git.
 
 Confirm the tools manually:
 
@@ -150,26 +149,26 @@ Build and install the extension package:
 cd F:\Works\Projects\16-dual-agent-vscode-orchestrator
 npm.cmd install
 npm.cmd run package
-code --install-extension .\dual-agent-orchestrator-2.0.0.vsix
+code --install-extension .\dual-agent-orchestrator-2.1.0.vsix --force
 ```
 
-Then reload VS Code and select the **Dual Agent** icon in the activity bar.
+Then reload VS Code and select the **Dual Agent** icon in the activity bar, or press `Ctrl+Alt+D`.
 
 To work on the extension itself, open this folder in VS Code and press `F5`; an Extension Development Host window opens with the extension loaded. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Use
 
-1. Open a local Git repository and trust the workspace. The extension does not run in Restricted Mode.
-2. Select the **Dual Agent** icon in the activity bar. Expand **Agents** to confirm Claude Code, Codex, and Git are ready, or run **Dual Agent: Check Agent Setup**.
-3. Start a run with the ▶ (implementation) or 💡 (brainstorming) button in the **Runs** view title, its welcome links, or the Command Palette (**Dual Agent: Start Implementation Run**).
-4. Type the objective, or select a longer brief in any editor first and choose **Use the selected text**. In a multi-root workspace, choose the folder.
-5. For implementation, read the consent dialog. It says where agents edit, whether you approve the plan, and which commands the extension will run, then choose **Allow and Start**.
-6. Watch progress in the **Runs** view and the status bar. Click any stage to open its full output; expand an editing stage to see its check results. **Dual Agent: Show Output** shows live agent activity.
-7. When the plan is ready, the status bar asks for approval. Choose **Review Plan** to open Claude's plan beside Codex's review, then **Approve**, **Approve with Guidance…**, or **Reject**.
-8. When the run ends, choose **Review Changes** to open every changed file in the diff editor, then **Apply Changes** to write them to your working tree (nothing is staged or committed) or **Discard Changes**.
-9. Review the diff in Source Control before committing. Right-click a run for its report, export, or the worktree folder.
+1. Open a local folder and trust the workspace. The extension does not run in Restricted Mode.
+2. Select the **Dual Agent** icon. The **Chat** view opens; drag it to the right-hand side bar if you prefer it there. To use it as an editor tab, like Claude Code, click the chat button in any editor's title bar or run **Dual Agent: Open Chat in Editor**; the tab is named after the conversation. Expand **Agents** to confirm Claude Code, Codex, and Git are ready.
+3. Type a message. Enter sends; Shift+Enter starts a new line. Attach files with the paperclip, by pasting, or by dropping them on the composer, and type `@` to mention a workspace file.
+4. Choose the mode in the composer (**Chat**, **Edit**, **Brainstorm**, **Implement**). The sliders button chooses each agent's model and effort; **Default** leaves the choice to the CLI.
+5. Watch the agents work on a timeline: Claude (orange) and Codex (blue) each get a node, text streams in, and every tool call appears with its IN and OUT, which you can click to expand. Codex's badge says whether it agrees. **Stop** cancels the message.
+6. For Edit and Implement, a card asks you to allow edits and lists the commands the extension will run. Choose **Allow** for this message or **Allow for this conversation**.
+7. In Implement mode, a card asks you to approve the plan: **Review plan** opens Claude's plan beside Codex's review, and you can add guidance before approving.
+8. When an edit finishes, the changes card lists the changed files. Click a file for its diff, **Review all** for the multi-file diff editor, then **Apply…** to write the changes to your working tree (nothing is staged or committed) or **Discard…**.
+9. Use the history button for earlier conversations and **New Conversation** to start fresh. Each message's **Report** opens the full record.
 
-A failed or cancelled run, including one interrupted by closing VS Code, can be continued with **Resume Run** from its first unfinished stage.
+The Command Palette still has **Dual Agent: Start Implementation Run** and **Start Brainstorming Run**, which take an objective from an input box or the editor selection and show progress in the **Runs** view. A failed or cancelled message or run, including one interrupted by closing VS Code, can be continued with **Resume** from its first unfinished stage.
 
 ## Configuration
 
@@ -180,13 +179,15 @@ A failed or cancelled run, including one interrupted by closing VS Code, can be 
 | `dualAgent.billingMode` | `subscription` | Strip billing variables or pass environment billing through |
 | `dualAgent.timeoutMinutes` | `30` | Maximum duration of each stage |
 | `dualAgent.claude.maxTurns` | `24` | Claude agentic-turn ceiling per stage |
-| `dualAgent.claude.model` | empty | Use account/CLI default unless explicitly set |
-| `dualAgent.codex.model` | empty | Use account/CLI default unless explicitly set |
+| `dualAgent.claude.model` | empty | Default Claude model; the chat composer can choose another per message |
+| `dualAgent.claude.effort` | empty | Default Claude effort (`low` to `max`); empty uses the CLI default |
+| `dualAgent.codex.model` | empty | Default Codex model; the chat composer can choose another per message |
+| `dualAgent.codex.effort` | empty | Default Codex reasoning effort; empty uses the CLI default |
 | `dualAgent.claude.allowedTools` | empty | Claude permission rules, such as `Bash(npm test:*)`, granted to write stages only |
 | `dualAgent.claude.resumeSessions` | `true` | Continue Claude's session across its stages in a run |
 | `dualAgent.context.maxCharacters` | `90000` | Maximum normalized context for a stage |
 | `dualAgent.fallbackOnQuota` | `true` | Allow bounded cross-provider fallback |
-| `dualAgent.history.maxRuns` | `50` | Private workspace run-history cap |
+| `dualAgent.history.maxRuns` | `100` | Private workspace run-history cap (conversations keep their answers when old runs are pruned) |
 | `dualAgent.environment.passthrough` | empty | Extra environment variable names passed to agents and commands |
 | `dualAgent.isolation.mode` | `worktree` | Edit an isolated worktree (`worktree`) or the workspace directly (`none`) |
 | `dualAgent.isolation.setupCommands` | empty | Commands run once in a new worktree, such as `[["npm", "ci"]]` |
@@ -201,7 +202,7 @@ Commands are argument lists without a shell: `["npx", "vitest", "run"]`, not `"n
 
 A worktree contains tracked files plus your uncommitted and untracked changes, but not ignored files such as `node_modules`, build output, or `.env`. If your checks need dependencies, add an install step to `dualAgent.isolation.setupCommands`. Setup and verification commands run repository code, including code the agents changed, with your permissions and outside any agent sandbox; the consent dialog lists them for every run.
 
-Claude Code's print mode cannot ask for approval, so Claude cannot run shell commands such as tests unless `dualAgent.claude.allowedTools` allows them. Verification commands give reviewers reliable results either way.
+Each Claude stage gets an explicit tool list. Read-only stages can only read and search files. Write stages can also edit files, and get a shell or any other tool only when a rule in `dualAgent.claude.allowedTools` names it, so Claude cannot run tests without one. Verification commands give reviewers reliable results either way.
 
 ## Billing and quota behavior
 
@@ -225,11 +226,12 @@ Continuing Claude's session saves tokens: later Claude stages receive only what 
 - Agents and commands receive an allowlisted environment.
 - Claude stages load only the user's own Claude settings (`--setting-sources user`) and no MCP servers (`--strict-mcp-config`). The extension warns when a repository contains Codex project configuration.
 - Every Git command the extension runs disables hooks, filesystem monitors, external diff, and textconv drivers.
-- Implementation runs edit an isolated worktree; changes reach your working tree only when you apply them, after a conflict check.
-- Prior model output, repository text, diffs, and check logs are fenced with random per-prompt boundaries, and the stage contract is restated after them.
-- Implementation and every resume require explicit consent; plan approval is on by default.
-- Codex review stages use its read-only sandbox; Claude review stages use plan permission mode.
-- UI text from agents is shown in tree items, plain-text tooltips with Markdown escaped, and read-only documents; nothing from a run is rendered as HTML or trusted Markdown.
+- Edit and Implement work in an isolated worktree; changes reach your working tree only when you apply them, after a conflict check.
+- Prior model output, earlier conversation turns, attachments, repository text, diffs, and check logs are fenced with random per-prompt boundaries, and the stage contract is restated after them.
+- Every message or run that edits files, and every resume of one, requires explicit consent; plan approval is on by default.
+- Codex review stages use its read-only sandbox. Claude review stages get only Claude's Read, Grep, and Glob tools, so they cannot run commands, write files, or fetch web pages.
+- The chat is a webview with a strict Content-Security-Policy: nothing is loaded from the network, only its own bundled script runs, every message from it is validated, and agent Markdown is rendered with raw HTML escaped, images disabled, and links that open only after a check. Elsewhere, agent text appears in tree items, plain-text tooltips with Markdown escaped, and read-only documents.
+- Attachments are stored in private storage, archives are unpacked with path, size, count, and compression-ratio limits, and PDFs are parsed in a worker thread with a timeout. Files whose names suggest secrets need an extra confirmation.
 - No network server is opened.
 
 Read [docs/SECURITY.md](docs/SECURITY.md) before enabling environment billing, verification commands, or distributing the extension.
@@ -240,7 +242,7 @@ Read [docs/SECURITY.md](docs/SECURITY.md) before enabling environment billing, v
 - A stage has one assigned provider and at most one fallback attempt.
 - Cancellation and timeouts terminate the agent's whole process tree (`taskkill /T` on Windows, the process group elsewhere) and mark later stages skipped.
 - Runs that were active when VS Code closed are marked cancelled on the next start and can be resumed.
-- **Resume Run** keeps completed stages, their outputs, and an earlier plan approval, and asks for consent again.
+- **Resume** keeps completed stages, their outputs, and an earlier plan approval, and asks for consent again.
 - A failed run remains exportable and inspectable, and its worktree is kept so its partial changes can be reviewed.
 - A new run cannot start while another is active, and a storage failure never leaves a run stuck as active.
 - A corrupted run-history file is set aside as `runs.json.unreadable-<time>` instead of blocking new runs.
@@ -250,8 +252,10 @@ Read [docs/SECURITY.md](docs/SECURITY.md) before enabling environment billing, v
 ```text
 src/
   adapters/       CLI execution, provider event parsing, environment, check runner
-  core/           workflows, orchestration, gate, context, Git, worktrees, state, reports
+  core/           workflows, orchestration, gate, context, conversations, attachments, Git, worktrees, state, reports
   ui/             tree views, documents, approvals, status bar, presentation
+  ui/chat/        chat controller, webview host, message protocol, transcript
+  webview/        the chat page (Preact), its Markdown renderer and styles
   config.ts       validated extension settings
   extension.ts    activation, commands, and composition root
 media/            activity-bar icon
@@ -269,7 +273,7 @@ scripts/          extension bundle and VS Code smoke test
 3. Vitest unit and integration tests with coverage thresholds.
 4. esbuild production bundling.
 
-`npm run smoke` launches an installed VS Code with a temporary profile and completes a run against fake CLIs inside the real extension host. CI repeats the checks on Windows and Linux and packages the VSIX. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+`npm run smoke` launches an installed VS Code with a temporary profile and, against fake CLIs inside the real extension host, completes a brainstorming run and a chat conversation with an attachment, a follow-up, and an edit. CI repeats the checks on Windows and Linux and packages the VSIX. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Known limitations
 
@@ -278,12 +282,15 @@ scripts/          extension bundle and VS Code smoke test
 - Full reciprocal workflows intentionally use more quota than a single-agent run.
 - CLI event formats can evolve; unknown events are tolerated, but provider changes may require parser updates.
 - The verdict is model output. It decides fix rounds and the run's label, never permissions, and a reviewer can be wrong.
-- Codex stages always start a fresh session: Codex's `exec resume` flags could not be verified, and fresh sessions keep reviews independent.
+- Codex stages always start a fresh session, so its checks stay independent; it gets the conversation as a summary instead.
+- Codex cannot open PDFs or Office files itself; it reads the text the extension extracts. Scanned PDFs without a text layer yield no text for Codex, though Claude still reads their pages.
+- Attachments are limited to 25 MB per file, 100 MB and 20 files per message; ZIP archives are unpacked up to 5,000 entries and 200 MB.
+- Token-by-token streaming is shown for Claude only; Codex reports each step when it completes.
 - Worktrees do not contain ignored files or initialized submodules.
-- Claude read-only enforcement depends on its plan permission mode. Project settings and MCP servers are excluded, but your user-level Claude hooks and managed policies still apply, and user-level MCP servers are disabled during runs.
+- Claude's tool limits are enforced by Claude Code itself (its tool list and permission modes), not by an operating-system sandbox. Project settings and MCP servers are excluded, but your user-level Claude hooks and managed policies still apply, and user-level MCP servers are disabled during runs.
 - Codex applies its own project configuration according to its trust settings; the extension warns about a `.codex` folder but cannot disable it.
 - Untracked file contents are included for at most 40 small text files; files whose names suggest secrets are never read into prompts or copied into worktrees.
-- Automated tests use fake agents; they do not consume live model quota.
+- Automated tests use fake agents; they do not consume live model quota. The live check is a separate, manual step (see PROJECT_STATUS.md).
 
 ## Documentation index
 
@@ -305,6 +312,7 @@ scripts/          extension bundle and VS Code smoke test
 - [Official OpenAI Codex app-server documentation](https://learn.chatgpt.com/docs/app-server)
 - [Claude Code CLI reference](https://code.claude.com/docs/en/cli-usage)
 - [VS Code Tree View API](https://code.visualstudio.com/api/extension-guides/tree-view)
+- [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 
 ## License
 
