@@ -6,3 +6,4 @@
 - [ADR-0004: Hardened process boundary](0004-hardened-process-boundary.md)
 - [ADR-0005: Native VS Code interface](0005-native-vscode-interface.md)
 - [ADR-0006: Isolated worktrees and a verification gate](0006-isolation-and-verification-gate.md)
+- [ADR-0007: Conversational chat panel](0007-chat-panel.md)

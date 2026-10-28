@@ -13,8 +13,53 @@ Every workflow obeys these rules:
 7. Later stages are skipped after an unhandled failure.
 8. Final output must disclose residual risks, unresolved findings, and incomplete verification.
 9. Write permission exists only with the run's explicit consent; without it every stage is read-only.
-10. Implementation workflows start only when Git can describe the workspace.
+10. Workflows that edit files (Edit and Implement) start only when Git can describe the workspace.
 11. Files change after the final gate only through a fix round that is verified again; the completion stage is read-only.
+
+## Chat workflow
+
+One message in **Chat** mode, the default. Every stage is read-only and runs in the conversation's folder.
+
+1. **Claude answers.** Claude answers the user's latest message in the context of the conversation, reading the files and attachments it needs.
+2. **Codex checks the answer** (with a verdict). Codex verifies Claude's claims, code references, and reasoning against the repository and attachments itself. It passes an answer that is correct and complete enough to act on, and fails it only for material errors, omissions, or risks.
+3. **Claude revises the answer**, only when the check did not pass. Claude weighs each finding against the evidence and gives the complete, corrected answer. This stage is not checked again, so a message costs at most three agent calls.
+
+A missing or unparseable verdict counts as a failed check, so Claude revises. The run is **completed** either way; the chat shows whether Codex agreed or Claude revised. The answer shown to the user is the last completed Claude stage.
+
+## Edit workflow
+
+One message in **Edit** mode: a quick change without a planning stage. It needs consent and a Git repository, and with the default isolation it works in a worktree.
+
+1. **Claude makes the change** (workspace-write). Claude inspects the relevant code, makes the change asked for, and ends with a summary. Configured verification commands then run.
+2. **Codex reviews the change** (read-only, with a verdict, a gate). Codex reviews the diff against the message and the checks.
+
+A failed review starts fix rounds exactly as in the implementation workflow. The changes stay in the worktree until you apply or discard them. Later Edit messages in the same conversation keep working in the same worktree, so a change can be built up over several messages and reviewed once.
+
+## Conversations
+
+Chat and Edit messages belong to a conversation, kept in private workspace storage with one file per conversation:
+
+- **History.** Each new message's prompt includes earlier turns, oldest first, keeping the newest when the budget runs out and trimming each answer. The history is fenced as untrusted, because it contains agent output.
+- **Sessions.** Claude's first stage in a message continues Claude's last session from the conversation, so it receives only what is new and the history is left out. If the session is gone, the stage starts a new session with the full prompt. Codex always starts fresh, with the history.
+- **Records.** Each turn keeps its final answer, outcome, and sessions, so the conversation survives the pruning of old runs from run history.
+- **Models and effort.** Each message records the models and efforts chosen in the composer; they are validated again when the run starts.
+
+Brainstorm and Implement messages from the chat run the workflows below, with the conversation's history and attachments.
+
+## Attachments
+
+Attachments are copied into the conversation's private attachment folder when added, never into the repository:
+
+| Kind | Detected by | Claude reads | Codex reads |
+|---|---|---|---|
+| Image (PNG, JPEG, GIF, WebP) | file signature | the file, with its Read tool | the file, attached to its prompt with `--image` |
+| PDF | `%PDF-` signature | the file, with its Read tool | the text the extension extracted |
+| Word, Excel, PowerPoint | ZIP signature and extension | the extracted text | the extracted text |
+| ZIP archive | ZIP signature | the unpacked folder and its listing | the unpacked folder and its listing |
+| Jupyter notebook | extension, valid UTF-8 | the file, with its Read tool | the file |
+| Text or code | valid UTF-8 without NUL bytes | the file; small files are also included in the prompt | the same |
+
+Other binary files are refused. Up to 40 KB of text per attachment is included in the prompt, within a quarter of the evidence budget; larger content is referenced by path. Claude gets read access to the attachment folder with `--add-dir`, through the same Read, Grep, and Glob tools as the rest of a read-only stage. An `@`-mentioned workspace file is referenced in place, not copied.
 
 ## Implementation workflow
 
@@ -34,7 +79,7 @@ When `dualAgent.workflow.approvePlan` is on (the default), the run waits with st
 
 ### 3. Claude implementation
 
-Workspace-write. Claude reconciles the plan review, documents acceptance or rejection of material feedback, implements the change, and runs proportionate checks. Claude can run a shell command only when `dualAgent.claude.allowedTools` (or the user's own Claude settings) allows it; otherwise it reports checks as not run. Configured verification commands then run.
+Workspace-write. Claude reconciles the plan review, documents acceptance or rejection of material feedback, implements the change, and runs proportionate checks. Claude has a shell only when a rule in `dualAgent.claude.allowedTools` names one; otherwise it reports checks as not run. Configured verification commands then run.
 
 ### 4. Codex code review
 
@@ -101,11 +146,11 @@ With `dualAgent.claude.resumeSessions` on (the default), each Claude stage after
 
 ## Isolation
 
-An implementation run in `worktree` mode creates a detached worktree in the extension's private storage. Its base commit holds the workspace as it was at the start: `HEAD` plus staged, unstaged, and untracked changes. Untracked files whose names suggest secrets, symbolic links, and ignored files are not copied. Agents, snapshots, and checks run in the worktree's counterpart of the workspace folder, so the diff reviewers see contains only the agents' changes.
+An Edit or Implement run in `worktree` mode creates a detached worktree in the extension's private storage. Its base commit holds the workspace as it was at the start: `HEAD` plus staged, unstaged, and untracked changes. Untracked files whose names suggest secrets, symbolic links, and ignored files are not copied. Agents, snapshots, and checks run in the worktree's counterpart of the workspace folder, so the diff reviewers see contains only the agents' changes.
 
 When the run ends you can review the changes in the diff editor, then apply or discard them. Applying checks the whole patch against your working tree first. If any file conflicts with edits you made since the run started, nothing is written. A successful apply writes the files without staging or committing anything, then removes the worktree. A failed or cancelled run keeps its worktree, so it can be resumed or its partial changes reviewed.
 
-In `none` mode, implementation stages edit the workspace directly, as in 1.x.
+In `none` mode, editing stages work in the workspace directly, as in 1.x.
 
 ## Fallback policy
 
@@ -129,7 +174,7 @@ The fallback provider receives the same stage contract and permission, with a fr
 
 ## Resuming
 
-A failed or cancelled run can be resumed, including one interrupted because VS Code closed, which is marked cancelled when the extension next starts. Completed stages, their outputs, fix-round stages already added, an earlier plan approval, and an earlier gate result are kept. Every unfinished stage is reset and runs again from the first one. Implementation runs ask for consent again, and a worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded.
+A failed or cancelled run can be resumed, including one interrupted because VS Code closed, which is marked cancelled when the extension next starts. Completed stages, their outputs, fix-round stages already added, an earlier plan approval, and an earlier gate result are kept. Every unfinished stage is reset and runs again from the first one. Runs that edit files ask for consent again, and a worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded.
 
 ## Completion policy
 

@@ -39,7 +39,7 @@ Agents receive an allowlisted environment (see the README's billing section). If
 
 ### Claude reports that it could not run tests
 
-Claude Code's print mode cannot ask for approval, so shell commands are denied unless a permission rule allows them. Add rules to `dualAgent.claude.allowedTools`, for example `Bash(npm test:*)` or `Bash(npm run lint)`. They apply to write stages only. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in the user's own `~/.claude/settings.json` also apply; rules in the repository's `.claude/settings.json` deliberately do not.
+Claude stages have no shell unless a rule in `dualAgent.claude.allowedTools` names one, for example `Bash(npm test:*)` or `Bash(npm run lint)`. A rule makes its tool available to write stages and pre-approves the matching commands. Print mode cannot ask for approval, so Claude Code denies other commands unless it judges them read-only. Read-only stages never get a shell. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in your own `~/.claude/settings.json` still apply, but only to tools a stage already has, so they cannot add a shell; rules in the repository's `.claude/settings.json` deliberately do not apply.
 
 Codex review stages run in a read-only sandbox, so test runners and builds that write files (caches, coverage, build output) usually fail there. Reviewers are instructed to report such checks as not run rather than passed. For results reviewers can rely on, configure `dualAgent.verification.commands`: the extension runs them itself after every editing stage and reports their exit codes to the next reviewer.
 
@@ -62,9 +62,29 @@ Git refuses repositories owned by a different user account. On Windows this happ
 git config --global --add safe.directory "F:/path/to/repository"
 ```
 
-### "Implementation workflows need a working Git repository"
+### The chat says it cannot run here
 
-Implementation runs require Git so reviewers see every change and the result can be reverted. Open a Git repository (or run `git init` and commit a baseline) and resolve any warning shown with the error.
+The chat needs a trusted workspace with a local folder. In a multi-root workspace, a new conversation uses the folder of the active editor, or the first folder; the conversation keeps that folder.
+
+### An attachment is refused
+
+The chat shows why above the composer. Files over 25 MB, more than 20 files or 100 MB per message, and binary files other than images (PNG, JPEG, GIF, WebP), PDFs, ZIP archives, and Word, Excel, or PowerPoint files are refused. Convert other formats first: for example, export a drawing as PNG. A file whose name suggests secrets asks for confirmation. Hover over an attachment chip to see notes, such as archive entries that were skipped for safety.
+
+### Codex cannot read a PDF
+
+Codex reads the text the extension extracts. A scanned PDF has no text layer, so the chip notes that no text was found; Claude still reads the pages as images. A PDF that takes more than 60 seconds to parse is skipped, and the chip says so.
+
+### The model list shows only "Default" for Codex
+
+The list comes from `codex debug models`. If that command fails or prints something unexpected, only **Default** and **Custom model…** are offered. Check `codex --version` in a terminal, update Codex, or type the model name with **Custom model…**. Changing `dualAgent.codex.*` settings reloads the list.
+
+### A model or effort is rejected
+
+The CLI reports the error in the message's stage, and nothing falls back for an invalid request. Choose another model or effort, or **Default**. Not every Codex model accepts every effort; the picker offers the levels the model catalog lists for each model.
+
+### "Editing files needs a working Git repository"
+
+Edit and Implement runs require Git so reviewers see every change and the result can be reverted. Open a Git repository (or run `git init` and commit a baseline) and resolve any warning shown with the error.
 
 ### "An isolated worktree needs a repository with at least one commit"
 
@@ -80,7 +100,7 @@ Commands are argument lists run without a shell, and their executables are never
 
 ### The plan is waiting for approval
 
-Implementation runs pause before the first editing stage while `dualAgent.workflow.approvePlan` is on. The status bar shows **Dual Agent: approve plan**; click it, or use the buttons on the run in the **Runs** view. **Review Plan** opens Claude's plan beside Codex's review. Cancelling the run also ends the wait.
+Implementation runs pause before the first editing stage while `dualAgent.workflow.approvePlan` is on. In the chat, the message shows an approval card. Otherwise the status bar shows **Dual Agent: approve plan**; click it, or use the buttons on the run in the **Runs** view. **Review Plan** opens Claude's plan beside Codex's review. Cancelling the run also ends the wait.
 
 ### "Completed with unresolved findings"
 
@@ -112,13 +132,13 @@ If `runs.json` in the extension's workspace storage is corrupted or written by a
 
 ### Claude starts a new session instead of continuing
 
-With `dualAgent.claude.resumeSessions` on, a Claude stage continues the previous Claude stage's session. If Claude reports that the session no longer exists, the stage runs again in a new session with the full prompt, and the output channel says so. Turn the setting off to always start fresh.
+With `dualAgent.claude.resumeSessions` on, a Claude stage continues the previous Claude stage's session, including the session of the conversation's previous message. If Claude reports that the session no longer exists, the stage runs again in a new session with the full prompt, and the output channel says so. Turn the setting off to always start fresh.
 
 ## Recovery
 
 Completed, failed, and cancelled runs remain in private workspace storage. A failed or cancelled run can be continued with **Resume Run** (inline on the run, in its context menu, or in the Command Palette). Completed stages and an earlier plan approval are kept, and every unfinished stage runs again; implementation runs ask for consent again. A run that was active when VS Code closed is marked cancelled at the next start, and the output channel reports how many were interrupted.
 
-A worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded. Worktrees live in the `worktrees` folder of the extension's workspace storage. Remove one you no longer need with **Discard Changes** rather than deleting the folder, so Git's worktree registration is removed too. If a folder was deleted by hand, run `git worktree prune` in the repository.
+A worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded. Worktrees live in the `worktrees` folder of the extension's workspace storage, conversations in `conversations`, and attachments in `attachments`; deleting a conversation from the chat's history deletes its attachments. Remove one you no longer need with **Discard Changes** rather than deleting the folder, so Git's worktree registration is removed too. If a folder was deleted by hand, run `git worktree prune` in the repository.
 
 ## Logs
 

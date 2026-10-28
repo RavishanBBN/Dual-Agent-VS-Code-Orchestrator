@@ -1,8 +1,17 @@
 # Roadmap
 
-Release 2.0 delivered the native VS Code interface, the verification gate with bounded fix rounds, extension-run setup and verification commands, isolated worktrees with review and apply, plan approval, Claude session continuity, resuming runs, and multi-root folder selection. Future work should deepen integration without weakening local safety.
+Release 2.0 delivered the native VS Code interface, the verification gate with bounded fix rounds, extension-run setup and verification commands, isolated worktrees with review and apply, plan approval, Claude session continuity, resuming runs, and multi-root folder selection. Release 2.1 added the chat panel with Chat and Edit modes, conversations, attachments, and model and effort pickers. Future work should deepen integration without weakening local safety.
 
 ## Planned candidates
+
+### Chat
+
+- streamed Codex text, through the app-server adapter below;
+- an optional parallel mode in which both agents answer and Claude merges the answers;
+- a per-message choice to skip the Codex check when speed matters more than verification;
+- slash commands for switching modes, models, and conversations from the keyboard;
+- dragging files from the VS Code Explorer onto the composer (today: paste, drop from the operating system, the paperclip, or `@`);
+- applying selected files or hunks from the changes card.
 
 ### Gates and verification
 
@@ -15,7 +24,6 @@ Release 2.0 delivered the native VS Code interface, the verification gate with b
 
 - interactive approval requests;
 - live account/rate-limit reads;
-- model catalog discovery;
 - durable thread resume, so Codex stages can continue their own session the way Claude stages do;
 - richer event fidelity.
 
@@ -54,4 +62,5 @@ This must remain an adapter behind the existing core contract so CLI mode stays 
 - unrestricted autonomous background editing;
 - infinite agent debate loops or unbounded fix rounds;
 - silently switching to paid API billing;
-- web views or remotely hosted UI.
+- remotely hosted UI, or webview content loaded from the network;
+- webviews other than the chat panel.

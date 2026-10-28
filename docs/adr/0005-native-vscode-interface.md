@@ -1,6 +1,6 @@
 # ADR-0005: Native VS Code interface
 
-**Status:** accepted
+**Status:** accepted; amended by [ADR-0007](0007-chat-panel.md), which adds a chat webview while keeping every other part of the interface native
 
 **Date:** 2026-10-28
 
