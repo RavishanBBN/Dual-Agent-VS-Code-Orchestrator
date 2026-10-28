@@ -1,4 +1,4 @@
-import type { AgentActivity, AgentStreamEvent, StageResult, TokenUsage } from '../core/types.js';
+import type { AgentActivity, AgentStreamEvent, QuotaReading, QuotaWindow, StageResult, TokenUsage } from '../core/types.js';
 import { emptyUsage } from '../core/types.js';
 
 const TITLE_LIMIT = 160;
@@ -58,6 +58,66 @@ export interface ParsedLine {
   failure?: string;
   /** A provider-reported error that may have been recovered from, kept to explain a later failure. */
   error?: string;
+  /** The account's usage limits, when the provider reports them in the stream. */
+  quota?: QuotaReading;
+}
+
+const epochToIso = (seconds: unknown): string | undefined =>
+  typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : undefined;
+
+/**
+ * Claude's `rate_limit_event`: each usage window with its utilization (a fraction) and reset time. A status of
+ * `rejected` means the limit is reached until `resetsAt`.
+ */
+export function claudeQuota(info: JsonObject | undefined, observedAt = new Date()): QuotaReading | undefined {
+  if (!info) return undefined;
+  const windows: QuotaWindow[] = [];
+  const unified = asObject(info.unifiedWindows);
+  for (const [name, value] of Object.entries(unified ?? {})) {
+    const window = asObject(value);
+    const utilization = typeof window?.utilization === 'number' ? window.utilization : undefined;
+    if (utilization === undefined) continue;
+    const resetsAt = epochToIso(window?.resetsAt);
+    windows.push({ name, usedPercent: Math.round(utilization * 1000) / 10, ...(resetsAt ? { resetsAt } : {}) });
+  }
+  const status = stringAt(info, 'status');
+  const resetsAt = epochToIso(info.resetsAt);
+  if (!windows.length && !status) return undefined;
+  return { agent: 'claude', windows, limited: status === 'rejected', ...(resetsAt ? { resetsAt } : {}), observedAt: observedAt.toISOString() };
+}
+
+/**
+ * Codex's `rate_limits` from its session log: the five-hour (primary) and weekly (secondary) windows as
+ * percentages used, and which limit, if any, has been reached.
+ */
+export function codexQuota(limits: JsonObject | undefined, observedAt = new Date()): QuotaReading | undefined {
+  if (!limits) return undefined;
+  const windows: QuotaWindow[] = [];
+  for (const key of ['primary', 'secondary']) {
+    const window = asObject(limits[key]);
+    const used = typeof window?.used_percent === 'number' ? window.used_percent : undefined;
+    if (used === undefined) continue;
+    const minutes = typeof window?.window_minutes === 'number' ? window.window_minutes : 0;
+    const name = minutes === 300 ? 'five_hour' : minutes === 10_080 ? 'weekly' : minutes ? `${minutes}_minutes` : key;
+    const resetsAt = epochToIso(window?.resets_at);
+    windows.push({ name, usedPercent: used, ...(resetsAt ? { resetsAt } : {}) });
+  }
+  if (!windows.length) return undefined;
+  const reached = limits.rate_limit_reached_type !== null && limits.rate_limit_reached_type !== undefined;
+  const full = windows.filter((window) => window.usedPercent >= 100);
+  const limited = reached || full.length > 0;
+  const resetsAt = (full.length ? full : windows).map((window) => window.resetsAt).filter((value): value is string => Boolean(value)).sort().at(-1);
+  const plan = stringAt(limits, 'plan_type');
+  return { agent: 'codex', windows, limited, ...(limited && resetsAt ? { resetsAt } : {}), ...(plan ? { plan } : {}), observedAt: observedAt.toISOString() };
+}
+
+/** Claude's TodoWrite plan as a checklist: done, in progress, and still to do. */
+function todoChecklist(input: JsonObject | undefined): { title: string; list: string } {
+  const todos = Array.isArray(input?.todos) ? input.todos.map(asObject) : [];
+  const mark = (status: string): string => (status === 'completed' ? '\u2713' : status === 'in_progress' ? '\u25b6' : '\u25cb');
+  const list = todos.map((todo) => `${mark(stringAt(todo, 'status'))} ${stringAt(todo, 'content')}`).join('\n');
+  const done = todos.filter((todo) => stringAt(todo, 'status') === 'completed').length;
+  return { title: `${done} of ${todos.length} done`, list };
 }
 
 /** Describes a Codex item other than a message, such as a command it ran or files it changed. */
@@ -234,6 +294,10 @@ function claudeActivity(name: string, input: JsonObject | undefined, id: string)
       return make('web', stringAt(input, 'url'), stringAt(input, 'url'));
     case 'WebSearch':
       return make('web', stringAt(input, 'query'), stringAt(input, 'query'));
+    case 'TodoWrite': {
+      const { title, list } = todoChecklist(input);
+      return make('todo', title, list);
+    }
     default:
       return make('tool', name, input ? JSON.stringify(input, null, 2) : '');
   }
@@ -259,6 +323,11 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
     return { ...(sessionId ? { sessionId } : {}), event: { agent: 'claude', category: 'message', message: '', delta: text } };
   }
 
+  if (type === 'rate_limit_event') {
+    const quota = claudeQuota(asObject(value.rate_limit_info));
+    return { ...(sessionId ? { sessionId } : {}), ...(quota ? { quota, event: { agent: 'claude', category: 'usage', message: '', quota } } : {}) };
+  }
+
   if (type === 'system' && value.subtype === 'init') {
     const model = stringAt(value, 'model');
     return {
@@ -272,9 +341,13 @@ export function parseClaudeLine(line: string): ParsedLine | undefined {
     const message = asObject(value.message);
     const text = textContent(message?.content);
     const blocks = Array.isArray(message?.content) ? message.content.map(asObject) : [];
-    const activities = blocks
-      .filter((block) => block?.type === 'tool_use')
-      .map((block) => claudeActivity(stringAt(block, 'name'), asObject(block?.input), stringAt(block, 'id')));
+    const activities = blocks.flatMap((block): AgentActivity[] => {
+      if (block?.type === 'tool_use') return [claudeActivity(stringAt(block, 'name'), asObject(block.input), stringAt(block, 'id'))];
+      // Extended thinking, shown as a collapsed step like Claude Code's "Thinking".
+      const thinking = block?.type === 'thinking' ? stringAt(block, 'thinking').trim() : '';
+      if (thinking) return [{ kind: 'reasoning', tool: 'Thinking', title: clip(thinking.split('\n')[0] ?? '', TITLE_LIMIT), input: clip(thinking, INPUT_LIMIT) }];
+      return [];
+    });
     const extraEvents = activities.map(
       (activity): AgentStreamEvent => ({ agent: 'claude', category: 'tool', message: activity.title, activity }),
     );
@@ -342,6 +415,7 @@ export class StreamAccumulator {
   private eventCount = 0;
   private failure?: string;
   private lastError?: string;
+  private quota?: QuotaReading;
 
   public add(parsed: ParsedLine | undefined): void {
     if (!parsed) return;
@@ -352,6 +426,7 @@ export class StreamAccumulator {
     if (parsed.usage) this.usage = parsed.usage;
     if (parsed.failure) this.failure = parsed.failure;
     if (parsed.error) this.lastError = parsed.error;
+    if (parsed.quota) this.quota = parsed.quota;
   }
 
   /** The definitive turn failure, if the provider reported one. */
@@ -371,6 +446,7 @@ export class StreamAccumulator {
       rawEventCount: this.eventCount,
       ...(this.sessionId ? { providerSessionId: this.sessionId } : {}),
       ...(this.model ? { model: this.model } : {}),
+      ...(this.quota ? { quota: this.quota } : {}),
     };
   }
 }

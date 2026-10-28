@@ -1,4 +1,5 @@
-import { access } from 'node:fs/promises';
+import { access, readdir, readFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 
 import type {
@@ -14,7 +15,7 @@ import { isEffort, isModelName } from '../core/agentOptions.js';
 import { AgentExecutionError, classifyFailure, limitDetail } from '../core/errors.js';
 import { resolveExecutable } from '../core/executables.js';
 import { buildChildEnvironment, type BillingMode } from './environment.js';
-import { parseClaudeLine, parseCodexLine, StreamAccumulator, type ParsedLine } from './parsers.js';
+import { codexQuota, parseClaudeLine, parseCodexLine, StreamAccumulator, type ParsedLine } from './parsers.js';
 import { runProcess } from './processRunner.js';
 
 export interface AdapterConfiguration {
@@ -29,6 +30,18 @@ export interface AdapterConfiguration {
   claudeAllowedTools?: readonly string[];
   /** Extra environment variable names passed to the agent process. */
   environmentPassthrough?: readonly string[];
+  /**
+   * How Agent-mode stages ask the user before a command or edit: an MCP configuration file naming the
+   * extension's permission bridge, and the bridge's tool. Without it Agent mode cannot run commands.
+   */
+  permissionBridge?: { configFile: string; tool: string };
+  /** Codex in Agent mode may reach the network from its sandbox, so it can install packages. */
+  codexAgentNetwork?: boolean;
+  /**
+   * Claude may use the MCP servers in the user's own Claude configuration. Off by default: a server can read
+   * and send data, so it is the user's choice. With it on, Claude loads servers as it does in the user's terminal.
+   */
+  claudeUserMcp?: boolean;
 }
 
 /** Session IDs are passed as arguments, so anything that could read as a flag is rejected. */
@@ -38,9 +51,11 @@ const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
  * Claude's built-in tools are allowlisted. Plan mode alone still offers Bash, PowerShell, WebFetch, and
  * publishing tools, and in print mode Claude Code runs commands it judges read-only without asking.
  */
-const CLAUDE_READ_TOOLS = ['Read', 'Grep', 'Glob'];
+const CLAUDE_READ_TOOLS = ['Read', 'Grep', 'Glob', 'TodoWrite'];
 const CLAUDE_EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit'];
 const CLAUDE_WEB_TOOLS = ['WebSearch', 'WebFetch'];
+/** Agent mode gets the shell too; everything Claude does not judge read-only goes to the permission bridge. */
+const CLAUDE_AGENT_TOOLS = [...CLAUDE_READ_TOOLS, ...CLAUDE_EDIT_TOOLS, 'Bash', ...CLAUDE_WEB_TOOLS];
 /** Arguments simple enough to put in an exact Bash rule without quoting. */
 const RULE_ARGUMENT = /^[\w@%+=:,./-]+$/;
 
@@ -94,6 +109,7 @@ export function claudeArguments(
   resumeSessionId?: string,
   run: RunArguments = {},
 ): string[] {
+  if (permission === 'agent') return claudeAgentArguments(configuration, resumeSessionId, run);
   const writes = permission === 'workspace-write';
   // Tool rules extend write stages only; a read-only stage can read and search (and use the web when allowed).
   const web = run.web === true;
@@ -116,7 +132,7 @@ export function claudeArguments(
     // MCP approvals) would otherwise apply without consent. Only the user's own settings are loaded.
     '--setting-sources',
     'user',
-    '--strict-mcp-config',
+    ...(configuration.claudeUserMcp ? [] : ['--strict-mcp-config']),
     '--permission-mode',
     writes ? 'acceptEdits' : 'plan',
     '--tools',
@@ -132,19 +148,63 @@ export function claudeArguments(
   return args;
 }
 
+/**
+ * Agent mode: the full toolset in the folder itself. Claude Code runs what it judges read-only and asks the
+ * permission bridge, and so the user, before anything else; the user's own allowed-tool rules still apply.
+ */
+function claudeAgentArguments(configuration: AdapterConfiguration, resumeSessionId: string | undefined, run: RunArguments): string[] {
+  const bridge = configuration.permissionBridge;
+  if (!bridge) throw new AgentExecutionError('Agent mode needs the permission bridge, which is not running.', 'invalid');
+  const rules = configuration.claudeAllowedTools ?? [];
+  const args = [
+    '-p',
+    '--input-format',
+    'text',
+    '--output-format',
+    'stream-json',
+    '--verbose',
+    '--include-partial-messages',
+    '--max-turns',
+    String(configuration.claudeMaxTurns ?? 24),
+    '--setting-sources',
+    'user',
+    // Only the bridge's MCP server starts, unless the user allowed their own servers too.
+    ...(configuration.claudeUserMcp ? [] : ['--strict-mcp-config']),
+    '--mcp-config',
+    bridge.configFile,
+    '--permission-prompt-tool',
+    bridge.tool,
+    '--permission-mode',
+    'default',
+    '--tools',
+    claudeTools(false, [...CLAUDE_AGENT_TOOLS, ...rules], false),
+  ];
+  if (rules.length) args.push('--allowedTools', ...rules);
+  for (const directory of run.readableDirectories ?? []) args.push('--add-dir', directory);
+  if (resumeSessionId) args.push('--resume', resumeSessionId);
+  const { model, effort } = chosen('claude', configuration, run);
+  if (model) args.push('--model', model);
+  if (effort) args.push('--effort', effort);
+  return args;
+}
+
 function isMissingSession(error: unknown): boolean {
   return error instanceof AgentExecutionError && /no conversation found/i.test(error.message);
 }
 
 export function codexArguments(configuration: AdapterConfiguration, permission: PermissionMode, run: RunArguments = {}): string[] {
-  const writes = permission === 'workspace-write';
+  const writes = permission !== 'read-only';
   // `--search` is a top-level option, so it comes before the subcommand.
-  const args = [...(run.web ? ['--search'] : []), 'exec', '--json'];
+  const args = [...(run.web || permission === 'agent' ? ['--search'] : []), 'exec', '--json'];
   // `--image` takes several values, so a fixed-arity flag always follows it before the stdin marker.
   for (const image of run.images ?? []) args.push('--image', image);
   args.push('--sandbox', writes ? 'workspace-write' : 'read-only');
-  // Codex refuses folders outside Git by default; a read-only stage cannot change one, so chat works anywhere.
-  if (!writes) args.push('--skip-git-repo-check');
+  // Codex exec cannot ask before a command, so in Agent mode it works inside its sandbox, with the network
+  // when that is allowed so it can install packages there.
+  if (permission === 'agent' && configuration.codexAgentNetwork !== false) args.push('--config', 'sandbox_workspace_write.network_access=true');
+  // Codex refuses folders outside Git by default. A read-only stage cannot change one, and an editing stage
+  // works in an isolated worktree or in a folder the extension snapshotted first, so both may run anywhere.
+  args.push('--skip-git-repo-check');
   const { model, effort } = chosen('codex', configuration, run);
   if (model) args.push('--model', model);
   if (effort) args.push('--config', `model_reasoning_effort=${effort}`);
@@ -295,8 +355,49 @@ abstract class CliAdapter implements AgentAdapter {
   }
 }
 
+/** Codex thread IDs are UUIDs; anything else is never used in a path. */
+const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Reads the account's usage limits from the session log Codex wrote for `threadId`. Codex records them there,
+ * not in `exec --json` output. Only that thread's log is opened, and only its rate-limit fields are read.
+ */
+export async function readCodexQuota(
+  threadId: string,
+  home = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'),
+  now = new Date(),
+): Promise<StageResult['quota']> {
+  if (!THREAD_ID.test(threadId)) return undefined;
+  const pad = (value: number): string => String(value).padStart(2, '0');
+  // A session that started just before midnight is filed under the previous day.
+  for (const day of [now, new Date(now.getTime() - 86_400_000)]) {
+    const folder = path.join(home, 'sessions', String(day.getFullYear()), pad(day.getMonth() + 1), pad(day.getDate()));
+    const name = (await readdir(folder).catch(() => [] as string[])).find((entry) => entry.endsWith(`${threadId}.jsonl`));
+    if (!name) continue;
+    const lines = (await readFile(path.join(folder, name), 'utf8').catch(() => '')).split(/\r?\n/);
+    for (const line of lines.reverse()) {
+      if (!line.includes('"rate_limits"')) continue;
+      try {
+        const entry = JSON.parse(line) as { payload?: { rate_limits?: Record<string, unknown> } };
+        const quota = codexQuota(entry.payload?.rate_limits, now);
+        if (quota) return quota;
+      } catch {
+        // A partly written line; an earlier one may still hold the limits.
+      }
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
 export class CodexCliAdapter extends CliAdapter {
   public readonly id = 'codex' as const;
+
+  public override async run(request: AgentRunRequest): Promise<StageResult> {
+    const result = await super.run(request);
+    const quota = result.providerSessionId ? await readCodexQuota(result.providerSessionId).catch(() => undefined) : undefined;
+    return quota ? { ...result, quota } : result;
+  }
 
   protected buildArguments(permission: PermissionMode, _resumeSessionId: string | undefined, run: RunArguments): string[] {
     return codexArguments(this.configuration, permission, run);

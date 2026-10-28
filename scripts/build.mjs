@@ -2,9 +2,12 @@ import * as esbuild from 'esbuild';
 
 const watch = process.argv.includes('--watch');
 
-/** The extension host bundle, and the PDF reader that runs in a worker thread only when a PDF is attached. */
+/**
+ * The extension host bundle; the PDF reader, run in a worker thread only when a PDF is attached; and the
+ * permission bridge Claude Code starts in Agent mode, which runs as its own process.
+ */
 const host = {
-  entryPoints: { extension: 'src/extension.ts', pdfWorker: 'src/core/pdfWorker.ts' },
+  entryPoints: { extension: 'src/extension.ts', pdfWorker: 'src/core/pdfWorker.ts', permissionServer: 'src/permission/main.ts' },
   bundle: true,
   outdir: 'dist',
   external: ['vscode'],
