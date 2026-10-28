@@ -30,10 +30,13 @@ Dual Agent Orchestrator is a local desktop VS Code extension. The VS Code extens
 
 ### Chat (`src/ui/chat`, `src/webview`)
 
-- **Chat view** (`chatProvider.ts`): a `WebviewViewProvider` for the `dualAgent.chat` view, and the same page in an editor tab. The page loads only `dist/webview/chat.js` and `chat.css` under a Content-Security-Policy that allows the bundle's nonce-tagged script, the extension's own styles, and images from the webview's resource roots, which are the bundle and the attachment folder. Command URIs are disabled.
+- **Chat view** (`chatProvider.ts`): a `WebviewViewProvider` for the `dualAgent.chat` view, and the same page in an editor tab. The page loads only `dist/webview/chat.js` and `chat.css` under a Content-Security-Policy that allows the bundle's nonce-tagged script, the extension's own styles, and images from the webview's resource roots, which are the bundle and the attachment folder. The policy requires Trusted Types and allows only the Markdown renderer's policy. Command URIs are disabled. The page reports script errors and policy violations back to the output log.
 - **Protocol** (`protocol.ts`): every message type in both directions. `parseWebviewMessage` validates each incoming message (types, lengths, IDs, base64) and drops anything malformed; `linkTarget` and `fileReference` decide what a link in agent output may open.
 - **Transcript** (`transcript.ts`): a pure function from conversations, runs, live streaming state, and worktree changes to the view model the page displays. The page makes no decisions of its own.
 - **Controller** (`chatController.ts`): owns conversations, pending attachments, the composer's mode, models, and efforts (in `globalState`, never workspace settings), and the edit-consent cards. It turns a message into a run through the extension's single-run lock and records each finished run on its turn.
+  - **Queue.** It holds the message queue, persisted in `workspaceState`, and drains it whenever the lock is free and the agents can work.
+  - **Retry and edit.** It handles both by rewinding the conversation and the worktree checkpoint before running the message again.
+  - **Catch-up.** For each continued session, it computes the turns that session missed.
 - **Page** (`src/webview/main.tsx`): Preact components for the transcript (a timeline of stages, each with its tool calls and their IN/OUT boxes, and streamed text), consent, approval, changes, and check cards, and the composer with attachments, `@` mentions, mode, and model pickers. `markdown.ts` renders agent Markdown with markdown-it: raw HTML is escaped, images are disabled, and links carry their target in a data attribute that the extension checks when clicked. Styles use VS Code theme variables only.
 
 ### Native views (`src/ui`)
@@ -48,6 +51,15 @@ The rest of the interface uses native VS Code components:
 - **Documents** (`documents.ts`): a read-only `dual-agent-run:` content provider for reports, stage outputs, and check logs, refreshed while a run progresses; and a `dual-agent-base:` provider that serves a file from a run's base commit as the left side of the diff editor.
 - **Approvals** (`approvals.ts`): holds the orchestrator's approval request until the user decides through the chat's approval card, a notification (shown only while the chat is hidden), the status bar, the Runs view, or the Command Palette.
 - **Presentation** (`presentation.ts`): pure functions for labels, icons, context values, tooltips, and dialog text, with no `vscode` import, so they are unit-tested. Text from agents and repositories is Markdown-escaped before it reaches a tooltip, and tooltips are untrusted `MarkdownString`s, so command links never activate.
+
+### Usage limits and continuations (`src/core/limits.ts`, `src/ui/continuations.ts`)
+
+- **Limit tracker.** `AgentLimits` holds the usage limit each agent last reported and when it resets, persisted in `globalState` because limits belong to the account. The orchestrator receives it as a dependency: it skips a limited agent, records limits from quota errors, clears them after a successful call, and stops a run with `limitReset` when no agent can continue.
+- **Scheduler.** `ContinuationScheduler` keeps the runs waiting to continue after a reset, persisted in `workspaceState`. It fires them through the extension, which checks consent conditions and resumes the run through the chat or the orchestrator.
+
+### Secret masking (`src/core/redact.ts`)
+
+`redactSecrets` replaces recognizable credentials with a labelled placeholder. The prompt builder applies it to every untrusted section before fencing; the extension applies it to the output log and exported reports.
 
 ### Composition root (`src/extension.ts`)
 
@@ -161,7 +173,7 @@ Every Git command resolves Git like any other executable and runs with `core.hoo
 
 ## Persistence
 
-Conversations are stored one JSON file per conversation under `conversations/` in the same private storage, so a save rewrites only one conversation; at most 50 are kept, never pruning the current one or one whose changes wait in a worktree. Attachments live under `attachments/<conversation>` and are deleted with their conversation.
+Conversations are stored one JSON file per conversation under `conversations/` in the same private storage, so a save rewrites only one conversation; at most 50 are kept, never pruning the current one or one whose changes wait in a worktree. Attachments live under `attachments/<conversation>` and are deleted with their conversation. Each Edit-mode turn records a checkpoint of the conversation's worktree as a Git tree ID. The queue and pending continuations are in `workspaceState`, and usage limits in `globalState`. **Delete All History** removes conversations, attachments, the queue, and run history together.
 
 Run history is stored as a versioned JSON document under VS Code's workspace-specific private storage, with worktrees in a `worktrees` folder beside it. Saves are serialized, and each writes a temporary file and renames it into place, retrying briefly when Windows reports the target as locked and falling back to an in-place copy. A file that cannot be parsed is renamed to `runs.json.unreadable-<timestamp>` rather than overwritten. History is capped by configuration, except that a run whose worktree changes are still waiting to be applied or discarded is never pruned. New fields are optional, so 1.x records load unchanged and are treated as edits made directly in the workspace.
 

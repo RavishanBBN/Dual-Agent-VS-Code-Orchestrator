@@ -61,6 +61,9 @@ Chat and Edit messages belong to a conversation, kept in private workspace stora
 
 - **History.** Each new message's prompt includes earlier turns, oldest first, keeping the newest when the budget runs out and trimming each answer. The history is fenced as untrusted, because it contains agent output.
 - **Sessions.** Claude's first stage in a message continues Claude's last session from the conversation, so it receives only what is new and the history is left out. If the session is gone, the stage starts a new session with the full prompt. Codex always starts fresh, with the history.
+- **Catching up.** If messages were answered without that session, for example by Codex alone while Claude was at its usage limit, the continued session is given those messages instead, fenced as history.
+- **Queue.** A message sent while another runs waits in a queue and starts when the run lock is free, in the order sent, each in its own conversation.
+- **Retry and edit.** Retrying or editing a message removes it and every later message, undoes their file changes in the worktree from the checkpoint recorded before the first of them that edited files, and runs the message again. The retried run and later messages start new sessions, because earlier sessions also saw what was removed.
 - **Records.** Each turn keeps its final answer, outcome, and sessions, so the conversation survives the pruning of old runs from run history.
 - **Models and effort.** Each message records the models and efforts chosen in the composer; they are validated again when the run starts.
 
@@ -193,6 +196,14 @@ It is not eligible for:
 - an unknown deterministic failure.
 
 The fallback provider receives the same stage contract and permission, with a fresh Git snapshot because the failed attempt may have changed files before stopping. The run records the intended provider, actual provider, and original failure, and counts the usage the failed attempt reported. There is no second fallback loop.
+
+### Usage limits and solo mode
+
+A quota failure also records the agent's limit and its reset time, read from the provider's message. If the message names no reset time, it is estimated as 15, 30, 60, then 120 minutes. The limit is shared by every run.
+
+- **One agent limited.** Its stages go straight to the other agent, which is told it is the recorded fallback. The answer is taken from the stage in Claude's role whoever ran it, and review stages still give a verdict.
+- **The limit resets.** The agent is tried again; its first successful call clears the record.
+- **Every agent that could run the stage is limited.** That means both agents, or only the stage's own agent while fallback is off. The run fails with `limitReset`, the time the first of those limits resets. With `dualAgent.limits.autoContinue` on, it is resumed automatically a minute after that time. A run that edits files is resumed this way only with unchanged isolation, setup, and verification commands.
 
 ## Resuming
 

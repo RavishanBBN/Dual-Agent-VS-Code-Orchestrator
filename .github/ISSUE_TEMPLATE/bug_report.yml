@@ -1,0 +1,62 @@
+name: Bug report
+description: Something in Dual Agent does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For a security problem, do not open an issue: use **Security → Report a vulnerability** instead.
+        Never paste tokens, API keys, credential files, private prompts, or proprietary code.
+  - type: input
+    id: version
+    attributes:
+      label: Extension version
+      placeholder: "2.3.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: VS Code, operating system, Claude Code, and Codex CLI versions
+      placeholder: "VS Code 1.143.1, Windows 11, Claude Code 2.1.312, codex-cli 0.165.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Chat
+        - Research
+        - Edit or Implement
+        - Brainstorm
+        - Usage limits, queue, or retry
+        - Attachments
+        - Runs view or commands
+        - Setup or installation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: In a disposable repository if you can.
+      placeholder: |
+        1. Open the chat and choose Edit mode
+        2. Send "…"
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output log
+      description: From **Dual Agent: Show Output**. Check it for anything private before pasting.
+      render: text

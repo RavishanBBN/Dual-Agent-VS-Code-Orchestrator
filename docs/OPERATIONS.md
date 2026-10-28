@@ -118,6 +118,33 @@ Applying checks the whole patch against your working tree first. It fails when y
 
 Warnings in the Runs view (expand the run) and the exported report mark conditions that weakened a run without stopping it. Examples: Git unavailable or its diff truncated, untracked files not listed or not copied into the worktree, repository agent configuration (`.codex`), or run history that could not be saved. Read them before trusting a review.
 
+### An agent is at its usage limit
+
+When Claude or Codex reports a usage limit or exhausted credits, a banner above the composer says until when. Meanwhile the other agent does that agent's stages too, marked **standing in** on the timeline. A stand-in's check of its own answer is weaker than an independent one, so read those answers with more care. The limit is read from the provider's message. If the message names no reset time, the agent is tried again after 15 minutes, then 30, 60, and 120. After the reset the agent rejoins, and a continued Claude session is given the messages it missed. To keep the limited agent's role empty instead, turn off `dualAgent.fallbackOnQuota`: the work then pauses until that agent resets.
+
+### Paused at the usage limits
+
+When both agents are out, the message stops with a **Paused at the usage limits** card, or a notification for runs started from the Runs view. With `dualAgent.limits.autoContinue` on (the default), the message continues by itself a minute after the first limit resets, from the stage where it stopped, and then the queued messages run. This continuation is kept across restarts of VS Code.
+
+- **Continue now** tries at once.
+- **Do not continue** cancels the automatic continuation; **Resume** is still available later.
+- A message that edits files continues by itself only while the setup and verification commands are the ones you allowed. If they changed, you are asked to resume it yourself, which shows the consent card again.
+
+### Queued messages
+
+A message sent while another runs waits in the queue above the composer, numbered in order. A message sent while both agents are at their limits, or while a paused message waits to continue, waits there too. Remove one with its ✕. Queued messages run one after another, each in its own conversation. An Edit message still shows its consent card unless you chose **Allow for this conversation**. The queue holds at most 20 messages and is kept across restarts.
+
+### Retrying or editing an earlier message
+
+**Retry** under a message runs it again with the models and efforts now selected. **Edit** puts its text in the composer; sending replaces the message. Either way:
+
+- The messages after it are removed from the conversation. Their runs stay in the Runs view.
+- File changes made in the isolated copy from that message on are undone. The copy is put back to the checkpoint taken before the first Edit message being replaced, or discarded if that message created it.
+- Changes that were already applied to your workspace are not undone; the confirmation says so. Revert them in Source Control if needed.
+- Claude and Codex start new sessions, so nothing from the removed messages carries over.
+
+Retrying the last message needs no confirmation. Retrying an earlier one asks first.
+
 ### Workflow stops at a review stage
 
 Open the stage from the Runs view, or the run report, and read the error. Authentication, invalid request, and policy failures intentionally do not fall back. Correct the underlying provider configuration, then use **Resume Run** to continue from that stage.
@@ -144,6 +171,10 @@ Completed, failed, and cancelled runs remain in private workspace storage. A fai
 
 A worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded. Worktrees live in the `worktrees` folder of the extension's workspace storage, conversations in `conversations`, and attachments in `attachments`; deleting a conversation from the chat's history deletes its attachments. Remove one you no longer need with **Discard Changes** rather than deleting the folder, so Git's worktree registration is removed too. If a folder was deleted by hand, run `git worktree prune` in the repository.
 
+**Dual Agent: Delete All History** (in the Runs view's menu and the Command Palette) deletes every conversation, attachment, queued message, and run record for the workspace. It refuses while a run is active or while a worktree still holds changes: apply or discard them first. Files in your workspace are not touched.
+
+Checkpoints for retries are Git tree objects in the repository's object database, written from the worktree's own index. Nothing refers to them, so `git gc` eventually removes old ones. Retrying from a message whose checkpoint is gone reports that the file changes could not be undone, and nothing is retried.
+
 ## Logs
 
-**Dual Agent: Show Output** opens the **Dual Agent** output channel: stage transitions, approvals, fallbacks, check output, and excerpts of agent messages and diagnostics. Set the channel's log level to Debug to also see tool and lifecycle events. Full stage outputs are in the stage documents opened from the Runs view. Nothing is written to the repository. Use VS Code's Extension Host log for extension failures.
+**Dual Agent: Show Output** opens the **Dual Agent** output channel: stage transitions, approvals, fallbacks, check output, and excerpts of agent messages and diagnostics. Set the channel's log level to Debug to also see tool and lifecycle events. Errors from the chat page itself, including content its security policy blocked, appear there as "Chat view error". Credentials in agent messages are masked in the log while `dualAgent.privacy.redactSecrets` is on. Full stage outputs are in the stage documents opened from the Runs view. Nothing is written to the repository. Use VS Code's Extension Host log for extension failures.

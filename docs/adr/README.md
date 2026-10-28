@@ -8,3 +8,4 @@
 - [ADR-0006: Isolated worktrees and a verification gate](0006-isolation-and-verification-gate.md)
 - [ADR-0007: Conversational chat panel](0007-chat-panel.md)
 - [ADR-0008: Research mode, web access, and lean context](0008-research-web-and-lean-context.md)
+- [ADR-0009: Working through usage limits, queueing messages, and retrying](0009-usage-limits-queue-and-retry.md)

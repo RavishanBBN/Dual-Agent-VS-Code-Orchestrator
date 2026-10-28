@@ -24,6 +24,11 @@ Read `README.md`, `PROJECT_STATUS.md`, and the relevant document under `docs/` b
 - Validate models and efforts with `src/core/agentOptions.ts` wherever they enter: settings, the chat, and stored runs.
 - Give agents web access only through a stage's `web` flag (Research) or the user's per-message Web toggle, never by default in other modes.
 - Let an editing stage run only the user's configured verification commands, as prefix rules built by `commandRules` from arguments that need no quoting.
+- Mask credentials with `redactSecrets` (`src/core/redact.ts`) in everything the extension quotes into prompts, logs, or exported reports, unless the user turned `dualAgent.privacy.redactSecrets` off. Add new credential formats there, with a test that builds the sample at run time.
+- Keep the chat page's Trusted Types policy (`trusted-types dual-agent-markdown`): HTML reaches the page only through `trustedMarkdown` in `src/webview/markdown.ts`.
+- Record usage limits only through `AgentLimits` (`src/core/limits.ts`), from quota errors classified by `classifyFailure`; a limit only reroutes or pauses stages, never changes permissions.
+- Continue a paused run automatically only through `ContinuationScheduler`, and for a run that edits files only when its setup and verification commands are unchanged since the user allowed it.
+- Undo a retried message's file changes only by restoring its checkpoint with `restoreWorktree`, or by discarding the worktree the message created, both inside the extension's worktree storage; never touch the user's working tree.
 - Keep provider-specific schemas inside `src/adapters/`.
 - Update tests, `CHANGELOG.md`, and `PROJECT_STATUS.md` with behavior changes.
 - Run `npm.cmd run check` before declaring completion, and `npm.cmd run smoke` after UI, manifest, or activation changes.
