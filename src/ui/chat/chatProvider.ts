@@ -81,6 +81,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       `style-src ${webview.cspSource}`,
       `font-src ${webview.cspSource}`,
       `script-src 'nonce-${nonce}'`,
+      "base-uri 'none'",
+      "form-action 'none'",
+      // Only the Markdown renderer's policy may produce HTML, so no other code path can inject markup.
+      "require-trusted-types-for 'script'",
+      'trusted-types dual-agent-markdown',
     ].join('; ');
     return `<!doctype html>
 <html lang="en">

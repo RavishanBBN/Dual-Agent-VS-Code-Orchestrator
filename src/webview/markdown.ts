@@ -41,6 +41,25 @@ export function renderMarkdown(text: string): string {
   return markdown.render(text.replace(VERDICT_BLOCK, '').trim());
 }
 
+interface TrustedTypePolicy {
+  createHTML(input: string): unknown;
+}
+interface TrustedTypesWindow {
+  trustedTypes?: { createPolicy(name: string, rules: { createHTML(input: string): string }): TrustedTypePolicy };
+}
+
+/**
+ * The page's Content-Security-Policy requires Trusted Types and names only this policy, so the renderer above
+ * is the one source of HTML on the page. Without Trusted Types (in tests) the HTML is used as it is.
+ */
+const policy = (globalThis as TrustedTypesWindow).trustedTypes?.createPolicy('dual-agent-markdown', { createHTML: (input) => input });
+
+/** Rendered agent Markdown in the form the page may assign to innerHTML. */
+export function trustedMarkdown(text: string): string {
+  const html = renderMarkdown(text);
+  return policy ? (policy.createHTML(html) as string) : html;
+}
+
 /** Whether a link target is a file path rather than a web or mail address. */
 export function isFileLink(href: string): boolean {
   return !/^(?:https?:|mailto:)/i.test(href);
