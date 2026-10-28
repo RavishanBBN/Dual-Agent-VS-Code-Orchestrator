@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { RunRecord, RunStore } from './types.js';
@@ -85,6 +85,20 @@ export class FileRunStore implements RunStore {
     const saved = this.queue.then(() => this.write(run));
     this.queue = saved.catch(() => undefined);
     return saved;
+  }
+
+  /** Deletes the whole history, including copies set aside as unreadable. */
+  public clear(): Promise<void> {
+    const cleared = this.queue.then(async () => {
+      const directory = path.dirname(this.filePath);
+      const base = path.basename(this.filePath);
+      const names = await readdir(directory).catch(() => [] as string[]);
+      for (const name of names.filter((entry) => entry === base || entry.startsWith(`${base}.`))) {
+        await rm(path.join(directory, name), { force: true });
+      }
+    });
+    this.queue = cleared.catch(() => undefined);
+    return cleared;
   }
 
   private async write(run: RunRecord): Promise<void> {
