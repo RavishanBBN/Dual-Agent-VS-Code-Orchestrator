@@ -2,7 +2,25 @@
 
 ## Doctor checks
 
-Expand the **Agents** view under the Dual Agent activity-bar icon, or run **Dual Agent: Check Agent Setup**. A healthy result shows a version for Claude Code, Codex, and Git. Hover a row to see the absolute path each command resolved to, or why Git does not accept the workspace.
+Expand the **Agents** view under the Dual Agent activity-bar icon, or run **Dual Agent: Check Agent Setup**. A healthy result shows a version and the sign-in for Claude Code and Codex, a version for Git, and both for Gemini CLI when the referee is enabled. Hover a row to see the absolute path each command resolved to, the account it is signed in with, or why Git does not accept the workspace. A CLI that is installed but signed out shows a warning; use **Sign In** on its row.
+
+## Settings for Agent mode, the editor, and the referee
+
+These settings are machine-scoped like every other Dual Agent setting, so only your user settings change them.
+
+| Setting | Default | Effect |
+|---|---:|---|
+| `dualAgent.codex.agentNetwork` | `true` | In Agent mode Codex cannot ask before a command, so it works in its sandbox; this lets the sandbox reach the network to install packages. Claude always asks instead. |
+| `dualAgent.claude.userMcpServers` | `false` | Lets Claude load MCP servers as Claude Code does in your terminal: those in your own Claude configuration, and a repository's `.mcp.json` servers only if you approved them in Claude Code. Off, Claude loads none. A server's tools still need a rule in `dualAgent.claude.allowedTools` to run without asking. |
+| `dualAgent.chat.includeEditorContext` | `true` | Sends the active editor's file, selected lines, and problems with new messages, shown as a chip above the message box that turns it off. |
+| `dualAgent.chat.sound` | `true` | Plays a short chime when a message that took longer than 15 seconds finishes. |
+| `dualAgent.findings.showInEditor` | `true` | Shows reviewers' findings that name a file and line as problems in the editor and the Problems panel. |
+| `dualAgent.usage.readLocalLogs` | `true` | Reads the CLIs' own logs for token counts, usage-limit messages, and Codex's rate limits, so the usage panel and the limits cover terminals and other editors too. |
+| `dualAgent.gemini.enabled` | `false` | Lets Gemini CLI rule on the findings of a failed check before the revision. |
+| `dualAgent.gemini.command` | `gemini` | Gemini CLI command name or absolute path, never resolved from the workspace. |
+| `dualAgent.gemini.model` | empty | Gemini model, such as `pro` or `flash`; empty uses the CLI default. |
+
+The referee uses `dualAgent.timeoutMinutes`, `dualAgent.billingMode`, and `dualAgent.environment.passthrough` like the agents.
 
 ### "Refusing to run … because it is inside the workspace"
 
@@ -39,13 +57,15 @@ Agents receive an allowlisted environment (see the README's billing section). If
 
 ### Claude reports that it could not run tests
 
-Editing stages may run your `dualAgent.verification.commands` themselves, with extra arguments, so setting those is usually enough; a command with an argument that needs quoting gets no rule. Otherwise, Claude stages have no shell unless a rule in `dualAgent.claude.allowedTools` names one, for example `Bash(npm test:*)` or `Bash(npm run lint)`. A rule makes its tool available to write stages and pre-approves the matching commands. Print mode cannot ask for approval, so Claude Code denies other commands unless it judges them read-only. Read-only stages never get a shell. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in your own `~/.claude/settings.json` still apply, but only to tools a stage already has, so they cannot add a shell; rules in the repository's `.claude/settings.json` deliberately do not apply.
+To let Claude run any command, asking you first, use Agent mode (`/agent`). Otherwise, editing stages may run your `dualAgent.verification.commands` themselves, with extra arguments, so setting those is usually enough; a command with an argument that needs quoting gets no rule. Otherwise, Claude stages have no shell unless a rule in `dualAgent.claude.allowedTools` names one, for example `Bash(npm test:*)` or `Bash(npm run lint)`. A rule makes its tool available to write stages and pre-approves the matching commands. Print mode cannot ask for approval, so Claude Code denies other commands unless it judges them read-only. Read-only stages never get a shell. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in your own `~/.claude/settings.json` still apply, but only to tools a stage already has, so they cannot add a shell; rules in the repository's `.claude/settings.json` deliberately do not apply.
 
 Codex review stages run in a read-only sandbox, so test runners and builds that write files (caches, coverage, build output) usually fail there. Reviewers are instructed to report such checks as not run rather than passed. For results reviewers can rely on, configure `dualAgent.verification.commands`: the extension runs them itself after every editing stage and reports their exit codes to the next reviewer.
 
 ### MCP servers or project hooks do not run during workflows
 
 This is intentional. Claude stages use `--setting-sources user --strict-mcp-config`, so repository settings, hooks, and all MCP servers are skipped. Claude Code's print mode does not show its folder-trust prompt, so loading them would run repository-provided commands without consent.
+
+To use the MCP servers in your own Claude configuration, turn on `dualAgent.claude.userMcpServers`. Print mode cannot ask, so a server's tool runs only with a matching rule in `dualAgent.claude.allowedTools`, which applies to editing and Agent-mode stages; in Agent mode, other calls ask you through the permission card. Repository servers and hooks still do not load.
 
 ### Unexpected API billing
 
@@ -65,6 +85,61 @@ git config --global --add safe.directory "F:/path/to/repository"
 ### The chat says it cannot run here
 
 The chat needs a trusted workspace with a local folder. In a multi-root workspace, a new conversation uses the folder of the active editor, or the first folder; the conversation keeps that folder.
+
+### "Agent mode needs the permission bridge, which is not running"
+
+When the extension activates it starts the permission bridge: a local named pipe (Windows) or Unix socket, and an MCP configuration file in its private global storage. If that fails, the output log shows "Agent mode cannot ask before commands, so it is unavailable", with the reason, and Claude's Agent-mode stages fail with this error. Common causes are a global storage folder that cannot be written, or a missing `dist/permissionServer.js` in a hand-built package. Reload the window after fixing the cause. Meanwhile, **Codex + Claude** lets Codex do Agent-mode work in its sandbox.
+
+### Agent mode asks before every command
+
+That is the design: Claude Code runs by itself only what it judges read-only and what your allow rules match, and asks about everything else. **Allow *tool* for this message** stops asking about that tool until the message finishes. To pre-approve a command you trust in every run, add a rule to `dualAgent.claude.allowedTools`, such as `Bash(npm install:*)`. While the chat is hidden, the request appears as a modal dialog; **Stop** denies it.
+
+### Codex cannot install packages in Agent mode
+
+Codex works in its `workspace-write` sandbox, which writes only in the folder. Installing into the folder (for example `npm install` without `-g`) needs `dualAgent.codex.agentNetwork` on, the default. Global installs and system changes are outside the sandbox; use **Claude + Codex**, so Claude asks you for them.
+
+### Run says the command uses shell syntax
+
+**Run** executes one command without a shell, so pipes, redirection, `&&`, `;`, substitution, and variables are refused rather than run differently than they read. Use **Terminal** to paste the command into a terminal, read it, and press Enter yourself. Run is offered only on one-line shell blocks, and its executable must be on `PATH` outside the folder, as for verification commands.
+
+### The Gemini referee does not rule
+
+With `dualAgent.gemini.enabled` on, the Agents view shows a **Gemini CLI (referee)** row. If it says "not available", install Gemini CLI with `npm install -g @google/gemini-cli`, run `gemini` once in a terminal to sign in, or set `dualAgent.gemini.command` to its absolute path. A ruling that fails or times out adds a run warning, "Gemini could not rule on the check", and the revision continues without it. The referee runs only when a check fails and a revision follows.
+
+### Signing in
+
+Run **Dual Agent: Sign In**, use the sign-in icon in the Agents view, or the **Sign in** button the chat shows for a signed-out agent. Pick the CLI and the way to sign in. A terminal named **Sign in to …** runs the CLI's own sign-in: follow the link or device code it prints, then close the terminal if the CLI leaves it open. The Agents view and the chat update as soon as the CLI reports the sign-in, or when the terminal closes.
+
+- **Claude Code:** a Claude subscription (`claude auth login --claudeai`), the Anthropic Console (`--console`, billed per token), or SSO.
+- **Codex:** a ChatGPT account (`codex login`), a device code when the browser cannot reach this machine (`--device-auth`), or an OpenAI API key, typed into a password box and passed to `codex login --with-api-key` on standard input.
+- **Gemini CLI:** the terminal starts `gemini`; choose **Login with Google**, then type `/quit`.
+
+The sign-in uses the same environment as the agents, so a `CLAUDE_CONFIG_DIR` or `CODEX_HOME` you set applies to it too. In subscription billing mode, API-key variables are removed from that environment, as they are for the agents. **Dual Agent: Sign Out** runs `claude auth logout` or `codex logout` after a confirmation; it signs the CLI out for your terminal too.
+
+### The limits meter is empty or out of date
+
+**Refresh** in the meter, or **Dual Agent: Refresh Subscription Limits**, asks each agent for its current windows with one tiny call (Claude on Haiku, Codex at low effort). It runs only when you ask, because it uses a little of each subscription: on this machine about 7,000 input tokens for Claude and 13,000 for Codex, mostly the CLIs' own instructions. A window whose reset time has passed shows as empty.
+
+The meter otherwise shows what the CLIs last reported. Claude reports its windows during a call; Codex records them in its session log under `CODEX_HOME` (or `~/.codex`), which the extension reads after each Codex stage and, with `dualAgent.usage.readLocalLogs` on, whenever any Codex session writes. A CLI version that reports no windows leaves its rows empty. A window at 98% or more makes the other agent take over until it resets, as for a reported limit.
+
+### "On this machine" differs from "In Dual Agent"
+
+**In Dual Agent** counts what each CLI reported after every stage the extension ran, including failed attempts. **On this machine** comes from the CLIs' own logs, so it also counts terminals, other editors, and subagents, for today and the last 7 days. The logs are read 10 seconds after start, a few seconds after either CLI writes, and every 2 minutes; the section shows when it was last updated. If it is missing, check that `dualAgent.usage.readLocalLogs` is on and that the logs are where `CLAUDE_CONFIG_DIR` and `CODEX_HOME` point, or in `~/.claude/projects` and `~/.codex/sessions`. A log over 512 MB is skipped. A Claude limit reported in a terminal session also makes Codex take over in Dual Agent until the stated reset.
+
+### Waiting for the network
+
+Claude Code retries a lost connection by itself for about three minutes before it reports it, so the chat shows **Waiting for the network** only after that.
+
+When an agent reports a connection error, the extension checks whether the machine is online by opening a connection to the providers' hosts, or to your proxy, and closing it.
+
+- **Offline.** The message stops where it was, and a **Waiting for the network** card appears; a hidden chat, or a run from the Runs view, gets a notification. With `dualAgent.limits.autoContinue` on, the message continues by itself within about 15 seconds of the connection coming back, and the queued messages follow. **Do not continue** cancels that; **Continue now** tries at once. With automatic continuation off, the card offers **Continue when online**.
+- **Online.** The error came from one provider, so the other agent does the stage, marked as standing in.
+
+Behind a proxy, set `HTTPS_PROXY` (or `ALL_PROXY` or `HTTP_PROXY`) where VS Code can see it, so the check probes the proxy rather than the providers directly. An edit run continues by itself only with unchanged setup and verification commands.
+
+### Findings appear as problems in the editor
+
+When a message finishes, reviewers' findings that name a file and line inside the folder are shown as problems: blocker and high as errors, medium as warnings, and low as information. They are replaced when the next message finishes. **Dual Agent: Clear Findings in the Editor**, in the chat's **…** menu, removes them, and `dualAgent.findings.showInEditor` turns them off.
 
 ### Research or the Web toggle finds nothing
 
@@ -88,11 +163,26 @@ The CLI reports the error in the message's stage, and nothing falls back for an 
 
 ### "Editing files needs a working Git repository"
 
-Edit and Implement runs require Git so reviewers see every change and the result can be reverted. Open a Git repository (or run `git init` and commit a baseline) and resolve any warning shown with the error.
+Runs that edit files need Git to describe every change, so reviewers see it and it can be reverted. With the default `dualAgent.isolation.mode` of `worktree`, a folder without Git, or without a commit, is snapshotted instead, so this error means Git itself failed: it is missing, or it refused the folder (see the warning shown with the error). With `dualAgent.isolation.mode` set to `none`, Edit, Test first, and Implement need a real Git repository; open one, or run `git init` and commit a baseline.
 
-### "An isolated worktree needs a repository with at least one commit"
+### "This folder is edited directly, not in an isolated copy"
 
-Worktree isolation checks out a commit. Commit a baseline, or set `dualAgent.isolation.mode` to `none` to let agents edit the workspace directly.
+The folder is not a Git repository, has no commit, or the message is in Agent mode. Dual Agent took a snapshot of the folder in its private storage, and the agents edit the folder itself. When the message finishes, the changes card lists the changed files:
+
+- **Review all** opens every change in the diff editor, against the snapshot.
+- **Keep…** leaves the files as they are and deletes the snapshot. After that, Dual Agent cannot undo them; use your own backups or version control.
+- **Undo all…** puts back every changed or deleted file and deletes files the agents created. Folders the snapshot skips, such as `node_modules`, `.venv`, and build output, are left as they are, so remove an installed package yourself if you no longer want it.
+- **Undo** on a file restores only that file.
+
+For an isolated copy instead, make the folder a Git repository with a commit (`git init`, `git add -A`, `git commit`). Agent mode always edits the folder itself.
+
+### "This folder has more than 20,000 files … too many to snapshot"
+
+The snapshot counts files outside dependency and build folders and outside what the folder's `.gitignore` files exclude. Open a Git repository instead, which gets an isolated worktree, or a smaller folder. Adding a `.gitignore` for large generated folders also lowers the count.
+
+### "This subfolder is a Git repository of its own"
+
+A snapshot records a nested repository as a link, not as its files, so Undo cannot put back changes inside it. Open that subfolder as the workspace to edit it in an isolated copy.
 
 ### Tests fail in the worktree because dependencies are missing
 
@@ -157,6 +247,8 @@ Increase `dualAgent.context.maxCharacters` cautiously. Large diffs and repeated 
 
 Cancellation and timeouts terminate the agent's whole process tree, including commands it launched. On Windows the tree is force-terminated with `taskkill /T /F` immediately; elsewhere the process group receives `SIGTERM` and then `SIGKILL` after two seconds. If a descendant escaped the tree and keeps the output open, the stage still settles within about seven seconds; check for and stop such stray processes manually.
 
+The run records why it stopped: "Stopped by you." or "VS Code closed while the message was running." Clicks on **Stop** within one second of sending are ignored, so a double click on **Send** does not stop the new message.
+
 ### Run history cannot be read
 
 If `runs.json` in the extension's workspace storage is corrupted or written by a newer version, it is renamed to `runs.json.unreadable-<timestamp>` next to the original and a new history starts. The old file is kept for inspection.
@@ -170,6 +262,8 @@ With `dualAgent.claude.resumeSessions` on, a Claude stage continues the previous
 Completed, failed, and cancelled runs remain in private workspace storage. A failed or cancelled run can be continued with **Resume Run** (inline on the run, in its context menu, or in the Command Palette). Completed stages and an earlier plan approval are kept, and every unfinished stage runs again; implementation runs ask for consent again. A run that was active when VS Code closed is marked cancelled at the next start, and the output channel reports how many were interrupted.
 
 A worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded. Worktrees live in the `worktrees` folder of the extension's workspace storage, conversations in `conversations`, and attachments in `attachments`; deleting a conversation from the chat's history deletes its attachments. Remove one you no longer need with **Discard Changes** rather than deleting the folder, so Git's worktree registration is removed too. If a folder was deleted by hand, run `git worktree prune` in the repository.
+
+Snapshots of folders edited directly are bare repositories named `direct-<id>.git` in the same `worktrees` folder. Use **Keep** or **Undo** rather than deleting one by hand: without it, the changes since the snapshot can no longer be undone from Dual Agent. The project brief is `brief.md` in the extension's workspace storage, and the permission bridge's configuration is `permission-mcp.json` in its global storage, deleted when the extension stops.
 
 **Dual Agent: Delete All History** (in the Runs view's menu and the Command Palette) deletes every conversation, attachment, queued message, and run record for the workspace. It refuses while a run is active or while a worktree still holds changes: apply or discard them first. Files in your workspace are not touched.
 

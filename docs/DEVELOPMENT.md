@@ -10,7 +10,7 @@
 - `@vscode/vsce` for packaging
 - Preact and markdown-it for the chat page; fflate for archives and Office files; unpdf (pdf.js) for PDF text
 
-`npm run build` produces three bundles: `dist/extension.js` for the extension host, `dist/pdfWorker.js` (pdf.js, loaded in a worker thread only when a PDF is attached), and `dist/webview/chat.js` and `chat.css` for the chat page, built for the browser with no Node.js access.
+`npm run build` produces four bundles: `dist/extension.js` for the extension host, `dist/pdfWorker.js` (pdf.js, loaded in a worker thread only when a PDF is attached), `dist/permissionServer.js` (Agent mode's permission bridge, which Claude Code starts as its own process), and `dist/webview/chat.js` and `chat.css` for the chat page, built for the browser with no Node.js access.
 
 ## Commands
 
@@ -27,9 +27,20 @@ npm.cmd run package
 
 No test command invokes a live provider. Fake adapters verify stage order, permission flow, the gate and fix rounds, the chat check and revision, plan approval, session continuity within a run and across conversation turns, models and efforts, attachments in prompts, resume, worktree routing and reuse, usage aggregation, durable updates, and fallback behavior without spending subscription quota.
 
-Attachment tests (`attachments.test.ts`) build images, PDFs, ZIP archives, and Word, Excel, and PowerPoint files in memory, and read PDFs with the real pdf.js. Chat tests (`chat.test.ts`) cover message validation, the link policy, the Markdown renderer, and the transcript. Conversation tests cover the store, history, and the Codex model catalog read from a fake CLI.
+Attachment tests (`attachments.test.ts`) build images, PDFs, ZIP archives, and Word, Excel, and PowerPoint files in memory, and read PDFs with the real pdf.js. Chat tests (`chat.test.ts`) cover message validation, the link policy, the Markdown renderer (including the Run, Terminal, and CSV buttons), and the transcript. Conversation tests cover the store, history, and the Codex model catalog read from a fake CLI.
+
+- **Permission bridge** (`permissions.test.ts`): the MCP handshake, allowed and denied calls in the format Claude Code reads, a real broker on a private pipe that refuses callers without the token, and the permission card's summaries and warnings.
+- **Quota readings** (`quota.test.ts`): Claude's `rate_limit_event`, Codex's five-hour and weekly windows, and finding the run's own Codex session log and nothing else.
+- **Sign-in** (`accounts.test.ts`): Claude's, Codex's, and Gemini CLI's status, each CLI's own sign-in and sign-out commands, the API key only on standard input, the terminal launch without a shell, and the chat's sign-in, refresh, and conflict messages.
+- **Offline and machine-wide usage** (`offline-usage.test.ts`): the connection errors Claude Code, Codex, and Node report, the TCP probe and the proxy, rechecking a run waiting for the network every 15 seconds, `AgentLimits.observe`, and reading both CLIs' logs incrementally, counting each message once, including subagents.
+- **Chat helpers** (`helpers-ui.test.ts`): the `sources` block with BibTeX and RIS, splitting a suggested command, slash commands, and the answer diff.
+- **Agent mode** (`cliAdapters.test.ts`, `presentation.test.ts`): Claude's full toolset with the permission bridge, Codex's sandbox and network in any folder, and the consent text.
+- **Runs** (`orchestrator.test.ts`, `limits.test.ts`): the recorded stop reason, the handover before a window is used up, pausing offline and continuing where the run stopped, fallback for a connection error while online, and dated weekly resets. The agents selector and Compare are covered by the smoke test.
+- **Folder snapshots** (`worktree.test.ts`): snapshot, diff, keep, undo, per-file apply and discard, and nested repositories, with real Git.
 
 Process-level behavior is tested with fake CLIs: `test/helpers.ts` writes a small Node.js script plus a launcher, a `.cmd` shim on Windows (the same shape npm installs for the real CLIs) or an executable shell script elsewhere. The adapter and check-runner tests run these through the real process runner, which covers argument escaping, stdin prompts, the environment allowlist, `--resume` and its fresh-session retry, and provider failure reports. Git snapshot and worktree tests create temporary repositories, so Git must be on `PATH`.
+
+Run one coverage run at a time: two `vitest run --coverage` processes in the same checkout share the coverage folder and can fail each other.
 
 ### Smoke test in VS Code
 
@@ -46,6 +57,9 @@ Process-level behavior is tested with fake CLIs: `test/helpers.ts` writes a smal
 - sends an Edit message, answers the consent card, and checks that the change appears in the changes card, was made in the worktree, and left the workspace untouched;
 - sends a second Edit message that adds another file, then edits and resends it, and checks that the message was replaced, its file was undone from the checkpoint, and Claude started a new session;
 - sends a message while another runs, and checks that it waits in the queue and then runs by itself;
+- chooses **Codex only** and checks that only Codex worked and Claude was not called, then **Codex + Claude** and checks that Codex answered and Claude checked;
+- sends a Compare message and checks for two answers and a merge;
+- runs **Fix with Dual Agent** and **Ask Dual Agent About This** on a file, and checks that they set the composer's mode (Edit, then Chat) without sending anything;
 - checks that the chat page reported no script errors or content blocked by its Content-Security-Policy and Trusted Types;
 - opens the chat in an editor tab and the **Get started** walkthrough.
 
@@ -76,9 +90,15 @@ Several tests reproduce specific vulnerabilities and must keep passing:
 - the chat's HTML is created only through its Trusted Types policy (`chat.test.ts`);
 - an agent at its usage limit is skipped until the reset, a run with both agents out stops with the reset time and continues on resume, and a continued session gets the turns it missed (`limits.test.ts`);
 - a continuation the run rescheduled while it was continuing is kept, and overdue continuations run after a restart (`limits.test.ts`);
-- a checkpoint restore reverts edits, re-creates deleted files, removes added ones, leaves ignored files alone, and refuses anything that is not a tree ID (`worktree.test.ts`).
+- a checkpoint restore reverts edits, re-creates deleted files, removes added ones, leaves ignored files alone, and refuses anything that is not a tree ID (`worktree.test.ts`);
+- a folder snapshot never writes into the folder, leaves `.env` and `node_modules` alone on undo, and its removal refuses a path outside the extension's storage (`worktree.test.ts`);
+- the permission bridge denies a caller without the token without asking the user, and denies everything when no broker is reachable (`permissions.test.ts`);
+- a suggested command that uses pipes, redirection, chaining, substitution, or variables is refused rather than run without a shell (`helpers-ui.test.ts`);
+- a Codex session log is read only for a thread ID that is a UUID, so `../` paths and other threads' logs are never opened (`quota.test.ts`);
+- CSV cells that start with `=`, `+`, `-`, or `@` are written as text, not formulas (`chat.test.ts`);
+- Claude's Agent-mode arguments always name the permission bridge, and fail without it (`cliAdapters.test.ts`).
 
-Some tests run only on Windows or only on POSIX; CI covers both. Coverage is measured for every module that does not import `vscode`: `src/core`, `src/adapters`, and `src/ui/presentation.ts`. The view classes, `extension.ts`, and `config.ts` are covered by the smoke test instead.
+Some tests run only on Windows or only on POSIX; CI covers both. Coverage is measured for `src/core`, `src/adapters`, `src/ui/presentation.ts`, the chat's protocol and transcript, and the Markdown renderer. The view classes, the chat controller, `extension.ts`, `config.ts`, and the page's Preact components are covered by the smoke test instead; the pure chat helpers (`permissions.ts`, `slash.ts`, `textDiff.ts`) and the permission server are unit-tested but not measured.
 
 ## Local extension debugging
 
@@ -88,8 +108,9 @@ Some tests run only on Windows or only on POSIX; CI covers both. Coverage is mea
 4. Select the **Dual Agent** activity-bar icon and expand **Agents**, or run **Dual Agent: Check Agent Setup**.
 5. Test a Chat message first because it is read-only; try an attachment and a follow-up.
 6. Test an Edit message next: allow edits, review the changes card in the diff editor, and apply or discard them. Then try Implement mode, which asks you to approve the plan.
-7. Check the chat in a light and a dark theme, and moved to the right-hand side bar.
-8. Use `npm run watch` to rebuild on save, then **Developer: Reload Window** in the host. **Developer: Open Webview Developer Tools** inspects the chat page.
+7. In a disposable folder without Git, send an Agent message such as "install left-pad and show its version": answer the permission cards, then use **Undo all…** and confirm the folder is back as it was, apart from `node_modules`.
+8. Check the chat in a light and a dark theme, and moved to the right-hand side bar.
+9. Use `npm run watch` to rebuild on save, then **Developer: Reload Window** in the host. **Developer: Open Webview Developer Tools** inspects the chat page.
 
 ## Adding a workflow stage
 
@@ -143,9 +164,9 @@ Never store a publishing token in the repository. For a manual publish from your
 2. Update `PROJECT_STATUS.md` verification results.
 3. Run `npm.cmd run check`, `npm.cmd run smoke`, `npm.cmd audit`, and `npm.cmd run package`.
 4. Install the VSIX in an isolated profile.
-5. With signed-in CLIs, test doctor, a Chat message with attachments and a follow-up, an Edit message with apply, retry of an Edit message, a brainstorming run, cancellation, resume, export, and an implementation run in a disposable repository: approve the plan, review the diff, and apply it.
+5. With signed-in CLIs, test doctor, a Chat message with attachments and a follow-up, an Edit message with apply, retry of an Edit message, a brainstorming run, cancellation, resume, export, and an implementation run in a disposable repository: approve the plan, review the diff, and apply it. Then, in a disposable folder without Git, an Agent message with its permission cards and **Undo all…**, and an Edit message with **Keep…**.
 6. Commit, push `main`, and wait for CI and CodeQL to pass.
-7. Tag the verified commit with the version and push the tag: `git tag v2.3.0 && git push origin v2.3.0`.
+7. Tag the verified commit with the version and push the tag: `git tag v2.4.0 && git push origin v2.4.0`.
 
 The **Release** workflow then:
 

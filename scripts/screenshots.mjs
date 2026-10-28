@@ -113,11 +113,13 @@ const THEMES = {
 
 const usage = (input, cached, output, reasoning = 0) => ({ input, cached, output, reasoning });
 const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
-const composer = (mode, web = false) => ({
+const composer = (mode, web = false, extra = {}) => ({
   mode,
   web,
+  agents: 'claude-codex',
   options: { claude: { model: 'opus', effort: 'high' }, codex: { effort: 'high' } },
   pending: [],
+  ...extra,
   choices: {
     claude: {
       models: [{ id: '', label: 'Default', efforts: CLAUDE_EFFORTS }, ...['opus', 'sonnet', 'haiku'].map((id) => ({ id, label: id, efforts: CLAUDE_EFFORTS }))],
@@ -232,7 +234,7 @@ const editTurn = {
   ],
   outcome: { text: 'Codex approved the change', tone: 'good' },
   checks: [{ command: 'npm test', passed: true, summary: 'passed in 4.2s' }],
-  changes: { runId: 'r2', files: [{ path: 'src/http/client.ts', status: 'M' }, { path: 'test/client.test.ts', status: 'M' }], state: 'active' },
+  changes: { runId: 'r2', files: [{ path: 'src/http/client.ts', status: 'M' }, { path: 'test/client.test.ts', status: 'M' }], state: 'active', direct: false },
   awaitingApproval: false,
   usage: { claude: usage(31_400, 27_900, 2_050), codex: usage(12_700, 6_100, 720, 410) },
   canResume: false,
@@ -245,19 +247,73 @@ const periods = [
   { label: 'All time', runs: 64, usage: { claude: usage(2_731_000, 2_310_000, 166_000), codex: usage(1_096_000, 468_000, 70_400, 39_100) } },
 ];
 
-const state = (turns, mode, extra = {}) => ({
+const quotas = [
+  { agent: 'claude', label: '5-hour', usedPercent: 46, resets: '3:00 PM' },
+  { agent: 'claude', label: 'weekly', usedPercent: 31, resets: 'Mon 9:00 AM' },
+  { agent: 'codex', label: '5-hour', usedPercent: 72, resets: '1:40 PM' },
+  { agent: 'codex', label: 'weekly', usedPercent: 22, resets: 'Sun 6:15 PM' },
+];
+
+const state = (turns, mode, extra = {}, composerExtra = {}) => ({
   folder: 'acme-http',
   conversationId: 'c1',
   title: 'Retry gives up one attempt early',
   conversations: [],
   turns: turns.map((turn) => ({ canRetry: true, ...turn })),
   running: false,
-  composer: composer(mode),
+  composer: composer(mode, false, composerExtra),
   usage: periods,
   queue: [],
   limits: [],
+  quotas,
+  brief: true,
+  accounts: [
+    { provider: 'claude', name: 'Claude', signedIn: true, detail: 'Signed in with Claude subscription (max).' },
+    { provider: 'codex', name: 'Codex', signedIn: true, detail: 'Signed in with ChatGPT.' },
+  ],
   ...extra,
 });
+
+// Agent mode: Claude installs what the project needs and asks before the command, as Claude Code does in a terminal.
+const agentTurn = {
+  id: 't4',
+  mode: 'agent',
+  message: 'Check whether Gemini CLI is installed, and install it if not.',
+  attachments: [],
+  createdAt: '2026-10-28T10:05:00.000Z',
+  status: 'running',
+  runId: 'r4',
+  canRetry: false,
+  stages: [
+    {
+      index: 0,
+      id: 'claude-agent',
+      title: 'Claude works in the folder',
+      agent: 'claude',
+      label: 'Claude · opus',
+      status: 'running',
+      primary: true,
+      activities: [
+        step('todo', 'TodoWrite', '1 of 3 done', '✓ Check for Gemini CLI\n◻ Install it with npm\n◻ Confirm the version'),
+        { ...step('command', 'Bash', 'gemini --version', 'gemini --version', "'gemini' is not recognized as an internal or external command"), failed: true },
+        step('command', 'Bash', 'npm --version', 'npm --version', '10.9.2'),
+      ],
+      text: 'Gemini CLI is not installed, and npm 10 is available, so I will install it globally with npm.',
+    },
+    { index: 1, id: 'codex-agent-check', title: 'Codex checks the result', agent: 'codex', label: 'Codex', status: 'pending', primary: false, activities: [] },
+  ],
+  checks: [],
+  awaitingApproval: false,
+  canResume: false,
+};
+
+const permission = {
+  id: 'p1',
+  tool: 'Bash',
+  summary: 'run a command: Install Gemini CLI globally',
+  detail: 'npm install -g @google/gemini-cli',
+  warnings: ['This changes your system outside the folder, which Undo cannot reverse.'],
+};
 
 // Claude is at its usage limit: Codex answers alone and checks the answer, and the next message waits its turn.
 const soloTurn = {
@@ -288,7 +344,29 @@ const soloTurn = {
 const scenes = [
   { name: 'chat-dark', theme: 'dark', state: state([chatTurn], 'chat'), width: 520, height: 920 },
   { name: 'edit-light', theme: 'light', state: state([editTurn], 'edit'), width: 520, height: 920 },
-  { name: 'usage-dark', theme: 'dark', state: state([chatTurn, editTurn], 'edit'), showUsage: true, width: 520, height: 1080 },
+  {
+    name: 'usage-dark',
+    theme: 'dark',
+    state: state([chatTurn, editTurn], 'edit', {
+      machine: {
+        updated: '10:12 AM',
+        periods: [
+          { label: 'Today', runs: 1, usage: { claude: usage(4_812_000, 4_390_000, 61_300), codex: usage(1_204_000, 702_000, 18_900, 9_200) } },
+          { label: 'Last 7 days', runs: 6, usage: { claude: usage(31_640_000, 28_900_000, 402_000), codex: usage(8_310_000, 4_870_000, 121_000, 64_000) } },
+        ],
+      },
+    }),
+    showUsage: true,
+    width: 520,
+    height: 1240,
+  },
+  {
+    name: 'agent-dark',
+    theme: 'dark',
+    state: state([agentTurn], 'agent', { running: true, permission }, { editor: { label: 'package.json', included: true } }),
+    width: 520,
+    height: 900,
+  },
   {
     name: 'solo-dark',
     theme: 'dark',
