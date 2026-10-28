@@ -192,6 +192,13 @@ export interface RunRecord {
   continueSessions?: Partial<Record<AgentId, string>>;
   /** The user allowed every stage of this run to search and read the web. */
   web?: boolean;
+  /** Earlier turns a continued session missed because the other agent answered them alone, by agent. */
+  catchUp?: Partial<Record<AgentId, string>>;
+  /**
+   * Set when the run stopped because every agent that could continue it was at its usage limit: the time the
+   * first of those limits resets, after which the run can continue.
+   */
+  limitReset?: string;
 }
 
 /** Everything about a new run beyond its kind, objective, folder, and consent. */
@@ -204,6 +211,7 @@ export interface StartOptions {
   /** An active worktree from the same conversation that this run keeps editing. */
   worktree?: WorktreeInfo;
   web?: boolean;
+  catchUp?: Partial<Record<AgentId, string>>;
 }
 
 export interface AgentRunRequest {
@@ -317,6 +325,8 @@ export interface OrchestratorOptions {
   setupCommands?: readonly (readonly string[])[];
   /** Commands run after every editing stage; their results are given to the next reviewer. */
   verificationCommands?: readonly (readonly string[])[];
+  /** Mask credentials in what prompts quote; on unless set to false. */
+  redactSecrets?: boolean;
 }
 
 export interface ApprovalDecision {

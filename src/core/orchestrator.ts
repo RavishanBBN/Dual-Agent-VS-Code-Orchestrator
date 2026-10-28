@@ -4,8 +4,9 @@ import path from 'node:path';
 import { sanitizeAgentOptions } from './agentOptions.js';
 import { attachmentText } from './attachments.js';
 import { buildStagePrompt, describeCheck } from './context.js';
-import { AgentExecutionError, canFallback } from './errors.js';
+import { AgentExecutionError, canFallback, isQuotaError, LimitReachedError } from './errors.js';
 import { captureGitSnapshot } from './gitSnapshot.js';
+import { type AgentLimits, formatReset } from './limits.js';
 import type {
   AgentAdapter,
   AgentId,
@@ -57,6 +58,8 @@ export interface OrchestratorDependencies {
   requestApproval?: (run: RunRecord, stage: StageRecord, signal: AbortSignal) => Promise<ApprovalDecision>;
   /** Reads the attachment text to include in an agent's prompt; defaults to reading the stored files. */
   readAttachmentText?: (attachments: readonly AttachmentRef[], agent: AgentId) => Promise<Record<string, string>>;
+  /** Usage limits agents reported, shared by every run so a limited agent is skipped until it resets. */
+  limits?: AgentLimits;
 }
 
 /** Ends a run as cancelled because the user decided to stop it. */
@@ -72,6 +75,8 @@ function messageOf(error: unknown): string {
 }
 
 const now = (): string => new Date().toISOString();
+
+const AGENT_NAMES: Record<AgentId, string> = { claude: 'Claude', codex: 'Codex' };
 
 /** Failed and cancelled runs continue from their first unfinished stage, if their worktree is still there. */
 export function canResume(run: RunRecord): boolean {
@@ -202,6 +207,7 @@ export class WorkflowOrchestrator {
       ...(options.history ? { history: options.history } : {}),
       ...(options.continueSessions ? { continueSessions: options.continueSessions } : {}),
       ...(options.web ? { web: true } : {}),
+      ...(options.catchUp && Object.keys(options.catchUp).length ? { catchUp: options.catchUp } : {}),
     };
     // A conversation keeps editing the same worktree until its changes are applied or discarded.
     const reused = options.worktree;
@@ -237,6 +243,7 @@ export class WorkflowOrchestrator {
     run.status = 'running';
     delete run.error;
     delete run.completedAt;
+    delete run.limitReset;
     run.resumeCount = (run.resumeCount ?? 0) + 1;
     return this.execute(run);
   }
@@ -316,6 +323,7 @@ export class WorkflowOrchestrator {
       run.status = cancelled ? 'cancelled' : 'failed';
       run.error = messageOf(error);
       run.completedAt = now();
+      if (error instanceof LimitReachedError) run.limitReset = error.resetAt;
       const running = run.stages.find((stage) => stage.status === 'running');
       if (running) {
         running.status = cancelled ? 'cancelled' : 'failed';
@@ -389,21 +397,44 @@ export class WorkflowOrchestrator {
 
     const inline = (agent: AgentId): Promise<Record<string, string>> =>
       run.attachments?.length ? (this.dependencies.readAttachmentText ?? attachmentText)(run.attachments, agent) : Promise.resolve({});
+    const limits = this.dependencies.limits;
+    const other: AgentId = stage.agent === 'claude' ? 'codex' : 'claude';
+    // An agent known to be at its usage limit is not tried again until the limit resets: the other agent
+    // works alone meanwhile, or the run stops until the first limit resets.
+    const known = limits?.active(stage.agent);
+    if (known) {
+      if (!this.options.fallbackOnQuota || limits?.active(other)) throw this.limitReached(stage);
+      stage.assignedAgent = other;
+      stage.fallbackReason = `${AGENT_NAMES[stage.agent]} is at its usage limit until ${formatReset(known.until)}${known.estimated ? ' (estimated)' : ''}.`;
+      await this.update(run);
+      this.log(run, `${AGENT_NAMES[other]} works alone: ${stage.fallbackReason}`);
+    }
     try {
-      const prompts = this.prompts(run, stage, stage.agent, snapshot, false, await inline(stage.agent));
-      stage.result = await this.attempt(run, stage, stage.agent, prompts, signal);
+      const agent = stage.assignedAgent;
+      const prompts = this.prompts(run, stage, agent, snapshot, agent !== stage.agent, await inline(agent));
+      stage.result = await this.attempt(run, stage, agent, prompts, signal);
     } catch (error) {
-      if (!this.options.fallbackOnQuota || !canFallback(error) || signal.aborted) throw error;
-      const fallback: AgentId = stage.agent === 'claude' ? 'codex' : 'claude';
-      stage.assignedAgent = fallback;
+      if (signal.aborted) throw error;
+      this.noteLimit(stage.assignedAgent, error);
+      const switchable = stage.assignedAgent === stage.agent && this.options.fallbackOnQuota && canFallback(error) && !limits?.active(other);
+      if (!switchable) throw limits && isQuotaError(error) ? this.limitReached(stage) : error;
+      stage.assignedAgent = other;
       stage.fallbackReason = messageOf(error);
       await this.update(run);
-      this.log(run, `Falling back to ${fallback}: ${stage.fallbackReason}`);
+      this.log(run, `Falling back to ${other}: ${stage.fallbackReason}`);
       // The failed attempt may have changed files before it stopped, so the fallback needs a fresh view.
       const fresh = await this.snapshot(run);
       if (signal.aborted) throw new Error('Workflow cancelled.');
-      stage.result = await this.attempt(run, stage, fallback, this.prompts(run, stage, fallback, fresh, true, await inline(fallback)), signal);
+      try {
+        stage.result = await this.attempt(run, stage, other, this.prompts(run, stage, other, fresh, true, await inline(other)), signal);
+      } catch (second) {
+        if (signal.aborted) throw second;
+        this.noteLimit(other, second);
+        throw limits && isQuotaError(second) ? this.limitReached(stage) : second;
+      }
     }
+    // A completed call shows the agent's limit, if it had one, has reset.
+    limits?.clear(stage.assignedAgent);
 
     if (stage.review) stage.verdict = parseVerdict(stage.result.text);
     stage.status = 'completed';
@@ -411,6 +442,22 @@ export class WorkflowOrchestrator {
     run.usage[stage.assignedAgent] = addUsage(run.usage[stage.assignedAgent], stage.result.usage);
     await this.update(run);
     this.log(run, `Stage completed: ${stage.title}${stage.verdict ? ` (verdict: ${summarizeVerdict(stage.verdict)})` : ''}.`);
+  }
+
+  /** Records a usage limit the agent reported, so later stages skip it until the limit resets. */
+  private noteLimit(agent: AgentId, error: unknown): void {
+    if (isQuotaError(error) && !(error instanceof LimitReachedError)) this.dependencies.limits?.record(agent, error.message);
+  }
+
+  /** The error that stops a run until the first agent that could continue it is past its limit. */
+  private limitReached(stage: StageRecord): LimitReachedError {
+    const limits = this.dependencies.limits;
+    const candidates: AgentId[] = this.options.fallbackOnQuota ? ['claude', 'codex'] : [stage.agent];
+    const resets = candidates.map((agent) => limits?.active(agent)?.until).filter((until): until is string => until !== undefined);
+    const resetAt = resets.sort()[0] ?? new Date(Date.now() + 15 * 60_000).toISOString();
+    const who =
+      candidates.length > 1 ? 'Claude and Codex are both at their usage limits' : `${AGENT_NAMES[stage.agent]} is at its usage limit and fallback is turned off`;
+    return new LimitReachedError(`${who}. The work can continue after ${formatReset(resetAt)}.`, resetAt);
   }
 
   /**
@@ -426,7 +473,8 @@ export class WorkflowOrchestrator {
     inlineText: Record<string, string>,
   ): StagePrompts {
     const max = this.options.maxContextCharacters;
-    const prompt = buildStagePrompt(run, stage, snapshot, max, { attachmentText: inlineText, ...(fallback ? { fallback: true } : {}) });
+    const redact = this.options.redactSecrets !== false;
+    const prompt = buildStagePrompt(run, stage, snapshot, max, { attachmentText: inlineText, redact, ...(fallback ? { fallback: true } : {}) });
     if (fallback || !this.options.resumeSessions?.includes(agent)) return { prompt };
     const index = run.stages.indexOf(stage);
     const previous = run.stages
@@ -436,9 +484,14 @@ export class WorkflowOrchestrator {
     // The first stage of a conversation turn continues the session from the previous turn.
     const sessionId = previous?.result?.providerSessionId ?? run.continueSessions?.[agent];
     if (!sessionId) return { prompt };
+    // A session continued from an earlier turn catches up on the turns the other agent answered alone.
+    const missed = previous ? undefined : run.catchUp?.[agent];
     return {
       prompt,
-      resume: { sessionId, prompt: buildStagePrompt(run, stage, snapshot, max, { resumedSessionId: sessionId, attachmentText: inlineText }) },
+      resume: {
+        sessionId,
+        prompt: buildStagePrompt(run, stage, snapshot, max, { resumedSessionId: sessionId, attachmentText: inlineText, redact, ...(missed ? { missedHistory: missed } : {}) }),
+      },
     };
   }
 
