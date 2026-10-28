@@ -14,7 +14,7 @@
 1. Open an issue or short design note for workflow, persistence, authentication, or permission changes.
 2. Add an ADR for decisions that change a system boundary.
 3. Run `npm.cmd run check`.
-4. Include screenshots for dashboard changes.
+4. Include screenshots for changes to views, menus, or dialogs.
 5. Document security and quota impact.
 6. Keep generated bundles and VSIX files out of commits unless a release process explicitly requires them.
 

@@ -22,7 +22,7 @@ Controls:
 - A configured absolute path inside the workspace is refused, as is a relative path such as `tools\codex`.
 - The process runner refuses to start anything that is not an absolute path, and refuses batch shims when `COMSPEC` is not absolute.
 - Child processes receive `NoDefaultCurrentDirectoryInExePath=1` on Windows, so command lookups made by agent tools also skip the current directory.
-- Git is resolved the same way before every snapshot.
+- Git and configured setup and verification commands are resolved the same way. In worktree runs the worktree, the workspace, and the repository root are all excluded.
 
 Regression tests plant a same-named launcher, and on Windows a `git.exe`, in a temporary workspace and assert they never run.
 
@@ -52,13 +52,36 @@ Prompts are budgeted per section. The objective share, both copies of the stage 
 
 Residual risk: models can still follow adversarial content. Sandbox boundaries, human review, and deterministic validation are required.
 
-### Conflicting writes
+### Conflicting writes and unreviewed changes
 
-Stages are sequential. Only implementation/fix stage contracts receive workspace-write permission, and only when the run has explicit write consent. Without consent every stage is downgraded to read-only. Claude owns write stages normally; if bounded fallback is enabled, Codex can inherit the same explicit stage permission after an eligible quota, availability, or timeout failure, and that reassignment is persisted. Normal Codex review stages use read-only sandboxing.
+Stages are sequential. Only implementation and fix stage contracts receive workspace-write permission, and only when the run has explicit write consent. Without consent every stage is downgraded to read-only. Claude owns write stages normally; if bounded fallback is enabled, Codex can inherit the same explicit stage permission after an eligible quota, availability, or timeout failure, and that reassignment is persisted. Normal Codex review stages use read-only sandboxing.
+
+In the default `worktree` isolation mode, agents run in a detached Git worktree in the extension's private storage, so their edits never touch the user's working tree during the run. The changes reach the workspace only when the user applies them, after reviewing them in the diff editor. Applying writes the working tree only, never the index or a commit. The whole patch is checked with `git apply --check` first, so a conflict with the user's own edits writes nothing. The apply confirmation lists every file and calls out symbolic links and runs that did not pass the gate. Deleting a worktree is refused for any path outside the extension's worktree directory, whatever the run history says, and runs with unapplied changes are never pruned from history.
+
+Plan approval (on by default) stops the run before the first editing stage until the user approves Claude's plan and Codex's review of it. The final completion stage is read-only, so nothing changes after the last verification.
 
 Implementation workflows refuse to start unless Git can describe the workspace, so every change remains reviewable and revertible.
 
-Residual risk: provider tools, hooks, or external processes may behave outside the extension's assumptions. Review local CLI configuration and managed policies.
+Residual risk: Claude's accept-edits mode limits edits to its working directory, but is not an operating-system sandbox. Provider tools, user-level hooks, or external processes may behave outside the extension's assumptions. In `none` isolation mode agents edit the workspace directly. Review local CLI configuration and managed policies.
+
+### Extension-run commands
+
+Setup and verification commands (`dualAgent.isolation.setupCommands`, `dualAgent.verification.commands`) give reviewers deterministic evidence, but they run repository code: `npm ci` runs dependency install scripts, and `npm test` runs whatever test and source files the agents last wrote. They run with the user's permissions and outside every agent sandbox, so an agent able to write files could turn a verification run into arbitrary code execution. The controls are:
+
+- commands exist only in machine-scoped user settings, so a repository cannot add one;
+- every run that will execute them lists them in the consent dialog, and every resume asks again;
+- each command is an argument vector run without a shell; its executable is resolved like an agent CLI and is refused inside the workspace or worktree, so a planted `npm.cmd` or `node_modules/.bin` entry never runs;
+- commands receive the same allowlisted environment as agents, with billing variables removed in subscription mode;
+- each command has a timeout, process-tree termination on cancel, and bounded captured output;
+- their output is fenced as untrusted evidence; only the exit code is presented as reliable.
+
+Residual risk: a configured command is exactly as trustworthy as the code it runs. Use them only in repositories where you would run that command yourself after an agent edit, and prefer worktree isolation so the commands run against the isolated copy.
+
+### Git hooks and configuration
+
+Every Git command the extension runs sets `core.hooksPath` to the null device, so no repository hook runs. This matters because the extension's own worktree commands (checkout, staging, ref updates) would otherwise run `post-checkout`, `reference-transaction`, and similar hooks from `.git/hooks`, where an agent with write access could plant them. Commands also set `core.fsmonitor=false` and `--no-optional-locks`, and diffs use `--no-ext-diff` and `--no-textconv`, so repository-local configuration cannot run a filesystem monitor or diff driver. A test plants hooks in a repository, confirms that plain Git runs them, and confirms that the extension's worktree lifecycle never does.
+
+Clean and smudge filters configured by the user (Git LFS, for example) still run during worktree checkout and staging, because they come from the user's own configuration and are needed for correct content.
 
 ### Runaway processes
 
@@ -72,9 +95,11 @@ Failures are classified from the provider's structured error (Claude `result` ev
 
 Commands and arguments are passed as arrays with `shell: false`; prompts are sent through stdin. The extension does not interpolate user prompts into a shell command. Model names must match a conservative pattern, and Claude tool rules may not start with `-`, so neither can be read as an extra CLI flag.
 
-### Git configuration
+### Verdicts and session continuity
 
-Snapshots run Git with `core.fsmonitor=false`, `--no-optional-locks`, `--no-ext-diff`, and `--no-textconv`, so repository-local configuration cannot run a filesystem monitor or diff driver, and snapshots do not take index locks that would contend with an agent's own Git commands.
+Verdicts are parsed from model output, which repository content can influence. A verdict therefore only decides whether a fix round runs and how the run is labelled; it never grants a permission, skips consent, or applies changes. The last verdict block is used so that quoted repository text earlier in the output is not taken as the verdict, and an unparseable verdict counts as a failure, never a pass.
+
+Continuing a Claude session (`--resume`) carries the session's earlier turns, including repository content already read, into the next stage. That content was already in Claude's context; each new prompt still fences new evidence with a fresh boundary and restates the stage contract. Session IDs that could read as command-line flags are rejected.
 
 ### Accidental API charges
 
@@ -84,7 +109,7 @@ Residual risk: provider-specific credential configuration outside these variable
 
 ### Data leakage
 
-There is no extension-owned server. Run records remain in private VS Code storage. The dashboard webview receives stage titles, status, usage, and warnings, but never stage outputs or raw provider events. Export requires an explicit save action and defaults to the home folder rather than the repository, so a report containing prompts and agent output is not committed by accident.
+There is no extension-owned server and no web view. Run records and worktrees remain in private VS Code storage. Agent output is shown only as tree-item text, as tooltips built from untrusted `MarkdownString`s with the text Markdown-escaped (so links, including `command:` links, never activate and no HTML renders), and in read-only text documents served by the extension. Untracked files whose names suggest secrets are never copied into a worktree, which would otherwise write them into the repository's object database through the base commit. Export requires an explicit save action and defaults to the home folder rather than the repository, so a report containing prompts and agent output is not committed by accident.
 
 Residual risk: each provider receives the context sent to its CLI according to that provider's account and data policies. Do not use repositories or accounts that are not authorized for the data involved.
 
@@ -100,9 +125,12 @@ Stages have timeouts; Claude has a maximum turn count; workflows have finite sta
 - [ ] No secrets are visible in the diff or prompt.
 - [ ] Write consent is appropriate for the objective.
 - [ ] `dualAgent.claude.allowedTools` grants only the commands this repository needs.
-- [ ] Git working tree has been reviewed before and after the run.
+- [ ] Setup and verification commands are ones you would run yourself after an agent edit.
+- [ ] `dualAgent.isolation.mode` is `worktree` unless there is a specific reason to edit the workspace directly.
+- [ ] The plan was read before approval, and the diff was reviewed before applying it.
+- [ ] Unresolved findings and failing checks were read before applying a run that did not pass its gate.
 - [ ] User-level hooks, skills, agent configuration, and any `.codex` project configuration are understood.
-- [ ] Run warnings in the dashboard or report have been read.
+- [ ] Run warnings in the Runs view or report have been read.
 - [ ] Exported reports are stored in an approved location.
 
 ## Reporting vulnerabilities

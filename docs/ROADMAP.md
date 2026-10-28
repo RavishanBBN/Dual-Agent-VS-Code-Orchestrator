@@ -1,37 +1,37 @@
 # Roadmap
 
-The 1.0 release contains the complete local reciprocal workflow. Future work should improve integration depth without weakening local safety.
+Release 2.0 delivered the native VS Code interface, the verification gate with bounded fix rounds, extension-run setup and verification commands, isolated worktrees with review and apply, plan approval, Claude session continuity, resuming runs, and multi-root folder selection. Future work should deepen integration without weakening local safety.
 
 ## Planned candidates
 
-### Deterministic verification and gates
+### Gates and verification
 
-- parse a structured verdict from Codex's final verification instead of free-text PASS, with a bounded fix loop and a "completed with findings" status;
-- optional extension-run verification commands whose output is passed to reviewers as trusted evidence. This needs a design that does not run agent-edited scripts outside every sandbox: in an implementation run, `npm test` executes whatever the agents last wrote;
-- use Claude Code's `--restricted` mode for review stages once the minimum supported CLI version includes it.
+- use structured-output flags (Claude `--json-schema`, Codex `--output-schema`) for verdicts once both are verified against supported CLI versions, instead of parsing a fenced block;
+- let the user decide on `needs-user-decision` findings from the Runs view and feed the decision into the next fix round;
+- use Claude Code's `--restricted` mode for review stages once the minimum supported CLI version includes it;
+- run verification commands inside an operating-system sandbox where one is available.
 
 ### Codex app-server adapter
 
 - interactive approval requests;
 - live account/rate-limit reads;
 - model catalog discovery;
-- durable thread resume;
+- durable thread resume, so Codex stages can continue their own session the way Claude stages do;
 - richer event fidelity.
 
 This must remain an adapter behind the existing core contract so CLI mode stays available.
 
 ### Claude session controls
 
-- explicit resume by captured session ID;
 - normalized account usage status when an official machine-readable surface is available;
 - surfaced permission requests instead of relying only on non-interactive policy modes.
 
 ### Isolated parallel work
 
-- one Git worktree per independent agent task;
-- patch preview and deterministic merge;
-- conflict detection before applying changes;
-- no parallel writes to the user's primary working tree.
+- several independent agent tasks, each in its own worktree;
+- deterministic merge of several worktrees with conflict detection before applying;
+- partial apply of selected files or hunks from the review;
+- optional reuse of ignored dependency folders in worktrees (for example a linked `node_modules`) where that is safe.
 
 ### Evaluation-driven routing
 
@@ -42,10 +42,9 @@ This must remain an adapter behind the existing core contract so CLI mode stays 
 
 ### Recovery
 
-- resume a workflow from the last completed checkpoint;
-- state schema migrations;
+- state schema migrations when a change cannot stay backward compatible;
 - import/export of signed run artifacts;
-- crash-safe process reconciliation.
+- crash-safe reconciliation of agent processes left running by a crashed extension host.
 
 ## Explicitly not planned
 
@@ -53,5 +52,6 @@ This must remain an adapter behind the existing core contract so CLI mode stays 
 - pooling or transferring subscription quota;
 - exposing hidden chain-of-thought;
 - unrestricted autonomous background editing;
-- infinite agent debate loops;
-- silently switching to paid API billing.
+- infinite agent debate loops or unbounded fix rounds;
+- silently switching to paid API billing;
+- web views or remotely hosted UI.

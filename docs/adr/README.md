@@ -4,3 +4,5 @@
 - [ADR-0002: Reciprocal sequential workflow](0002-reciprocal-sequential-workflow.md)
 - [ADR-0003: Checkpoint context instead of transcript mirroring](0003-checkpoint-context.md)
 - [ADR-0004: Hardened process boundary](0004-hardened-process-boundary.md)
+- [ADR-0005: Native VS Code interface](0005-native-vscode-interface.md)
+- [ADR-0006: Isolated worktrees and a verification gate](0006-isolation-and-verification-gate.md)

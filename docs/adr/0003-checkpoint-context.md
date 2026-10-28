@@ -1,6 +1,6 @@
 # ADR-0003: Checkpoint context instead of transcript mirroring
 
-**Status:** accepted
+**Status:** accepted; amended by [ADR-0006](0006-isolation-and-verification-gate.md): within a run, Claude continues its own session, while every cross-provider handoff remains a checkpoint
 
 **Date:** 2026-10-27
 

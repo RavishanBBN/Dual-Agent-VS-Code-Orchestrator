@@ -1,6 +1,6 @@
 # ADR-0002: Reciprocal sequential workflow
 
-**Status:** accepted
+**Status:** accepted; amended by [ADR-0006](0006-isolation-and-verification-gate.md), which adds a final gate with bounded fix rounds and makes the finalization stage read-only
 
 **Date:** 2026-10-27
 

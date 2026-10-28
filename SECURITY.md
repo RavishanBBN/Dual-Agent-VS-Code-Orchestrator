@@ -22,7 +22,8 @@ Do not include authentication tokens, cookies, API keys, proprietary source code
 - escape from configured read-only behavior;
 - credential or API-key exposure;
 - repository-controlled executable replacement;
-- remote content execution in the webview;
+- execution of agent or repository content in the editor UI (for example through trusted Markdown links);
+- repository hooks or configured commands running without the documented consent;
 - silent switching from subscription use to paid API billing;
 - run-history leakage outside private extension storage.
 

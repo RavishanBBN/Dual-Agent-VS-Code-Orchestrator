@@ -2,7 +2,7 @@
 
 ## Doctor checks
 
-Use **Dual Agent: Check Agent Setup**. A healthy result shows a version for both providers. Hover the version in the dashboard to see the absolute path each command resolved to.
+Expand the **Agents** view under the Dual Agent activity-bar icon, or run **Dual Agent: Check Agent Setup**. A healthy result shows a version for Claude Code, Codex, and Git. Hover a row to see the absolute path each command resolved to, or why Git does not accept the workspace.
 
 ### "Refusing to run … because it is inside the workspace"
 
@@ -41,7 +41,7 @@ Agents receive an allowlisted environment (see the README's billing section). If
 
 Claude Code's print mode cannot ask for approval, so shell commands are denied unless a permission rule allows them. Add rules to `dualAgent.claude.allowedTools`, for example `Bash(npm test:*)` or `Bash(npm run lint)`. They apply to write stages only. Each rule lets agents run that command against files they wrote, so prefer narrow rules. Rules in the user's own `~/.claude/settings.json` also apply; rules in the repository's `.claude/settings.json` deliberately do not.
 
-Codex review stages run in a read-only sandbox, so test runners and builds that write files (caches, coverage, build output) usually fail there. Reviewers are instructed to report such checks as not run rather than passed.
+Codex review stages run in a read-only sandbox, so test runners and builds that write files (caches, coverage, build output) usually fail there. Reviewers are instructed to report such checks as not run rather than passed. For results reviewers can rely on, configure `dualAgent.verification.commands`: the extension runs them itself after every editing stage and reports their exit codes to the next reviewer.
 
 ### MCP servers or project hooks do not run during workflows
 
@@ -66,13 +66,37 @@ git config --global --add safe.directory "F:/path/to/repository"
 
 Implementation runs require Git so reviewers see every change and the result can be reverted. Open a Git repository (or run `git init` and commit a baseline) and resolve any warning shown with the error.
 
+### "An isolated worktree needs a repository with at least one commit"
+
+Worktree isolation checks out a commit. Commit a baseline, or set `dualAgent.isolation.mode` to `none` to let agents edit the workspace directly.
+
+### Tests fail in the worktree because dependencies are missing
+
+A worktree contains tracked files and your uncommitted and untracked changes, but no ignored files: no `node_modules`, virtual environments, build output, or `.env`. Install what your checks need with `dualAgent.isolation.setupCommands`, for example `[["npm", "ci"]]`. They run once when the worktree is created; a failure stops the run before any agent starts, and **Resume Run** retries them. If a check needs a value from `.env`, pass the variable name through `dualAgent.environment.passthrough` instead of copying the file.
+
+### "… was not found on PATH" for a verification command
+
+Commands are argument lists run without a shell, and their executables are never taken from the workspace or worktree. Use a command on `PATH` such as `npm`, `npx`, `pnpm`, or `python`, for example `[["npx", "vitest", "run"]]`, not `node_modules/.bin/vitest` or a single string like `"npm test"`. Make sure the command does not wait for input or watch files: it gets no terminal and is stopped after `dualAgent.verification.timeoutMinutes`.
+
+### The plan is waiting for approval
+
+Implementation runs pause before the first editing stage while `dualAgent.workflow.approvePlan` is on. The status bar shows **Dual Agent: approve plan**; click it, or use the buttons on the run in the **Runs** view. **Review Plan** opens Claude's plan beside Codex's review. Cancelling the run also ends the wait.
+
+### "Completed with unresolved findings"
+
+The final gate did not pass after the allowed fix rounds: the reviewer returned `fail` or no readable verdict, or a verification command failed. The reason is on the run's tooltip and in the report, and the verification stage shows each finding. You can still review and apply the changes; the apply dialog repeats the warning. Raise `dualAgent.workflow.maxFixRounds` (up to 3) for more automatic attempts.
+
+### "The changes do not apply cleanly"
+
+Applying checks the whole patch against your working tree first. It fails when you edited the same lines after the run started, and nothing is written. **Show Details** prints Git's explanation to the output channel. Either revert or commit your edits and apply again, or use **Open Worktree in New Window** and copy the changes you want. The worktree is kept until you apply or discard it.
+
 ### Run warnings
 
-Warnings in the dashboard and exported report mark conditions that weakened a run without stopping it: Git unavailable or its diff truncated, untracked files not listed, repository agent configuration (`.codex`), or run history that could not be saved. Read them before trusting a review.
+Warnings in the Runs view (expand the run) and the exported report mark conditions that weakened a run without stopping it. Examples: Git unavailable or its diff truncated, untracked files not listed or not copied into the worktree, repository agent configuration (`.codex`), or run history that could not be saved. Read them before trusting a review.
 
 ### Workflow stops at a review stage
 
-Export the run report and inspect the stage error. Authentication, invalid request, and policy failures intentionally do not fall back. Correct the underlying provider configuration and start a new workflow.
+Open the stage from the Runs view, or the run report, and read the error. Authentication, invalid request, and policy failures intentionally do not fall back. Correct the underlying provider configuration, then use **Resume Run** to continue from that stage.
 
 ### Context truncation
 
@@ -86,14 +110,16 @@ Cancellation and timeouts terminate the agent's whole process tree, including co
 
 If `runs.json` in the extension's workspace storage is corrupted or written by a newer version, it is renamed to `runs.json.unreadable-<timestamp>` next to the original and a new history starts. The old file is kept for inspection.
 
+### Claude starts a new session instead of continuing
+
+With `dualAgent.claude.resumeSessions` on, a Claude stage continues the previous Claude stage's session. If Claude reports that the session no longer exists, the stage runs again in a new session with the full prompt, and the output channel says so. Turn the setting off to always start fresh.
+
 ## Recovery
 
-Completed and failed records remain in private workspace storage. The current release does not resume a partially completed run automatically. Export the failed report and start a new objective such as:
+Completed, failed, and cancelled runs remain in private workspace storage. A failed or cancelled run can be continued with **Resume Run** (inline on the run, in its context menu, or in the Command Palette). Completed stages and an earlier plan approval are kept, and every unfinished stage runs again; implementation runs ask for consent again. A run that was active when VS Code closed is marked cancelled at the next start, and the output channel reports how many were interrupted.
 
-```text
-Continue the previous Dual Agent run using the attached report. Preserve the existing working-tree changes and begin by validating their current state.
-```
+A worktree run can be resumed only while its worktree exists and its changes have not been applied or discarded. Worktrees live in the `worktrees` folder of the extension's workspace storage. Remove one you no longer need with **Discard Changes** rather than deleting the folder, so Git's worktree registration is removed too. If a folder was deleted by hand, run `git worktree prune` in the repository.
 
 ## Logs
 
-User-visible normalized events appear in the dashboard. Provider stderr is treated as diagnostics and is not automatically persisted in the repository. Use VS Code's Extension Host log and Developer Tools for extension failures.
+**Dual Agent: Show Output** opens the **Dual Agent** output channel: stage transitions, approvals, fallbacks, check output, and excerpts of agent messages and diagnostics. Set the channel's log level to Debug to also see tool and lifecycle events. Full stage outputs are in the stage documents opened from the Runs view. Nothing is written to the repository. Use VS Code's Extension Host log for extension failures.
