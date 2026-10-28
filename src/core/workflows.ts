@@ -153,6 +153,27 @@ const CHAT: readonly WorkflowStageDefinition[] = [
   },
 ];
 
+/**
+ * A greeting or a question about the assistant itself: one quick reply from the product description, with no
+ * workspace and no check, because there is nothing in it to verify.
+ */
+const INTRO: readonly WorkflowStageDefinition[] = [
+  {
+    id: 'claude-intro',
+    context: 'none',
+    title: 'Claude answers',
+    agent: 'claude',
+    permission: 'read-only',
+    purpose: 'Quick reply',
+    instructions:
+      'The user is greeting you, thanking you, or asking who you are or what you can do. Reply as the Claude and Codex pair ("we"), from the "About Dual Agent" section: warmly, briefly, and only with what fits the question. End by asking what they would like to work on. Do not read files or use tools.',
+  },
+];
+
+export function introWorkflow(): WorkflowStageDefinition[] {
+  return INTRO.map((stage) => ({ ...stage }));
+}
+
 /** One requested change: Claude edits, Codex reviews the diff, and fix rounds follow a failed review. */
 const EDIT: readonly WorkflowStageDefinition[] = [
   {

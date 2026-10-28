@@ -42,9 +42,10 @@ export interface WorkflowStageDefinition {
   /**
    * `lean` gives the stage the workspace as a summary (status, changed files, a short diff, untracked file
    * names) instead of full contents; the agent reads what it needs. Every turn of an agent re-reads its
-   * prompt, so a smaller one saves tokens many times over.
+   * prompt, so a smaller one saves tokens many times over. `none` leaves the workspace out entirely and gives
+   * the product description instead, for a quick reply to a greeting or a question about the assistant.
    */
-  context?: 'lean';
+  context?: 'lean' | 'none';
   /** The stage may search and read the web; other stages may only when the user turns web access on. */
   web?: boolean;
   /** When plan approval is enabled, the user must approve the work so far before this stage starts. */

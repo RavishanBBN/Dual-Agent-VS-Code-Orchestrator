@@ -93,6 +93,7 @@ export function issueSummary(verdict: ReviewVerdict): string {
 export function describeOutcome(run: RunRecord): string {
   if (run.status === 'failed') return `Failed: ${run.error ?? 'no reason recorded'}`;
   if (run.status === 'cancelled') return 'Stopped';
+  if (run.status === 'completed' && run.stages.every((stage) => stage.id === 'claude-intro')) return 'Quick reply, nothing to check';
   const reviews = run.stages.filter((stage) => stage.review && stage.status === 'completed' && stage.verdict);
   const last = reviews.at(-1);
   if (!last?.verdict) return run.status === 'completed' ? 'Completed' : run.status;

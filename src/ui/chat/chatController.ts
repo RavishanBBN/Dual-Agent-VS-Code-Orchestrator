@@ -26,6 +26,7 @@ import {
   type Conversation,
   type ConversationTurn,
 } from '../../core/conversation.js';
+import { isSmallTalk } from '../../core/about.js';
 import { formatReset, type AgentLimit } from '../../core/limits.js';
 import { editsFiles } from '../../core/orchestrator.js';
 import type { AgentId, AgentOptions, AttachmentRef, OrchestratorEvent, RunRecord, StartOptions, WorkflowKind, WorktreeInfo } from '../../core/types.js';
@@ -787,7 +788,10 @@ export class ChatController implements vscode.Disposable {
   }
 
   private async startMessage(conversation: Conversation, item: QueuedMessage): Promise<void> {
-    const { mode, attachments } = item;
+    const { attachments } = item;
+    // A greeting or a question about the assistant gets a quick reply in any mode, so "hi" never asks to edit files.
+    const smallTalk = !attachments.length && isSmallTalk(item.text);
+    const mode: WorkflowKind = smallTalk ? 'chat' : item.mode;
     const earlier = { ...conversation, turns: [...conversation.turns] };
     const turn: ConversationTurn = {
       id: randomUUID(),
@@ -796,7 +800,7 @@ export class ChatController implements vscode.Disposable {
       message: item.text,
       attachments,
       agentOptions: item.agentOptions,
-      ...(item.web ? { web: true } : {}),
+      ...(item.web && !smallTalk ? { web: true } : {}),
       ...(item.fresh ? { freshSessions: true } : {}),
     };
     if (!conversation.turns.length) conversation.title = titleFor(turn.message);

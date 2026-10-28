@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
+import { isSmallTalk } from './about.js';
 import { sanitizeAgentOptions } from './agentOptions.js';
 import { attachmentText } from './attachments.js';
 import { buildStagePrompt, describeCheck } from './context.js';
@@ -31,7 +32,7 @@ import type {
 import { checksPassed, isFinished } from './types.js';
 import { addUsage, totalUsageByAgent } from './usage.js';
 import { onlyMinorFindings, parseVerdict, summarizeVerdict } from './verdict.js';
-import { fixRoundStages, getWorkflow, repairStage, reviseStage } from './workflows.js';
+import { fixRoundStages, getWorkflow, introWorkflow, repairStage, reviseStage } from './workflows.js';
 
 export interface PreparedWorktree {
   info: WorktreeInfo;
@@ -107,6 +108,11 @@ function attachmentAccess(run: RunRecord): { images: string[]; folders: string[]
     if (!attachment.workspaceRelative) folders.add(path.dirname(attachment.path));
   }
   return { images, folders: [...folders] };
+}
+
+/** A chat greeting or question about the assistant gets one quick reply; everything else its full workflow. */
+function workflowFor(kind: WorkflowKind, objective: string, options: StartOptions): WorkflowStageDefinition[] {
+  return kind === 'chat' && !options.attachments?.length && isSmallTalk(objective) ? introWorkflow() : getWorkflow(kind);
 }
 
 function stageRecord(definition: WorkflowStageDefinition, allowWrites: boolean): StageRecord {
@@ -197,7 +203,7 @@ export class WorkflowOrchestrator {
       allowWrites,
       createdAt: created,
       updatedAt: created,
-      stages: getWorkflow(kind).map((stage) => stageRecord(stage, allowWrites)),
+      stages: workflowFor(kind, objective, options).map((stage) => stageRecord(stage, allowWrites)),
       usage: totalUsageByAgent(),
       warnings: [],
       isolation,
