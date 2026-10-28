@@ -424,7 +424,7 @@ export class WorkflowOrchestrator {
       this.log(run, `Falling back to ${other}: ${stage.fallbackReason}`);
       // The failed attempt may have changed files before it stopped, so the fallback needs a fresh view.
       const fresh = await this.snapshot(run);
-      if (signal.aborted) throw new Error('Workflow cancelled.');
+      if (signal.aborted) throw new Error('Workflow cancelled.', { cause: error });
       try {
         stage.result = await this.attempt(run, stage, other, this.prompts(run, stage, other, fresh, true, await inline(other)), signal);
       } catch (second) {
