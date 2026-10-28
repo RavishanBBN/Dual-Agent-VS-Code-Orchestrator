@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { renderRunReport } from '../src/core/report.js';
+import { fence, renderRunReport, renderStageDocument } from '../src/core/report.js';
 import { FileRunStore } from '../src/core/store.js';
 import type { RunRecord } from '../src/core/types.js';
 import { totalUsageByAgent } from '../src/core/usage.js';
@@ -113,5 +113,79 @@ describe('run report warnings', () => {
     const value = run('warned');
     value.warnings = ['Git snapshot unavailable.'];
     expect(renderRunReport(value)).toContain('## Warnings\n\n- Git snapshot unavailable.');
+  });
+});
+
+const worktree = { path: '/storage/wt', workingDirectory: '/storage/wt', repositoryRoot: '/repo', baseCommit: 'abc' };
+
+describe('isolated runs in history', () => {
+  it('never prunes a run whose worktree changes still wait for review', async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'dual-agent-store-'));
+    temporaryDirectories.push(directory);
+    const store = new FileRunStore(directory, 5);
+    await store.save({ ...run('pending-review'), worktree: { ...worktree, state: 'active' } });
+    await store.save({ ...run('applied'), worktree: { ...worktree, state: 'applied' } });
+    for (let index = 0; index < 6; index += 1) await store.save(run(`later-${index}`));
+
+    const ids = (await store.list()).map((item) => item.id);
+    expect(ids).toContain('pending-review');
+    expect(ids).not.toContain('applied');
+    expect(ids).toHaveLength(6);
+  });
+
+  it('reports isolation, approval, verdicts, checks, and unresolved findings', () => {
+    const value: RunRecord = {
+      ...run('gated'),
+      kind: 'implementation',
+      status: 'completed-with-findings',
+      isolation: 'worktree',
+      worktree: { ...worktree, state: 'active' },
+      approval: { decidedAt: '2026-01-01T00:00:30.000Z', notes: 'Keep the API.' },
+      unresolved: 'the reviewer reported fail: 1 high',
+      stages: [
+        {
+          id: 'codex-final-verification',
+          title: 'Final verification',
+          agent: 'codex',
+          assignedAgent: 'codex',
+          permission: 'read-only',
+          purpose: 'gate',
+          instructions: 'verify',
+          status: 'completed',
+          verdict: { outcome: 'fail', findings: [{ severity: 'high', title: 'Off by one', location: 'a.ts:3' }] },
+          checks: [{ command: ['npm', 'test'], exitCode: 0, durationMs: 900, output: 'ok' }],
+        },
+      ],
+    };
+    const report = renderRunReport(value);
+    expect(report).toContain('Status: **completed with unresolved findings**');
+    expect(report).toContain('Isolation: isolated worktree at `/storage/wt` (changes waiting to be applied or discarded)');
+    expect(report).toContain('## Guidance given at plan approval\n\nKeep the API.');
+    expect(report).toContain('## Unresolved at completion\n\nthe reviewer reported fail: 1 high');
+    expect(report).toContain('- Verdict: fail: 1 high');
+    expect(report).toContain('  - high: Off by one (a.ts:3)');
+    expect(report).toContain('- `npm test`: passed in 0.9 s');
+  });
+
+  it('renders a stage document whose fence agent output cannot close', () => {
+    const value = run('document');
+    const stage = {
+      id: 'claude-implement',
+      title: 'Implement',
+      agent: 'claude' as const,
+      assignedAgent: 'claude' as const,
+      permission: 'workspace-write' as const,
+      purpose: 'implement',
+      instructions: 'implement',
+      status: 'completed' as const,
+      checks: [{ command: ['npm', 'test'], exitCode: 1, durationMs: 100, output: 'before\n```\nafter' }],
+      result: { text: 'Done.', usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, reasoningOutputTokens: 0 }, rawEventCount: 1 },
+    };
+    value.stages = [stage];
+    const document = renderStageDocument(value, stage);
+    expect(document).toContain('# 1. Implement');
+    expect(document).toContain('````text\nbefore\n```\nafter\n````');
+    expect(document).toContain('## Output\n\nDone.');
+    expect(fence('a ```` b')).toBe('`````\na ```` b\n`````');
   });
 });

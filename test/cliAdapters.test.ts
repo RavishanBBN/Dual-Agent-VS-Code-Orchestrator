@@ -173,6 +173,78 @@ describe('CLI adapters with fake providers', () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  it('continues a Claude session with the shorter prompt when asked to resume', { timeout: 20_000 }, async () => {
+    const { bin, workspace } = await layout('claude');
+    const command = await writeFakeCli(bin, 'fakeclaude', fakeCli(claudeSuccess));
+    const result = await new ClaudeCliAdapter({ ...base, command }).run({
+      ...request(workspace, 'workspace-write'),
+      resume: { sessionId: 'ses_1', prompt: 'short prompt' },
+    });
+    expect(result.resumedSession).toBe(true);
+    const call = await recordedCall(bin);
+    expect(call.input).toBe('short prompt');
+    expect(call.args.slice(call.args.indexOf('--resume'), call.args.indexOf('--resume') + 2)).toEqual(['--resume', 'ses_1']);
+  });
+
+  it('starts a new session with the full prompt when the session to resume is gone', { timeout: 20_000 }, async () => {
+    const { bin, workspace } = await layout('claude');
+    // Claude Code 2.1 reports an unknown session like this, before any model call.
+    const script = `if (process.argv.includes('--resume')) {
+  console.log(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['No conversation found with session ID: ses_old'] }));
+  console.error('No conversation found with session ID: ses_old');
+  process.exitCode = 1;
+} else {
+${fakeCli(claudeSuccess)}
+}`;
+    const command = await writeFakeCli(bin, 'fakeclaude', script);
+    const events: string[] = [];
+    const result = await new ClaudeCliAdapter({ ...base, command }).run({
+      ...request(workspace),
+      onEvent: (event) => events.push(event.message),
+      resume: { sessionId: 'ses_old', prompt: 'short prompt' },
+    });
+    expect(result.text).toBe('final answer');
+    expect(result.resumedSession).toBeUndefined();
+    const call = await recordedCall(bin);
+    expect(call.input).toBe('stage prompt');
+    expect(call.args).not.toContain('--resume');
+    expect(events.some((message) => message.includes('could not be resumed'))).toBe(true);
+  });
+
+  it('does not retry other failures of a resumed session, and never passes a session ID that looks like a flag', { timeout: 20_000 }, async () => {
+    const { bin, workspace } = await layout('claude');
+    const lines = [{ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 429 rate limit' }];
+    const command = await writeFakeCli(bin, 'fakeclaude', fakeCli(lines, 1));
+    const adapter = new ClaudeCliAdapter({ ...base, command });
+    const error = await rejection(adapter.run({ ...request(workspace), resume: { sessionId: 'ses_1', prompt: 'short' } }));
+    expect(error.kind).toBe('quota');
+
+    await rejection(adapter.run({ ...request(workspace), resume: { sessionId: '--dangerously-skip-permissions', prompt: 'short' } }));
+    expect((await recordedCall(bin)).args).not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('ignores resume requests for Codex, whose resume flags are not verified', { timeout: 20_000 }, async () => {
+    const { bin, workspace } = await layout('codex');
+    const success = [
+      { type: 'item.completed', item: { type: 'agent_message', text: 'review complete' } },
+      { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } },
+    ];
+    const command = await writeFakeCli(bin, 'fakecodex', fakeCli(success));
+    await new CodexCliAdapter({ ...base, command }).run({ ...request(workspace), resume: { sessionId: 'thr_1', prompt: 'short' } });
+    const call = await recordedCall(bin);
+    expect(call.input).toBe('stage prompt');
+    expect(call.args).toEqual(['exec', '--json', '--sandbox', 'read-only', '-']);
+  });
+
+  it('refuses an executable inside any untrusted directory, such as the primary workspace of a worktree run', { timeout: 20_000 }, async () => {
+    const { bin, workspace } = await layout('untrusted');
+    const command = await writeFakeCli(bin, 'fakeclaude', fakeCli(claudeSuccess));
+    const error = await rejection(
+      new ClaudeCliAdapter({ ...base, command }).run({ ...request(workspace), untrustedDirectories: [path.dirname(bin)] }),
+    );
+    expect(error.message).toContain('inside the workspace');
+  });
+
   it('warns when a repository carries Codex project configuration', async () => {
     const workspace = await temporaryDirectory('preflight');
     expect(await new CodexCliAdapter(base).preflightWarnings(workspace)).toEqual([]);

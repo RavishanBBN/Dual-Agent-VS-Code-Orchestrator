@@ -64,6 +64,16 @@ describe('provider failure reporting', () => {
     expect(accumulator.failureMessage()).toBe('API Error: 500');
   });
 
+  it('reports Claude errors that are listed only in the errors array, such as an unknown session', () => {
+    const parsed = parseClaudeLine(
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: abc"],"usage":{}}',
+    );
+    expect(parsed?.failure).toBe('No conversation found with session ID: abc');
+    expect(parseClaudeLine('{"type":"result","subtype":"error_max_turns","is_error":true}')?.failure).toBe(
+      'Claude stopped with error_max_turns.',
+    );
+  });
+
   it('separates Codex turn failures from recoverable error events', () => {
     const error = parseCodexLine('{"type":"error","message":"stream disconnected; retrying"}');
     expect(error).toMatchObject({ error: 'stream disconnected; retrying' });

@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import { AgentExecutionError } from '../src/core/errors.js';
-import { WorkflowOrchestrator } from '../src/core/orchestrator.js';
+import { canResume, WorkflowOrchestrator, type CheckRequest, type OrchestratorDependencies } from '../src/core/orchestrator.js';
 import type {
   AgentAdapter,
   AgentHealth,
   AgentRunRequest,
+  ApprovalDecision,
+  CheckResult,
   GitSnapshot,
+  OrchestratorOptions,
   RunRecord,
   RunStore,
   StageResult,
@@ -16,10 +19,10 @@ class MemoryStore implements RunStore {
   public runs: RunRecord[] = [];
   public failures = 0;
   public async list(): Promise<RunRecord[]> {
-    return this.runs;
+    return structuredClone(this.runs);
   }
   public async latest(): Promise<RunRecord | undefined> {
-    return this.runs[0];
+    return structuredClone(this.runs[0]);
   }
   public async save(run: RunRecord): Promise<void> {
     if (this.failures > 0) {
@@ -32,11 +35,20 @@ class MemoryStore implements RunStore {
 
 const usage = { inputTokens: 10, cachedInputTokens: 2, outputTokens: 3, reasoningOutputTokens: 0 };
 
+const stageOf = (request: AgentRunRequest): string => /- ID: (\S+)/.exec(request.prompt)?.[1] ?? '';
+const verdict = (outcome: 'pass' | 'fail'): string =>
+  `Review.\n\`\`\`verdict\n${JSON.stringify({ verdict: outcome, findings: outcome === 'fail' ? [{ severity: 'high', title: 'Off-by-one in pager' }] : [] })}\n\`\`\``;
+
 class FakeAdapter implements AgentAdapter {
   public calls: AgentRunRequest[] = [];
   public failOnce = false;
   public warnings: string[] = [];
-  public constructor(public readonly id: 'claude' | 'codex') {}
+  /** Returns the stage output, or an error to throw. */
+  public respond: (request: AgentRunRequest) => string | Error = () => `${this.id} result`;
+  public constructor(
+    public readonly id: 'claude' | 'codex',
+    private readonly sessionId?: string,
+  ) {}
   public async doctor(): Promise<AgentHealth> {
     return { agent: this.id, available: true, detail: 'ok' };
   }
@@ -50,31 +62,49 @@ class FakeAdapter implements AgentAdapter {
       this.failOnce = false;
       throw new AgentExecutionError('usage limit reached', 'quota', 1, { ...usage, inputTokens: 4 });
     }
-    return { text: `${this.id} result`, usage, rawEventCount: 1 };
+    const response = this.respond(request);
+    if (response instanceof Error) throw response;
+    return {
+      text: response,
+      usage,
+      rawEventCount: 1,
+      ...(this.sessionId ? { providerSessionId: this.sessionId } : {}),
+      ...(request.resume ? { resumedSession: true } : {}),
+    };
   }
 }
 
 const clean: GitSnapshot = { available: true, status: '', diff: '', diffStat: '', untracked: [], warnings: [] };
 const noGit: GitSnapshot = { ...clean, available: false, warnings: ['The workspace is not a Git repository, so agents receive no diff.'] };
 
-function setup(snapshot: GitSnapshot = clean, fallbackOnQuota = true) {
+interface Setup {
+  snapshot?: GitSnapshot;
+  options?: Partial<OrchestratorOptions>;
+  dependencies?: OrchestratorDependencies;
+  claudeSession?: string;
+}
+
+function setup({ snapshot = clean, options = {}, dependencies = {}, claudeSession }: Setup = {}) {
   const store = new MemoryStore();
-  const claude = new FakeAdapter('claude');
+  const claude = new FakeAdapter('claude', claudeSession);
   const codex = new FakeAdapter('codex');
   let snapshots = 0;
   const orchestrator = new WorkflowOrchestrator(
     { claude, codex },
     store,
-    { maxContextCharacters: 20_000, fallbackOnQuota },
+    { maxContextCharacters: 20_000, fallbackOnQuota: true, ...options },
     {
       captureSnapshot: async () => {
         snapshots += 1;
         return snapshot;
       },
+      ...dependencies,
     },
   );
   return { store, claude, codex, orchestrator, snapshots: () => snapshots };
 }
+
+const check = (exitCode: number): CheckResult => ({ command: ['npm', 'test'], exitCode, durationMs: 1200, output: exitCode ? '1 failing' : 'all passing' });
 
 describe('WorkflowOrchestrator', () => {
   it('runs the complete Claude-led reciprocal brainstorming workflow', async () => {
@@ -90,7 +120,10 @@ describe('WorkflowOrchestrator', () => {
     expect(codex.calls).toHaveLength(2);
     expect(run.usage.claude.inputTokens).toBe(30);
     expect(run.usage.codex.inputTokens).toBe(20);
-    expect(events).toContain('agent-event');
+    expect(events).toEqual(expect.arrayContaining(['agent-event', 'log']));
+    // Review stages ask for a verdict; brainstorming records it without gating on it.
+    expect(codex.calls[0]?.prompt).toContain('Required verdict');
+    expect(run.stages[1]?.verdict?.outcome).toBe('missing');
   });
 
   it('falls back on quota failure with a fresh snapshot and counts the failed attempt', async () => {
@@ -111,14 +144,14 @@ describe('WorkflowOrchestrator', () => {
   });
 
   it('requires explicit write consent for implementation', async () => {
-    const { orchestrator } = setup(clean, false);
+    const { orchestrator } = setup({ options: { fallbackOnQuota: false } });
     await expect(orchestrator.start('implementation', 'Change files.', process.cwd(), false)).rejects.toThrow(
       'explicit workspace-write consent',
     );
   });
 
   it('refuses to run implementation stages without a usable Git snapshot', async () => {
-    const { claude, codex, orchestrator } = setup(noGit);
+    const { claude, codex, orchestrator } = setup({ snapshot: noGit });
     const run = await orchestrator.start('implementation', 'Change files.', process.cwd(), true);
     expect(run.status).toBe('failed');
     expect(run.error).toContain('need a working Git repository');
@@ -129,7 +162,7 @@ describe('WorkflowOrchestrator', () => {
   });
 
   it('records snapshot and provider warnings while a read-only workflow continues', async () => {
-    const { codex, orchestrator } = setup(noGit);
+    const { codex, orchestrator } = setup({ snapshot: noGit });
     codex.warnings = ['The repository contains .codex.'];
     const run = await orchestrator.start('brainstorming', 'Design the system.', process.cwd(), false);
     expect(run.status).toBe('completed');
@@ -180,5 +213,284 @@ describe('WorkflowOrchestrator', () => {
     });
     const run = await orchestrator.start('brainstorming', 'Design the system.', process.cwd(), false);
     expect(run.status).toBe('completed');
+  });
+});
+
+describe('final gate and fix rounds', () => {
+  it('completes when the final verification passes', async () => {
+    const { codex, orchestrator } = setup({ options: { maxFixRounds: 1 } });
+    codex.respond = () => verdict('pass');
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+    expect(run.status).toBe('completed');
+    expect(run.stages).toHaveLength(7);
+    expect(run.unresolved).toBeUndefined();
+  });
+
+  it('adds a fix round when the final verification fails, and completes once a re-verification passes', async () => {
+    const { claude, codex, orchestrator } = setup({ options: { maxFixRounds: 2 } });
+    let finalVerifications = 0;
+    codex.respond = (request) => {
+      if (!stageOf(request).includes('verification')) return verdict('pass');
+      finalVerifications += 1;
+      return verdict(finalVerifications === 1 ? 'fail' : 'pass');
+    };
+
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+
+    expect(run.status).toBe('completed');
+    expect(run.stages.map((stage) => stage.id)).toEqual([
+      'claude-plan',
+      'codex-plan-review',
+      'claude-implement',
+      'codex-code-review',
+      'claude-adjudicate-fix',
+      'codex-final-verification',
+      'claude-fix-round-1',
+      'codex-reverification-round-1',
+      'claude-finalize',
+    ]);
+    expect(run.stages[6]).toMatchObject({ permission: 'workspace-write', status: 'completed' });
+    const fixPrompt = claude.calls.find((request) => stageOf(request) === 'claude-fix-round-1')?.prompt;
+    expect(fixPrompt).toContain('1 high');
+    expect(fixPrompt).toContain('Off-by-one in pager');
+  });
+
+  it('completes with unresolved findings when the fix rounds run out', async () => {
+    const { codex, orchestrator } = setup({ options: { maxFixRounds: 1 } });
+    codex.respond = (request) => verdict(stageOf(request).includes('verification') ? 'fail' : 'pass');
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+    expect(run.status).toBe('completed-with-findings');
+    expect(run.unresolved).toContain('1 high');
+    expect(run.stages.filter((stage) => stage.round === 1)).toHaveLength(2);
+  });
+
+  it('never treats a missing verdict as a pass', async () => {
+    const { orchestrator } = setup({ options: { maxFixRounds: 0 } });
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+    expect(run.status).toBe('completed-with-findings');
+    expect(run.unresolved).toContain('no machine-readable verdict');
+    expect(run.stages).toHaveLength(7);
+  });
+
+  it('runs verification after every editing stage, shows the result to reviewers, and gates on it', async () => {
+    const checkRequests: CheckRequest[] = [];
+    const results = [[check(0)], [check(1)], [check(0)]];
+    const { codex, orchestrator } = setup({
+      options: { maxFixRounds: 1, verificationCommands: [['npm', 'test']] },
+      dependencies: {
+        runChecks: async (request) => {
+          checkRequests.push(request);
+          return results.shift() ?? [check(0)];
+        },
+      },
+    });
+    codex.respond = () => verdict('pass');
+
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+
+    // Implement, adjudicate, and one fix round: the adjudication checks failed even though Codex passed it.
+    expect(checkRequests).toHaveLength(3);
+    expect(run.stages.find((stage) => stage.id === 'claude-adjudicate-fix')?.checks?.[0]?.exitCode).toBe(1);
+    expect(run.stages.some((stage) => stage.id === 'claude-fix-round-1')).toBe(true);
+    expect(run.status).toBe('completed');
+    const reviewPrompt = codex.calls.find((request) => stageOf(request) === 'codex-final-verification')?.prompt ?? '';
+    expect(reviewPrompt).toContain('Orchestrator-run checks');
+    expect(reviewPrompt).toContain('`npm test`: failed with exit code 1');
+    expect(reviewPrompt).toContain('1 failing');
+  });
+});
+
+describe('plan approval', () => {
+  it('waits for approval before the first editing stage and passes guidance to later prompts', async () => {
+    const statuses: string[] = [];
+    const requested: string[] = [];
+    const { claude, orchestrator } = setup({
+      options: { approvePlan: true },
+      dependencies: {
+        requestApproval: async (_run, stage): Promise<ApprovalDecision> => {
+          requested.push(stage.id);
+          return { approved: true, notes: 'Keep the public API stable.' };
+        },
+      },
+    });
+    orchestrator.onEvent((event) => statuses.push(event.run.status));
+
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+
+    expect(requested).toEqual(['claude-implement']);
+    expect(statuses).toContain('awaiting-approval');
+    expect(run.approval?.notes).toBe('Keep the public API stable.');
+    const implement = claude.calls.find((request) => stageOf(request) === 'claude-implement');
+    expect(implement?.prompt).toContain('User guidance given when approving the plan');
+    expect(implement?.prompt).toContain('Keep the public API stable.');
+  });
+
+  it('cancels without editing anything when the plan is rejected', async () => {
+    const { claude, orchestrator } = setup({
+      options: { approvePlan: true },
+      dependencies: { requestApproval: async () => ({ approved: false }) },
+    });
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+    expect(run.status).toBe('cancelled');
+    expect(run.error).toContain('rejected');
+    expect(claude.calls.map(stageOf)).toEqual(['claude-plan']);
+    expect(run.stages.find((stage) => stage.id === 'claude-implement')?.status).toBe('skipped');
+  });
+
+  it('treats a cancellation during the wait as cancelled', async () => {
+    const holder: { orchestrator?: WorkflowOrchestrator } = {};
+    const { orchestrator } = setup({
+      options: { approvePlan: true },
+      dependencies: {
+        requestApproval: async () => {
+          holder.orchestrator?.cancel();
+          return { approved: true };
+        },
+      },
+    });
+    holder.orchestrator = orchestrator;
+    const run = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+    expect(run.status).toBe('cancelled');
+    expect(run.approval).toBeUndefined();
+  });
+});
+
+describe('sessions and resuming', () => {
+  it('continues Claude\'s own session in later Claude stages, without repeating its earlier output', async () => {
+    const { claude, codex, orchestrator } = setup({ options: { resumeSessions: ['claude'] }, claudeSession: 'ses-claude' });
+    claude.respond = (request) => `CLAUDE-OUTPUT-${stageOf(request)}`;
+
+    const run = await orchestrator.start('brainstorming', 'Design the system.', process.cwd(), false);
+
+    expect(claude.calls[0]?.resume).toBeUndefined();
+    const synthesis = claude.calls[1];
+    expect(synthesis?.resume?.sessionId).toBe('ses-claude');
+    // The fresh prompt is complete; the resumed prompt leaves out what the session already holds.
+    expect(synthesis?.prompt).toContain('CLAUDE-OUTPUT-claude-proposal');
+    expect(synthesis?.resume?.prompt).not.toContain('CLAUDE-OUTPUT-claude-proposal');
+    expect(synthesis?.resume?.prompt).toContain('already in this session');
+    expect(synthesis?.resume?.prompt).toContain('codex result');
+    expect(codex.calls.every((request) => request.resume === undefined)).toBe(true);
+    expect(run.stages[2]?.result?.resumedSession).toBe(true);
+  });
+
+  it('resumes a failed run from its first unfinished stage', async () => {
+    const { claude, orchestrator } = setup({ options: { approvePlan: true }, dependencies: { requestApproval: async () => ({ approved: true }) } });
+    claude.respond = (request) => (stageOf(request) === 'claude-implement' ? new AgentExecutionError('disk full', 'unknown', 1) : 'claude result');
+    const failed = await orchestrator.start('implementation', 'Add paging.', process.cwd(), true);
+    expect(failed.status).toBe('failed');
+    expect(canResume(failed)).toBe(true);
+
+    claude.respond = () => 'claude result';
+    const before = claude.calls.length;
+    const resumed = await orchestrator.resume(failed.id, true);
+
+    expect(resumed.status).toBe('completed-with-findings');
+    expect(resumed.resumeCount).toBe(1);
+    expect(resumed.error).toBeUndefined();
+    // The completed plan was not repeated, and the earlier approval still stands.
+    expect(claude.calls.slice(before).map(stageOf)).toEqual(['claude-implement', 'claude-adjudicate-fix', 'claude-finalize']);
+    expect(resumed.stages.every((stage) => stage.status === 'completed')).toBe(true);
+  });
+
+  it('refuses to resume completed runs, runs without consent, and runs whose worktree is gone', async () => {
+    const worktree = { path: '/wt', workingDirectory: '/wt', repositoryRoot: '/repo', baseCommit: 'abc', state: 'active' as const };
+    const { orchestrator, store } = setup({ dependencies: { worktreeExists: async () => false } });
+    const completed = await orchestrator.start('brainstorming', 'Design it.', process.cwd(), false);
+    await expect(orchestrator.resume(completed.id, false)).rejects.toThrow('Only failed or cancelled runs');
+
+    const failed: RunRecord = { ...structuredClone(completed), id: 'failed-run', kind: 'implementation', status: 'failed', allowWrites: true };
+    await store.save(failed);
+    await expect(orchestrator.resume('failed-run', false)).rejects.toThrow('consent');
+    await store.save({ ...failed, worktree });
+    await expect(orchestrator.resume('failed-run', true)).rejects.toThrow('no longer exists');
+    await store.save({ ...failed, worktree: { ...worktree, state: 'applied' } });
+    await expect(orchestrator.resume('failed-run', true)).rejects.toThrow('already applied');
+    await expect(orchestrator.resume('missing', true)).rejects.toThrow('no longer in the history');
+  });
+
+  it('marks runs left active by a closed window as cancelled and resumable', async () => {
+    const { orchestrator, store } = setup();
+    const run = await orchestrator.start('brainstorming', 'Design it.', process.cwd(), false);
+    run.status = 'running';
+    run.stages[2]!.status = 'running';
+    run.stages[3]!.status = 'pending';
+    await store.save(run);
+
+    const [recovered] = await orchestrator.recoverInterrupted();
+
+    expect(recovered).toMatchObject({ id: run.id, status: 'cancelled' });
+    expect(recovered?.error).toContain('VS Code closed');
+    expect(recovered?.stages.map((stage) => stage.status).slice(2, 4)).toEqual(['cancelled', 'skipped']);
+    expect(canResume(recovered!)).toBe(true);
+    expect(await orchestrator.recoverInterrupted()).toEqual([]);
+  });
+
+  it('updates a finished run and reports the change', async () => {
+    const { orchestrator, store } = setup();
+    const run = await orchestrator.start('brainstorming', 'Design it.', process.cwd(), false);
+    const seen: string[] = [];
+    orchestrator.onEvent((event) => seen.push(event.type));
+    await orchestrator.updateRun(run.id, (record) => {
+      record.warnings = ['changed'];
+    });
+    expect((await store.latest())?.warnings).toEqual(['changed']);
+    expect(seen).toEqual(['run-updated']);
+  });
+});
+
+describe('worktree isolation', () => {
+  const info = { path: '/storage/wt', workingDirectory: '/storage/wt/app', repositoryRoot: '/repo', baseCommit: 'base', state: 'active' as const };
+
+  it('runs every stage and check in the worktree and excludes both trees from executable lookup', async () => {
+    const prepared: string[] = [];
+    const checkRequests: CheckRequest[] = [];
+    const { claude, codex, orchestrator } = setup({
+      options: { isolation: 'worktree', setupCommands: [['npm', 'ci']], verificationCommands: [['npm', 'test']] },
+      dependencies: {
+        prepareWorktree: async (workspacePath) => {
+          prepared.push(workspacePath);
+          return { info: { ...info }, warnings: ['Untracked files not copied into the isolated worktree: .env (name suggests a secret).'] };
+        },
+        runChecks: async (request) => {
+          checkRequests.push(request);
+          return [check(0)];
+        },
+      },
+    });
+
+    const run = await orchestrator.start('implementation', 'Add paging.', '/repo/app', true);
+
+    expect(prepared).toEqual(['/repo/app']);
+    expect(run.isolation).toBe('worktree');
+    expect(run.worktree).toMatchObject({ workingDirectory: '/storage/wt/app', setupCompleted: true });
+    expect(run.warnings?.[0]).toContain('.env');
+    expect([...claude.calls, ...codex.calls].every((request) => request.cwd === '/storage/wt/app')).toBe(true);
+    expect(claude.calls[0]?.untrustedDirectories).toEqual(['/repo/app', '/storage/wt', '/repo']);
+    expect(checkRequests[0]?.commands).toEqual([['npm', 'ci']]);
+    expect(checkRequests.every((request) => request.cwd === '/storage/wt/app')).toBe(true);
+    expect(run.setupChecks).toHaveLength(1);
+  });
+
+  it('fails before any agent runs when a setup command fails', async () => {
+    const { claude, orchestrator } = setup({
+      options: { isolation: 'worktree', setupCommands: [['npm', 'ci']] },
+      dependencies: {
+        prepareWorktree: async () => ({ info: { ...info }, warnings: [] }),
+        runChecks: async () => [{ ...check(1), command: ['npm', 'ci'] }],
+      },
+    });
+    const run = await orchestrator.start('implementation', 'Add paging.', '/repo/app', true);
+    expect(run.status).toBe('failed');
+    expect(run.error).toContain('Worktree setup failed: `npm ci` failed with exit code 1');
+    expect(claude.calls).toHaveLength(0);
+    expect(run.worktree?.setupCompleted).toBeUndefined();
+  });
+
+  it('keeps brainstorming in the workspace', async () => {
+    const { claude, orchestrator } = setup({ options: { isolation: 'worktree' } });
+    const run = await orchestrator.start('brainstorming', 'Design it.', '/repo/app', false);
+    expect(run.isolation).toBe('none');
+    expect(claude.calls.every((request) => request.cwd === '/repo/app')).toBe(true);
   });
 });

@@ -27,13 +27,20 @@ export interface AdapterConfiguration {
   environmentPassthrough?: readonly string[];
 }
 
+/** Session IDs are passed as arguments, so anything that could read as a flag is rejected. */
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
 /** Repository files that can configure a provider, relative to the workspace root. */
 const PROJECT_CONFIGURATION: Record<AgentId, readonly string[]> = {
   claude: [],
   codex: ['.codex'],
 };
 
-export function claudeArguments(configuration: AdapterConfiguration, permission: PermissionMode): string[] {
+export function claudeArguments(
+  configuration: AdapterConfiguration,
+  permission: PermissionMode,
+  resumeSessionId?: string,
+): string[] {
   const writes = permission === 'workspace-write';
   const args = [
     '-p',
@@ -53,8 +60,13 @@ export function claudeArguments(configuration: AdapterConfiguration, permission:
     writes ? 'acceptEdits' : 'plan',
   ];
   if (writes && configuration.claudeAllowedTools?.length) args.push('--allowedTools', ...configuration.claudeAllowedTools);
+  if (resumeSessionId) args.push('--resume', resumeSessionId);
   if (configuration.model) args.push('--model', configuration.model);
   return args;
+}
+
+function isMissingSession(error: unknown): boolean {
+  return error instanceof AgentExecutionError && /no conversation found/i.test(error.message);
 }
 
 export function codexArguments(configuration: AdapterConfiguration, permission: PermissionMode): string[] {
@@ -69,8 +81,10 @@ abstract class CliAdapter implements AgentAdapter {
 
   public constructor(protected readonly configuration: AdapterConfiguration) {}
 
-  protected abstract buildArguments(permission: PermissionMode): string[];
+  protected abstract buildArguments(permission: PermissionMode, resumeSessionId?: string): string[];
   protected abstract parse(line: string): ParsedLine | undefined;
+  /** Whether this provider's CLI can continue a session non-interactively with the same flags. */
+  protected readonly supportsResume: boolean = false;
 
   private environment(): NodeJS.ProcessEnv {
     return buildChildEnvironment(process.env, {
@@ -121,21 +135,39 @@ abstract class CliAdapter implements AgentAdapter {
   }
 
   public async run(request: AgentRunRequest): Promise<StageResult> {
+    const resume = request.resume;
+    if (resume && this.supportsResume && SESSION_ID.test(resume.sessionId)) {
+      try {
+        return { ...(await this.execute(request, resume.prompt, resume.sessionId)), resumedSession: true };
+      } catch (error) {
+        // A session can disappear (cleaned up, or created on another machine); the stage then starts fresh.
+        if (!isMissingSession(error) || request.signal.aborted) throw error;
+        request.onEvent({
+          agent: this.id,
+          category: 'diagnostic',
+          message: `Session ${resume.sessionId} could not be resumed; starting a new session.`,
+        });
+      }
+    }
+    return this.execute(request, request.prompt);
+  }
+
+  private async execute(request: AgentRunRequest, prompt: string, resumeSessionId?: string): Promise<StageResult> {
     const accumulator = new StreamAccumulator();
     const environment = this.environment();
-    // The workspace is excluded so a planted codex.cmd or claude.exe can never be selected.
+    // The workspace and its worktree are excluded so a planted codex.cmd or claude.exe can never be selected.
     const executable = resolveExecutable(this.configuration.command, {
       environment,
-      untrustedDirectories: [request.cwd],
+      untrustedDirectories: [request.cwd, ...(request.untrustedDirectories ?? [])],
     });
     let diagnostic = '';
 
     try {
       await runProcess({
         command: executable,
-        args: this.buildArguments(request.permission),
+        args: this.buildArguments(request.permission, resumeSessionId),
         cwd: request.cwd,
-        input: request.prompt,
+        input: prompt,
         timeoutMs: this.configuration.timeoutMs,
         signal: request.signal,
         environment,
@@ -194,9 +226,10 @@ export class CodexCliAdapter extends CliAdapter {
 
 export class ClaudeCliAdapter extends CliAdapter {
   public readonly id = 'claude' as const;
+  protected override readonly supportsResume = true;
 
-  protected buildArguments(permission: PermissionMode): string[] {
-    return claudeArguments(this.configuration, permission);
+  protected buildArguments(permission: PermissionMode, resumeSessionId?: string): string[] {
+    return claudeArguments(this.configuration, permission, resumeSessionId);
   }
 
   protected parse(line: string): ParsedLine | undefined {

@@ -6,8 +6,8 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],
-      // Everything except the VS Code composition layer (extension.ts, config.ts, dashboardProvider.ts).
-      include: ['src/core/**/*.ts', 'src/adapters/**/*.ts', 'src/ui/messages.ts'],
+      // Everything except modules that import vscode (extension.ts, config.ts, and the view classes in src/ui).
+      include: ['src/core/**/*.ts', 'src/adapters/**/*.ts', 'src/ui/presentation.ts'],
       exclude: ['src/core/types.ts'],
       thresholds: {
         lines: 80,
