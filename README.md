@@ -76,7 +76,7 @@ Dual Agent Orchestrator turns that ad-hoc interaction into a conversation backed
 ## Architecture
 
 ```text
-VS Code: Dual Agent side bar ─ Chat (webview) · Runs view · Agents view · status bar · diff editor
+VS Code: Chat (webview, right side bar) · Runs and Agents views (activity bar) · status bar · diff editor
           |
           v
 extension.ts ── chat controller (conversations, attachments, consent, models)
@@ -152,14 +152,14 @@ npm.cmd run package
 code --install-extension .\dual-agent-orchestrator-2.1.0.vsix --force
 ```
 
-Then reload VS Code and select the **Dual Agent** icon in the activity bar, or press `Ctrl+Alt+D`.
+Then reload VS Code and press `Ctrl+Alt+D` to open the chat in the right-hand side bar.
 
 To work on the extension itself, open this folder in VS Code and press `F5`; an Extension Development Host window opens with the extension loaded. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## Use
 
 1. Open a local folder and trust the workspace. The extension does not run in Restricted Mode.
-2. Select the **Dual Agent** icon. The **Chat** view opens; drag it to the right-hand side bar if you prefer it there. To use it as an editor tab, like Claude Code, click the chat button in any editor's title bar or run **Dual Agent: Open Chat in Editor**; the tab is named after the conversation. Expand **Agents** to confirm Claude Code, Codex, and Git are ready.
+2. Press `Ctrl+Alt+D`, or run **Dual Agent: Open Chat**. The chat opens in the right-hand side bar, where Claude Code's panel opens; if the right side bar is hidden, **Ctrl+Alt+B** toggles it. The **Dual Agent** icon in the activity bar on the left holds the **Runs** and **Agents** views. To use the chat as an editor tab instead, like Claude Code, click the chat button in any editor's title bar or run **Dual Agent: Open Chat in Editor**; the tab is named after the conversation. Expand **Agents** to confirm Claude Code, Codex, and Git are ready.
 3. Type a message. Enter sends; Shift+Enter starts a new line. Attach files with the paperclip, by pasting, or by dropping them on the composer, and type `@` to mention a workspace file.
 4. Choose the mode in the composer (**Chat**, **Edit**, **Brainstorm**, **Implement**). The sliders button chooses each agent's model and effort; **Default** leaves the choice to the CLI.
 5. Watch the agents work on a timeline: Claude (orange) and Codex (blue) each get a node, text streams in, and every tool call appears with its IN and OUT, which you can click to expand. Codex's badge says whether it agrees. **Stop** cancels the message.
@@ -210,7 +210,14 @@ Agent processes and your commands receive only an allowlisted environment: `PATH
 
 In the default `subscription` mode, billing variables are removed even when listed there: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `AWS_BEARER_TOKEN_BEDROCK`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_API_KEY`, and `AZURE_OPENAI_API_KEY`. Matching ignores case on Windows. The CLIs therefore use their saved interactive sign-ins.
 
-The displayed numbers are observations from provider events, useful for comparing workload distribution but not authoritative subscription balances.
+### Seeing token usage
+
+- **Per step:** each Claude or Codex stage in the chat shows its tokens; hover for input, cached input, output, and reasoning.
+- **Per message:** the footer line under a message ("Claude 31.4k · Codex 18.4k tokens") opens a table per agent, with the Claude CLI's API-equivalent cost estimate.
+- **Overall:** the chart button in the chat's header shows the conversation's total; click it, or run **Dual Agent: Show Token Usage**, for this conversation, today, the last 7 days, and all runs in the workspace.
+- **Per run:** hover a run in the **Runs** view, or open its report.
+
+Input counts every input token, including cached input, for both agents. The numbers are observations from provider events, useful for comparing workload distribution but not authoritative subscription balances: neither CLI reports how much of your plan's limit remains.
 
 If a stage fails with a recognized quota, availability, or timeout condition and fallback is enabled, the other agent attempts that stage once with a fresh Git snapshot. The condition is classified from the provider's structured error or the process's stderr, never from the agent's output stream. Authentication errors, invalid requests, policy failures, and unknown failures are not rerouted. Tokens spent by a failed attempt still count.
 

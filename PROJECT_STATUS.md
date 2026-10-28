@@ -42,7 +42,7 @@ This document is the maintained implementation ledger for Dual Agent Orchestrato
 | Session continuity and resume | Complete | Claude session reuse within runs and across messages; resume from first unfinished stage; interrupted runs recovered |
 | Shared checkpoint context | Complete | Per-section budgets including checks, attachments, and history; random block boundaries; restated contract |
 | Durable state | Complete | Serialized saves, locked-file retry, unreadable files set aside, unapplied work never pruned |
-| Usage observation | Complete | Per-provider totals including failed attempts, shown per message |
+| Usage observation | Complete | Per-provider totals including failed attempts, with input counted the same way for both agents; shown per stage, per message, and for the conversation, today, 7 days, and all runs |
 | Bounded provider fallback | Complete | Classified from provider errors and stderr only; fresh snapshot |
 | Report export | Complete | Markdown report with verdicts, checks, isolation, approval, attachments, warnings |
 | Unit and integration tests | Complete | Fake-CLI adapter and check tests, real-Git snapshot and worktree tests, attachment tests with real pdf.js, chat protocol, Markdown, and transcript tests |
@@ -58,7 +58,7 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 | Dependency audit | Passed | `npm audit`: 0 known vulnerabilities, with preact 10.29.8, markdown-it 15.0.3, fflate 0.8.3, and unpdf 1.8.1 pinned |
 | TypeScript | Passed | Strict `tsc --noEmit`, including the webview's TSX |
 | ESLint | Passed | Type-aware rules; zero findings |
-| Unit and integration tests | Passed | 204 passed, 1 skipped (POSIX-only symlink test), 18 files |
+| Unit and integration tests | Passed | 206 passed, 1 skipped (POSIX-only symlink test), 18 files |
 | Coverage | Passed | 93.8% lines, 78.5% branches, 90.2% statements, 91.4% functions across every module that does not import `vscode` or Preact |
 | Smoke test in VS Code | Passed | `npm run smoke`, VS Code 1.143.1. Brainstorming and worktree review as in 2.0.0. The chat page loaded its script under its CSP, and the Codex model list arrived from the fake CLI. A Chat message with an attachment completed with "Codex agreed", both agents' steps stayed in the transcript with their IN and OUT, and each fake CLI received the chosen model, effort, attachment folder, streaming, and read-only tools. A follow-up continued Claude's session. An Edit message passed the consent card and changed only the worktree, and its changes card listed the file. The chat opened in an editor tab |
 | Live chat with attachments | Passed | Real CLIs, Claude haiku at low effort and Codex gpt-5.6-luna at low effort, in a disposable repository. Claude read a PNG, a PDF, a Word file, and a ZIP and answered all four facts correctly, with text streamed in 28 chunks. Codex opened the unpacked ZIP file in its sandbox and saw the image through `--image`, and passed the answer |
@@ -71,7 +71,7 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 | Git hooks disabled | Passed | Planted hooks never ran during the worktree lifecycle; a control `git worktree add` ran them |
 | Worktree apply | Passed | Applies to the working tree only, refuses conflicts without writing, works with `core.autocrlf=true` checkouts on Windows |
 | VSIX package | Passed | `dual-agent-orchestrator-2.1.0.vsix`, 27 files, 752 KB, no packaging warnings |
-| CI | Passed for 2.0.0 | Windows and Linux on commit `80e5419`; 2.1.0 is not yet pushed |
+| CI | Passed | GitHub Actions on Windows and Linux, and the VSIX package job, for 2.1.0 at commit `31b23cb` |
 | Live implementation run | Not run | Plan approval from the chat card, verification commands, and apply with signed-in CLIs remain to be tested by hand |
 
 ## Release acceptance criteria
@@ -95,7 +95,7 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 - [x] `npm run smoke` passes in a real VS Code.
 - [x] VSIX packaging passes.
 - [x] Live chat, follow-up, and edit messages pass with signed-in CLIs.
-- [ ] CI passes on Windows and Linux for 2.1.0.
+- [x] CI passes on Windows and Linux for 2.1.0.
 - [ ] Signed-in implementation run from the chat with plan approval, verification commands, review, and apply.
 
 ## Known risks
@@ -116,7 +116,7 @@ Results of the 2.1.0 verification on Windows 11 with Node.js 22.13.0, Git 2.49.0
 
 ## Next verification action
 
-Push 2.1.0 to CI for Windows and Linux. Then, with signed-in CLIs, install the VSIX and test in a disposable Git repository:
+With signed-in CLIs, install the VSIX and test in a disposable Git repository:
 
 1. In the chat, attach an image and a PDF, ask about them, and send a follow-up.
 2. Send an Edit message, allow it, review the changes card's diff, and apply it.

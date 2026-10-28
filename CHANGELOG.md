@@ -8,12 +8,12 @@ A Claude Code–style chat becomes the main interface. Claude answers and Codex 
 
 ### Added
 
-- **Chat panel.** A **Chat** view in the Dual Agent side bar, also available as an editor tab (**Dual Agent: Open Chat in Editor**; `Ctrl+Alt+D` focuses it).
+- **Chat panel.** A **Chat** view in the right-hand (secondary) side bar, where Claude Code places its panel, also available as an editor tab (**Dual Agent: Open Chat in Editor**; `Ctrl+Alt+D` focuses it).
   - Claude's text streams in as it is written.
   - A timeline shows each agent's stage (Claude orange, Codex blue) and every tool call with the tool's name, its IN (command, path, pattern, or edit) and OUT, as in Claude Code. Steps are saved with the run, so they stay after the message finishes. Codex's verdict appears as a badge.
   - An editor title-bar button opens the chat as a tab named after the conversation.
   - Agent Markdown is rendered with tables and code blocks with a Copy button, and file references open at the cited line.
-  - Each message shows its usage, and past conversations are listed in a history.
+  - Token usage per stage, per message (a table per agent, with the Claude CLI's API-equivalent cost estimate), and overall: a header button and **Dual Agent: Show Token Usage** show this conversation, today, the last 7 days, and all runs. Past conversations are listed in a history.
 - **Chat mode** (the default): Claude answers, Codex checks the answer against the code and attachments, and Claude revises only when the check fails. It is read-only, with two or three agent calls per message.
 - **Edit mode:** Claude edits an isolated worktree, verification commands run, and Codex reviews the diff as a gate, followed by fix rounds. A card lists the changed files with **Review all**, **Apply…**, and **Discard…**. Later Edit messages in the conversation keep working on the same worktree.
 - **Brainstorm and Implement from the chat,** with the plan approval card (approve, approve with guidance, review plan, reject) and the edit consent card (allow once or for the conversation, with the commands that will run).
@@ -33,11 +33,15 @@ A Claude Code–style chat becomes the main interface. Claude answers and Codex 
 
 ### Changed
 
-- The chat is the first view of the Dual Agent container; Runs and Agents start collapsed.
+- The chat has its own container in the secondary side bar; the activity-bar icon holds Runs and Agents, with a link to the chat.
 - Read-only Codex stages pass `--skip-git-repo-check`, so Chat and Brainstorm work in folders without Git.
 - `dualAgent.history.maxRuns` defaults to 100, since every chat message is a run.
 - The plan approval notification is shown only while the chat is hidden, since the chat has its own card.
 - Applying or discarding a worktree updates every run that shared it.
+
+### Fixed
+
+- Claude's input tokens now include cache reads and writes, and its thinking tokens are recorded. Claude reports them separately, so earlier runs showed only a few uncached input tokens per stage; usage recorded before 2.1.0 still under-counts Claude's input.
 
 ### Security
 
