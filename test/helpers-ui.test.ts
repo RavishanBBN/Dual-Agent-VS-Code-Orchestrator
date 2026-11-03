@@ -56,6 +56,66 @@ describe('splitting a suggested command', () => {
       expect('error' in splitCommandLine(line), line).toBe(true);
     }
   });
+
+  it('refuses a command that starts a shell, even with its shell syntax in quotes', () => {
+    for (const line of [
+      'cmd /d /c "echo %PATH%"',
+      'cmd.exe /c dir',
+      'C:\\Windows\\System32\\cmd.exe /c dir',
+      'powershell -Command "Get-ChildItem env:"',
+      'pwsh.exe -c "Remove-Item -Recurse ~"',
+      'bash -c "ls | wc -l"',
+      "sh -c 'rm -rf ~'",
+      '/bin/zsh -c "echo $HOME"',
+      'wsl ls',
+    ]) {
+      const result = splitCommandLine(line);
+      expect('error' in result ? result.error : `accepted as ${JSON.stringify(result.argv)}`, line).toMatch(/starts a shell|runs code/);
+    }
+  });
+
+  it('refuses inline code for an interpreter, and programs that start other programs', () => {
+    for (const line of [
+      'node -e "require(\'fs\').rmSync(\'x\')"',
+      'node --eval "process.exit(1)"',
+      'node -p "process.env"',
+      'python -c "import os"',
+      'python3 -c "print(1)"',
+      'py -c "print(1)"',
+      'perl -e "unlink q(x)"',
+      'ruby -e "puts 1"',
+      'php -r "echo 1;"',
+      'sudo ls',
+      'env bash',
+      'xargs rm',
+      'start notepad',
+      'runas /user:admin cmd',
+      // Forms a first version of this check missed, each of which runs code.
+      'node -pe "1+1"',
+      'python -Bc "import os"',
+      'perl -ne "print"',
+      'python3.12 -c "import os"',
+      'node --eval="process.exit()"',
+      'npx -c "echo $HOME"',
+      'npm exec -c "rm -rf x"',
+      'pnpm -c exec "echo hi"',
+      'forfiles /c "cmd /c del x"',
+    ]) {
+      expect('error' in splitCommandLine(line), line).toBe(true);
+    }
+  });
+
+  it('still runs ordinary programs and scripts from the project', () => {
+    expect(splitCommandLine('node scripts/build.mjs')).toEqual({ argv: ['node', 'scripts/build.mjs'] });
+    expect(splitCommandLine('python -m pytest -q')).toEqual({ argv: ['python', '-m', 'pytest', '-q'] });
+    expect(splitCommandLine('npx vitest run')).toEqual({ argv: ['npx', 'vitest', 'run'] });
+    expect(splitCommandLine('git log --format="%h | %s"')).toEqual({ argv: ['git', 'log', '--format=%h | %s'] });
+    expect(splitCommandLine('bashful lint')).toEqual({ argv: ['bashful', 'lint'] });
+    expect(splitCommandLine('python3 tools/check.py --count 3')).toEqual({ argv: ['python3', 'tools/check.py', '--count', '3'] });
+    expect(splitCommandLine('node -r ts-node/register src/main.ts')).toEqual({ argv: ['node', '-r', 'ts-node/register', 'src/main.ts'] });
+    expect(splitCommandLine('npm install -g @google/gemini-cli')).toEqual({ argv: ['npm', 'install', '-g', '@google/gemini-cli'] });
+    expect(splitCommandLine('node --version')).toEqual({ argv: ['node', '--version'] });
+  });
 });
 
 describe('slash commands', () => {
