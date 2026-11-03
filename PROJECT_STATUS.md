@@ -6,7 +6,7 @@ This document is the maintained implementation ledger for Dual Agent: Claude + C
 
 | Field | Value |
 |---|---|
-| Release | 2.4.0 (Agent mode with permission prompts, folders without Git, agents selector, Compare and Test first, editor integration, limits meter and machine-wide usage, offline pause, Gemini referee, slash commands, Marketplace name "Dual Agent: Claude + Codex"), after 2.3.1 (quick replies about the assistant) and 2.3.0 (Marketplace-ready: solo mode at usage limits, automatic continuation, message queue, retry and edit, secret masking) |
+| Release | 2.4.1 (Run refuses commands that start a shell or run inline code), after 2.4.0 (Agent mode with permission prompts, folders without Git, agents selector, Compare and Test first, editor integration, limits meter and machine-wide usage, offline pause, Gemini referee, slash commands, Marketplace name "Dual Agent: Claude + Codex"), after 2.3.1 (quick replies about the assistant) and 2.3.0 (Marketplace-ready: solo mode at usage limits, automatic continuation, message queue, retry and edit, secret masking) |
 | Last updated | 2026-10-28 |
 | Product scope | Desktop VS Code extension, trusted local workspaces only |
 | Interface | Chat webview (side bar or editor tab); native Runs and Agents views, commands, status bar, output channel, read-only documents, diff editors; editor quick fixes, context menu, and findings as problems |
@@ -71,6 +71,12 @@ This document is the maintained implementation ledger for Dual Agent: Claude + C
 | Documentation | Complete | Marketplace README, walkthrough, architecture, workflow, security, operations, development and release, roadmap, ADRs 0001 to 0010, issue and pull-request templates |
 
 ## Verification record
+
+Results of the 2.4.1 verification on Windows 11 with Node.js 22.13.0:
+
+| Check | Result | Notes |
+|---|---|---|
+| Unit and integration tests | Passed | The Run check's tests were written first and failed for the right reason; a review of the fix found five bypasses (clustered options, versioned names, `npx -c`, `forfiles`, `--eval=`), each fixed and tested |
 
 Results of the 2.4.0 verification on Windows 11 with Node.js 22.13.0:
 

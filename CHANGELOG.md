@@ -4,6 +4,20 @@ All notable changes are documented here. This project follows semantic versionin
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-11-03
+
+The Run button no longer runs a command that starts a shell or runs inline code.
+
+### Security
+
+- **Run refuses shells and inline code.** The check for shell syntax skips quoted text, which is right for ordinary programs. A command that starts an interpreter, though, receives that quoted text and interprets it. For example, `cmd /c "echo %PATH%"` expanded a variable after passing the check, and `powershell -Command "…"` could do anything PowerShell can. Run now refuses:
+  - shells, such as `cmd`, `powershell`, `pwsh`, `bash`, `sh`, `zsh`, and `wsl`, by name, path, or `.exe` name;
+  - programs that start other programs, such as `sudo`, `env`, `xargs`, `start`, `runas`, `forfiles`, and `wmic`;
+  - interpreters given inline code: `node -e`/`-p`, `python -c`, `perl -e`, `ruby -e`, `php -r`, and `npx -c`, including clustered options such as `node -pe`, `python -Bc`, and `perl -ne`, versioned names such as `python3.12`, and `--eval=` forms.
+
+  Refused commands can still be pasted into a terminal, where you run them yourself. Ordinary programs and project scripts, such as `node scripts/build.mjs`, `python -m pytest`, and `npm install`, still run.
+- Found by an independent Codex review of an answer about this code, and the fix was itself reviewed for bypasses before release.
+
 ## [2.4.0] - 2026-10-28
 
 Agent mode runs commands and installs software with your approval, folders without Git can be edited, you choose which agent leads, and three new modes join Chat, Research, and Edit.
