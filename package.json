@@ -909,7 +909,7 @@
     "@vscode/vsce": "4.0.0",
     "esbuild": "^0.28.2",
     "eslint": "^10.13.0",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "typescript-eslint": "^8.46.2",
     "vitest": "^5.0.5"
   }
