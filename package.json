@@ -895,7 +895,7 @@
     "fflate": "0.8.3",
     "markdown-it": "15.0.3",
     "preact": "11.0.1",
-    "unpdf": "1.9.1"
+    "unpdf": "2.1.0"
   },
   "overrides": {
     "@azure/msal-node": "7.1.0"
